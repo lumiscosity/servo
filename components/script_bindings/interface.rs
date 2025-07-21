@@ -142,6 +142,7 @@ pub(crate) unsafe fn create_global_object<D: DomTypes>(
     trace: TraceHook,
     mut rval: MutableHandleObject,
     origin: &MutableOrigin,
+    is_system_or_addon_principal: bool,
 ) {
     assert!(rval.is_null());
 
@@ -150,7 +151,7 @@ pub(crate) unsafe fn create_global_object<D: DomTypes>(
     options.creationOptions_.sharedMemoryAndAtomics_ = false;
     select_compartment(cx, &mut options);
 
-    let principal = ServoJSPrincipals::new::<D>(origin);
+    let principal = ServoJSPrincipals::new::<D>(origin, is_system_or_addon_principal);
 
     rval.set(JS_NewGlobalObject(
         *cx,
