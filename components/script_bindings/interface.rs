@@ -143,13 +143,19 @@ pub(crate) unsafe fn create_global_object<D: DomTypes>(
     mut rval: MutableHandleObject,
     origin: &MutableOrigin,
     is_system_or_addon_principal: bool,
+    force_new_compartment: bool,
 ) {
     assert!(rval.is_null());
 
     let mut options = RealmOptions::default();
     options.creationOptions_.traceGlobal_ = Some(trace);
     options.creationOptions_.sharedMemoryAndAtomics_ = false;
-    select_compartment(cx, &mut options);
+    if force_new_compartment {
+        options.creationOptions_.compSpec_ = CompartmentSpecifier::NewCompartmentAndZone;
+        options.creationOptions_.__bindgen_anon_1.comp_ = std::ptr::null_mut();
+    } else {
+        select_compartment(cx, &mut options);
+    }
 
     let principal = ServoJSPrincipals::new::<D>(origin, is_system_or_addon_principal);
 

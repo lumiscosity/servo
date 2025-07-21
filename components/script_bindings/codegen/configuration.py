@@ -253,6 +253,7 @@ class Descriptor(DescriptorProvider):
         self.proxy = False
         self.weakReferenceable = desc.get('weakReferenceable', False)
         self.isSystemOrAddonPrincipal = desc.get('isSystemOrAddonPrincipal', False)
+        self.forceNewCompartment = desc.get('forceNewCompartment', False)
 
         # If we're concrete, we need to crawl our ancestor interfaces and mark
         # them as having a concrete descendant.

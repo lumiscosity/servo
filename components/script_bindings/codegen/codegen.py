@@ -3214,7 +3214,8 @@ create_global_object::<D>(
     {TRACE_HOOK_NAME}::<D>,
     obj.handle_mut(),
     origin,
-    {"true" if self.descriptor.isSystemOrAddonPrincipal else "false"});
+    {"true" if self.descriptor.isSystemOrAddonPrincipal else "false"},
+    {"true" if self.descriptor.forceNewCompartment else "false"});
 assert!(!obj.is_null());
 
 let root = raw.reflect_with(obj.get());
