@@ -150,7 +150,9 @@ pub(crate) unsafe fn create_global_object<D: DomTypes>(
     let mut options = RealmOptions::default();
     options.creationOptions_.traceGlobal_ = Some(trace);
     options.creationOptions_.sharedMemoryAndAtomics_ = false;
-    if force_new_compartment {
+    // TODO make `force_new_compartment` create a non-sharable and/or system compartment,
+    // so that the select_compartment() in other globals never reuses our compartment.
+    if force_new_compartment || true {
         options.creationOptions_.compSpec_ = CompartmentSpecifier::NewCompartmentAndZone;
         options.creationOptions_.__bindgen_anon_1.comp_ = std::ptr::null_mut();
     } else {
