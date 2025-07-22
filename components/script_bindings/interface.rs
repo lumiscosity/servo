@@ -151,6 +151,8 @@ pub(crate) unsafe fn create_global_object<D: DomTypes>(
     options.creationOptions_.traceGlobal_ = Some(trace);
     options.creationOptions_.sharedMemoryAndAtomics_ = false;
     if use_system_compartment {
+        // Force the creation of a new compartment. Otherwise we may reuse a shareable non-system
+        // compartment in select_compartment() for this global, which is not what we want.
         options.creationOptions_.compSpec_ = CompartmentSpecifier::NewCompartmentAndZone;
         options.creationOptions_.__bindgen_anon_1.comp_ = std::ptr::null_mut();
     } else {
@@ -166,6 +168,7 @@ pub(crate) unsafe fn create_global_object<D: DomTypes>(
         // with the runtime’s global “trusted” principals. This influences the IsSystemCompartment() check in
         // select_compartment() below [1], preventing compartment reuse in either direction between this global and
         // any globals created with `use_system_compartment` set to false.
+        // TODO: this overwrites any previous trusted principals, which is probably not what we want
         // [1] IsSystemCompartment() → Realm::isSystem() → Realm::isSystem_ → principals == trustedPrincipals()
         JS_SetTrustedPrincipals(*cx, principal.as_raw());
     }
