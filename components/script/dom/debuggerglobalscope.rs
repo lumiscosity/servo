@@ -11,7 +11,7 @@ use crossbeam_channel::Sender;
 use dom_struct::dom_struct;
 use embedder_traits::resources::{self, Resource};
 use js::gc::HandleValue;
-use js::jsval::{ObjectValue, UndefinedValue};
+use js::jsval::UndefinedValue;
 use js::rust::Runtime;
 use js::rust::wrappers::JS_DefineDebuggerObject;
 use net_traits::ResourceThreads;
