@@ -177,7 +177,7 @@ jobs:
     env:
       UNIQUE_ID: '${{ needs.gen-uuids.outputs.build-unique-id }}'
       TIMEOUT: '600'
-      GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+      GH_TOKEN: '${{ github.token }}'
       RUN_URL: '/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}'
       SLEEP_PER_ITERATION: '15'
     runs-on: ubuntu-latest
@@ -250,7 +250,7 @@ jobs:
     env:
       UNIQUE_ID: '${{ needs.gen-uuids.outputs.test-unique-id }}'
       TIMEOUT: '600'
-      GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+      GH_TOKEN: '${{ github.token }}'
       RUN_URL: '/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}'
       SLEEP_PER_ITERATION: '15'
     runs-on: ubuntu-latest
@@ -359,7 +359,7 @@ jobs:
     env:
       UNIQUE_ID: '${{ needs.gen-uuids.outputs.bench-unique-id }}'
       TIMEOUT: '600'
-      GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+      GH_TOKEN: '${{ github.token }}'
       RUN_URL: '/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}'
       SLEEP_PER_ITERATION: '15'
     runs-on: ubuntu-latest
