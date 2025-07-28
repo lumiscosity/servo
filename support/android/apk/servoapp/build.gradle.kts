@@ -104,6 +104,12 @@ android {
                 abiFilters.add(getNDKAbi("armv7"))
             }
         }
+        register("armv7Production") {
+            initWith(release)
+            ndk {
+                abiFilters.add(getNDKAbi("armv7"))
+            }
+        }
         register("arm64Debug") {
             initWith(debug)
             ndk {

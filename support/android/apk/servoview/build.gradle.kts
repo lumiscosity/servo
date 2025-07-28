@@ -76,6 +76,9 @@ android {
         register("armv7Release") {
             initWith(release)
         }
+        register("armv7Production") {
+            initWith(production)
+        }
         register("arm64Debug") {
             initWith(debug)
         }
@@ -107,6 +110,9 @@ android {
         }
         named("armv7Release") {
             jniLibs.srcDirs(getJniLibsPath(false, true, "armv7"))
+        }
+        named("armv7Production") {
+            jniLibs.srcDirs(getJniLibsPath(false, false, "armv7"))
         }
         named("arm64Debug") {
             jniLibs.srcDirs(getJniLibsPath(true, false, "arm64"))
