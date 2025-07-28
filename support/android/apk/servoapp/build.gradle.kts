@@ -58,6 +58,12 @@ android {
                 keyAlias = signingKeyInfo["keyAlias"] as String
                 keyPassword = signingKeyInfo["keyPassword"] as String
             }
+            register("production") {
+                storeFile = signingKeyInfo["storeFile"] as File
+                storePassword = signingKeyInfo["storePassword"] as String
+                keyAlias = signingKeyInfo["keyAlias"] as String
+                keyPassword = signingKeyInfo["keyPassword"] as String
+            }
         }
     }
 
@@ -72,10 +78,18 @@ android {
             proguardFiles(getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro")
         }
 
+        create("production") {
+            signingConfig =
+            signingConfigs.getByName(if (signingKeyInfo != null) "production" else "debug")
+            isMinifyEnabled = false
+            proguardFiles(getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro")
+        }
+
         // Custom build types
 
         val debug = getByName("debug")
         val release = getByName("release")
+        val production = getByName("production")
 
 
         register("armv7Debug") {
@@ -98,6 +112,12 @@ android {
         }
         register("arm64Release") {
             initWith(release)
+            ndk {
+                abiFilters.add(getNDKAbi("arm64"))
+            }
+        }
+        register("arm64Production") {
+            initWith(production)
             ndk {
                 abiFilters.add(getNDKAbi("arm64"))
             }
@@ -131,7 +151,7 @@ android {
     // Ignore default "debug" and "release" build types
     androidComponents {
         beforeVariants {
-            if (it.buildType == "release" || it.buildType == "debug") {
+            if (it.buildType == "release" || it.buildType == "debug" || it.buildType == "production" ) {
                 it.enable = false
             }
         }
@@ -139,14 +159,15 @@ android {
 
     project.afterEvaluate {
         android.applicationVariants.forEach { variant ->
-            val pattern = Pattern.compile("^[\\w\\d]+([A-Z][\\w\\d]+)(Debug|Release)")
+            val pattern = Pattern.compile("^[\\w\\d]+([A-Z][\\w\\d]+)(Debug|Release|Production)")
             val matcher = pattern.matcher(variant.name)
             if (!matcher.find()) {
                 throw GradleException("Invalid variant name for output: " + variant.name)
             }
             val arch = matcher.group(1)
             val debug = variant.name.contains("Debug")
-            val finalFolder = getTargetDir(debug, arch)
+            val release = variant.name.contains("Release")
+            val finalFolder = getTargetDir(debug, release, arch)
             val finalFile = File(finalFolder, "servoapp.apk")
             variant.outputs.forEach { output ->
                 val copyAndRenameAPKTask =

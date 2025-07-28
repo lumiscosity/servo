@@ -134,7 +134,7 @@ class PackageCommands(CommandBase):
             elif build_type.is_release():
                 build_type_string = "Release"
             else:
-                raise Exception("TODO what should this be?")
+                build_type_string = "Production"
 
             flavor_name = "Basic"
             if flavor is not None:

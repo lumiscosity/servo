@@ -8,22 +8,22 @@ import java.util.Properties
 Some functions are extensions to the Project class, as to allow access to its public members.
  */
 
-fun Project.getTargetDir(debug: Boolean, arch: String): String {
+fun Project.getTargetDir(debug: Boolean, release: Boolean, arch: String): String {
     val basePath = project.rootDir.parentFile.parentFile.parentFile.absolutePath
-    return basePath + "/target/android/" + getSubTargetDir(debug, arch)
+    return basePath + "/target/android/" + getSubTargetDir(debug, release, arch)
 }
 
-fun Project.getNativeTargetDir(debug: Boolean, arch: String): String {
+fun Project.getNativeTargetDir(debug: Boolean, release: Boolean, arch: String): String {
     val basePath = project.rootDir.parentFile.parentFile.parentFile.absolutePath
-    return basePath + "/target/" + getSubTargetDir(debug, arch)
+    return basePath + "/target/" + getSubTargetDir(debug, release, arch)
 }
 
-fun getSubTargetDir(debug: Boolean, arch: String): String {
-    return getRustTarget(arch) + "/" + if (debug) "debug" else "release"
+fun getSubTargetDir(debug: Boolean, release: Boolean, arch: String): String {
+    return getRustTarget(arch) + "/" + if (debug) "debug" else if (release) "release" else "production"
 }
 
-fun Project.getJniLibsPath(debug: Boolean, arch: String): String =
-    getTargetDir(debug, arch) + "/jniLibs"
+fun Project.getJniLibsPath(debug: Boolean, release: Boolean, arch: String): String =
+    getTargetDir(debug, release, arch) + "/jniLibs"
 
 fun getRustTarget(arch: String): String {
     return when (arch.lowercase(Locale.getDefault())) {

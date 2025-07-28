@@ -58,8 +58,16 @@ android {
             proguardFiles(getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro")
         }
 
+        create("production") {
+            signingConfig =
+            signingConfigs.getByName("debug") // Change this to sign with a production key
+            isMinifyEnabled = false
+            proguardFiles(getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro")
+        }
+
         val debug = getByName("debug")
         val release = getByName("release")
+        val production = getByName("production")
 
         // Custom build types
         register("armv7Debug") {
@@ -73,6 +81,9 @@ android {
         }
         register("arm64Release") {
             initWith(release)
+        }
+        register("arm64Production") {
+            initWith(production)
         }
         register("x86Debug") {
             initWith(debug)
@@ -92,35 +103,38 @@ android {
         named("main") {
         }
         named("armv7Debug") {
-            jniLibs.srcDirs(getJniLibsPath(true, "armv7"))
+            jniLibs.srcDirs(getJniLibsPath(true, false, "armv7"))
         }
         named("armv7Release") {
-            jniLibs.srcDirs(getJniLibsPath(false, "armv7"))
+            jniLibs.srcDirs(getJniLibsPath(false, true, "armv7"))
         }
         named("arm64Debug") {
-            jniLibs.srcDirs(getJniLibsPath(true, "arm64"))
+            jniLibs.srcDirs(getJniLibsPath(true, false, "arm64"))
         }
         named("arm64Release") {
-            jniLibs.srcDirs(getJniLibsPath(false, "arm64"))
+            jniLibs.srcDirs(getJniLibsPath(false, true, "arm64"))
+        }
+        named("arm64Production") {
+            jniLibs.srcDirs(getJniLibsPath(false, false, "arm64"))
         }
         named("x86Debug") {
-            jniLibs.srcDirs(getJniLibsPath(true, "x86"))
+            jniLibs.srcDirs(getJniLibsPath(true, false, "x86"))
         }
         named("x86Release") {
-            jniLibs.srcDirs(getJniLibsPath(false, "x86"))
+            jniLibs.srcDirs(getJniLibsPath(false, true, "x86"))
         }
         named("x64Debug") {
-            jniLibs.srcDirs(getJniLibsPath(true, "x64"))
+            jniLibs.srcDirs(getJniLibsPath(true, false, "x64"))
         }
         named("x64Release") {
-            jniLibs.srcDirs(getJniLibsPath(false, "x64"))
+            jniLibs.srcDirs(getJniLibsPath(false, true, "x64"))
         }
     }
 
     // Ignore default "debug" and "release" build types
     androidComponents {
         beforeVariants {
-            if (it.buildType == "release" || it.buildType == "debug") {
+            if (it.buildType == "release" || it.buildType == "debug" || it.buildType == "production") {
                 it.enable = false
             }
         }
@@ -149,7 +163,7 @@ android {
         // while iterating
         tasks.mapNotNull { compileTask -> // mapNotNull acts as our filter, null results are dropped
             // This matches the task `mergeBasicArmv7DebugJniLibFolders`.
-            val pattern = Pattern.compile("^merge[A-Z]\\w+([A-Z]\\w+)(Debug|Release)JniLibFolders")
+            val pattern = Pattern.compile("^merge[A-Z]\\w+([A-Z]\\w+)(Debug|Release|Production)JniLibFolders")
             val matcher = pattern.matcher(compileTask.name)
             if (matcher.find())
                 compileTask to matcher.group(1)
@@ -157,15 +171,16 @@ android {
         }.forEach { (compileTask, arch) ->
             val ndkBuildTask = tasks.create<Exec>("ndkbuild" + compileTask.name) {
                 val debug = compileTask.name.contains("Debug")
+                val release = compileTask.name.contains("Release")
                 commandLine(
                     getNdkDir() + "/ndk-build",
                     "APP_BUILD_SCRIPT=../jni/Android.mk",
                     "NDK_APPLICATION_MK=../jni/Application.mk",
-                    "NDK_LIBS_OUT=" + getJniLibsPath(debug, arch),
+                    "NDK_LIBS_OUT=" + getJniLibsPath(debug, release, arch),
                     "NDK_DEBUG=" + if (debug) "1" else "0",
                     "APP_ABI=" + getNDKAbi(arch),
                     "NDK_LOG=1",
-                    "SERVO_TARGET_DIR=" + getNativeTargetDir(debug, arch)
+                    "SERVO_TARGET_DIR=" + getNativeTargetDir(debug, release, arch)
                 )
             }
 
@@ -173,14 +188,15 @@ android {
         }
 
         android.libraryVariants.forEach { variant ->
-            val pattern = Pattern.compile("^[\\w\\d]+([A-Z][\\w\\d]+)(Debug|Release)")
+            val pattern = Pattern.compile("^[\\w\\d]+([A-Z][\\w\\d]+)(Debug|Release|Production)")
             val matcher = pattern.matcher(variant.name)
             if (!matcher.find()) {
                 throw GradleException("Invalid variant name for output: " + variant.name)
             }
             val arch = matcher.group(1)
             val debug = variant.name.contains("Debug")
-            val finalFolder = getTargetDir(debug, arch)
+            val release = variant.name.contains("Release")
+            val finalFolder = getTargetDir(debug, release, arch)
             val finalFile = File(finalFolder, "servoview.aar")
             variant.outputs.forEach { output ->
                 val copyAndRenameAARTask =
@@ -205,8 +221,8 @@ dependencies {
     val list = listOf("armv7", "arm64", "x86", "x64")
     for (arch in list) {
         for (debug in listOf(true, false)) {
-            val basePath = getTargetDir(debug, arch) + "/build"
-            val cmd = arch + (if (debug) "Debug" else "Release") + "Implementation"
+            val basePath = getTargetDir(debug, false, arch) + "/build"
+            val cmd = arch + (if (debug) "Debug" else "Production") + "Implementation"
 
             for (dep in deps) {
                 val path = findDependencyPath(basePath, dep.fileName, dep.folderFilter)
