@@ -221,7 +221,7 @@ pub(crate) struct CanvasState {
 }
 
 impl CanvasState {
-    pub(crate) fn new(global: &GlobalScope, size: Size2D<u64>) -> CanvasState {
+    pub(crate) fn new(global: &GlobalScope, size: Size2D<u64>) -> Option<CanvasState> {
         debug!("Creating new canvas rendering context.");
         let (sender, receiver) =
             profiled_ipc::channel(global.time_profiler_chan().clone()).unwrap();
@@ -233,7 +233,7 @@ impl CanvasState {
                 size, sender,
             ))
             .unwrap();
-        let (ipc_renderer, canvas_id, image_key) = receiver.recv().unwrap();
+        let (ipc_renderer, canvas_id, image_key) = receiver.recv().ok()??;
         debug!("Done.");
         // Worklets always receive a unique origin. This messes with fetching
         // cached images in the case of paint worklets, since the image cache
@@ -243,7 +243,7 @@ impl CanvasState {
         } else {
             global.origin().immutable().clone()
         };
-        CanvasState {
+        Some(CanvasState {
             ipc_renderer,
             canvas_id,
             size: Cell::new(size),
@@ -256,11 +256,7 @@ impl CanvasState {
             image_key,
             origin,
             current_default_path: DomRefCell::new(Path::new()),
-        }
-    }
-
-    pub(crate) fn get_ipc_renderer(&self) -> &IpcSender<CanvasMsg> {
-        &self.ipc_renderer
+        })
     }
 
     pub(crate) fn image_key(&self) -> ImageKey {
@@ -2194,6 +2190,14 @@ impl CanvasState {
             .borrow_mut()
             .ellipse(x, y, rx, ry, rotation, start, end, ccw)
             .map_err(|_| Error::IndexSize)
+    }
+}
+
+impl Drop for CanvasState {
+    fn drop(&mut self) {
+        if let Err(err) = self.ipc_renderer.send(CanvasMsg::Close(self.canvas_id)) {
+            warn!("Could not close canvas: {}", err)
+        }
     }
 }
 

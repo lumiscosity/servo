@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 #![allow(clippy::too_many_arguments)]
+#![allow(unreachable_patterns)]
 
 use std::borrow::ToOwned;
 use std::collections::HashMap;
@@ -85,8 +86,7 @@ impl CanvasPaintThread {
                         recv(create_receiver) -> msg => {
                             match msg {
                                 Ok(ConstellationCanvasMsg::Create { sender: creator, size }) => {
-                                    let canvas_data = canvas_paint_thread.create_canvas(size);
-                                    creator.send(canvas_data).unwrap();
+                                    creator.send(canvas_paint_thread.create_canvas(size)).unwrap();
                                 },
                                 Ok(ConstellationCanvasMsg::Exit(exit_sender)) => {
                                     let _ = exit_sender.send(());
@@ -106,15 +106,15 @@ impl CanvasPaintThread {
         (create_sender, ipc_sender)
     }
 
-    pub fn create_canvas(&mut self, size: Size2D<u64>) -> (CanvasId, ImageKey) {
+    pub fn create_canvas(&mut self, size: Size2D<u64>) -> Option<(CanvasId, ImageKey)> {
         let canvas_id = self.next_canvas_id;
         self.next_canvas_id.0 += 1;
 
-        let canvas = Canvas::new(size, self.compositor_api.clone(), self.font_context.clone());
+        let canvas = Canvas::new(size, self.compositor_api.clone(), self.font_context.clone())?;
         let image_key = canvas.image_key();
         self.canvases.insert(canvas_id, canvas);
 
-        (canvas_id, image_key)
+        Some((canvas_id, image_key))
     }
 
     fn process_canvas_2d_message(&mut self, message: Canvas2dMsg, canvas_id: CanvasId) {
@@ -293,6 +293,7 @@ impl CanvasPaintThread {
 
 #[allow(clippy::large_enum_variant)]
 enum Canvas {
+    #[cfg(feature = "raqote")]
     Raqote(CanvasData<raqote::DrawTarget>),
     #[cfg(feature = "vello")]
     Vello(CanvasData<crate::vello_backend::VelloDrawTarget>),
@@ -305,35 +306,57 @@ impl Canvas {
         size: Size2D<u64>,
         compositor_api: CrossProcessCompositorApi,
         font_context: Arc<FontContext>,
-    ) -> Self {
-        #[cfg(feature = "vello")]
-        if servo_config::pref!(dom_canvas_vello_enabled) {
-            return Self::Vello(CanvasData::new(size, compositor_api, font_context));
+    ) -> Option<Self> {
+        match servo_config::pref!(dom_canvas_backend)
+            .to_lowercase()
+            .as_str()
+        {
+            #[cfg(feature = "raqote")]
+            "" | "auto" | "raqote" => Some(Self::Raqote(CanvasData::new(
+                size,
+                compositor_api,
+                font_context,
+            ))),
+            #[cfg(feature = "vello")]
+            "" | "auto" | "vello" => Some(Self::Vello(CanvasData::new(
+                size,
+                compositor_api,
+                font_context,
+            ))),
+            #[cfg(feature = "vello_cpu")]
+            "" | "auto" | "vello_cpu" => Some(Self::VelloCPU(CanvasData::new(
+                size,
+                compositor_api,
+                font_context,
+            ))),
+            s => {
+                warn!("Unknown 2D canvas backend: `{s}`");
+                None
+            },
         }
-        #[cfg(feature = "vello_cpu")]
-        if servo_config::pref!(dom_canvas_vello_cpu_enabled) {
-            return Self::VelloCPU(CanvasData::new(size, compositor_api, font_context));
-        }
-        Self::Raqote(CanvasData::new(size, compositor_api, font_context))
     }
 
     fn image_key(&self) -> ImageKey {
         match self {
+            #[cfg(feature = "raqote")]
             Canvas::Raqote(canvas_data) => canvas_data.image_key(),
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.image_key(),
             #[cfg(feature = "vello_cpu")]
             Canvas::VelloCPU(canvas_data) => canvas_data.image_key(),
+            _ => unreachable!(),
         }
     }
 
     fn pop_clip(&mut self) {
         match self {
+            #[cfg(feature = "raqote")]
             Canvas::Raqote(canvas_data) => canvas_data.pop_clip(),
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.pop_clip(),
             #[cfg(feature = "vello_cpu")]
             Canvas::VelloCPU(canvas_data) => canvas_data.pop_clip(),
+            _ => unreachable!(),
         }
     }
 
@@ -351,6 +374,7 @@ impl Canvas {
         transform: Transform2D<f32>,
     ) {
         match self {
+            #[cfg(feature = "raqote")]
             Canvas::Raqote(canvas_data) => canvas_data.fill_text(
                 text,
                 x,
@@ -389,6 +413,7 @@ impl Canvas {
                 composition_options,
                 transform,
             ),
+            _ => unreachable!(),
         }
     }
 
@@ -401,6 +426,7 @@ impl Canvas {
         transform: Transform2D<f32>,
     ) {
         match self {
+            #[cfg(feature = "raqote")]
             Canvas::Raqote(canvas_data) => {
                 canvas_data.fill_rect(rect, style, shadow_options, composition_options, transform)
             },
@@ -412,6 +438,7 @@ impl Canvas {
             Canvas::VelloCPU(canvas_data) => {
                 canvas_data.fill_rect(rect, style, shadow_options, composition_options, transform)
             },
+            _ => unreachable!(),
         }
     }
 
@@ -425,6 +452,7 @@ impl Canvas {
         transform: Transform2D<f32>,
     ) {
         match self {
+            #[cfg(feature = "raqote")]
             Canvas::Raqote(canvas_data) => canvas_data.stroke_rect(
                 rect,
                 style,
@@ -451,6 +479,7 @@ impl Canvas {
                 composition_options,
                 transform,
             ),
+            _ => unreachable!(),
         }
     }
 
@@ -464,6 +493,7 @@ impl Canvas {
         transform: Transform2D<f32>,
     ) {
         match self {
+            #[cfg(feature = "raqote")]
             Canvas::Raqote(canvas_data) => canvas_data.fill_path(
                 path,
                 fill_rule,
@@ -490,6 +520,7 @@ impl Canvas {
                 composition_options,
                 transform,
             ),
+            _ => unreachable!(),
         }
     }
 
@@ -503,6 +534,7 @@ impl Canvas {
         transform: Transform2D<f32>,
     ) {
         match self {
+            #[cfg(feature = "raqote")]
             Canvas::Raqote(canvas_data) => canvas_data.stroke_path(
                 path,
                 style,
@@ -529,16 +561,19 @@ impl Canvas {
                 composition_options,
                 transform,
             ),
+            _ => unreachable!(),
         }
     }
 
     fn clear_rect(&mut self, rect: &Rect<f32>, transform: Transform2D<f32>) {
         match self {
+            #[cfg(feature = "raqote")]
             Canvas::Raqote(canvas_data) => canvas_data.clear_rect(rect, transform),
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.clear_rect(rect, transform),
             #[cfg(feature = "vello_cpu")]
             Canvas::VelloCPU(canvas_data) => canvas_data.clear_rect(rect, transform),
+            _ => unreachable!(),
         }
     }
 
@@ -553,6 +588,7 @@ impl Canvas {
         transform: Transform2D<f32>,
     ) {
         match self {
+            #[cfg(feature = "raqote")]
             Canvas::Raqote(canvas_data) => canvas_data.draw_image(
                 snapshot,
                 dest_rect,
@@ -582,66 +618,79 @@ impl Canvas {
                 composition_options,
                 transform,
             ),
+            _ => unreachable!(),
         }
     }
 
     fn read_pixels(&mut self, read_rect: Option<Rect<u32>>) -> Snapshot {
         match self {
+            #[cfg(feature = "raqote")]
             Canvas::Raqote(canvas_data) => canvas_data.read_pixels(read_rect),
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.read_pixels(read_rect),
             #[cfg(feature = "vello_cpu")]
             Canvas::VelloCPU(canvas_data) => canvas_data.read_pixels(read_rect),
+            _ => unreachable!(),
         }
     }
 
     fn measure_text(&mut self, text: String, text_options: TextOptions) -> TextMetrics {
         match self {
+            #[cfg(feature = "raqote")]
             Canvas::Raqote(canvas_data) => canvas_data.measure_text(text, text_options),
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.measure_text(text, text_options),
             #[cfg(feature = "vello_cpu")]
             Canvas::VelloCPU(canvas_data) => canvas_data.measure_text(text, text_options),
+            _ => unreachable!(),
         }
     }
 
     fn clip_path(&mut self, path: &Path, fill_rule: FillRule, transform: Transform2D<f32>) {
         match self {
+            #[cfg(feature = "raqote")]
             Canvas::Raqote(canvas_data) => canvas_data.clip_path(path, fill_rule, transform),
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.clip_path(path, fill_rule, transform),
             #[cfg(feature = "vello_cpu")]
             Canvas::VelloCPU(canvas_data) => canvas_data.clip_path(path, fill_rule, transform),
+            _ => unreachable!(),
         }
     }
 
     fn put_image_data(&mut self, snapshot: Snapshot, rect: Rect<u32>) {
         match self {
+            #[cfg(feature = "raqote")]
             Canvas::Raqote(canvas_data) => canvas_data.put_image_data(snapshot, rect),
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.put_image_data(snapshot, rect),
             #[cfg(feature = "vello_cpu")]
             Canvas::VelloCPU(canvas_data) => canvas_data.put_image_data(snapshot, rect),
+            _ => unreachable!(),
         }
     }
 
     fn update_image_rendering(&mut self) {
         match self {
+            #[cfg(feature = "raqote")]
             Canvas::Raqote(canvas_data) => canvas_data.update_image_rendering(),
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.update_image_rendering(),
             #[cfg(feature = "vello_cpu")]
             Canvas::VelloCPU(canvas_data) => canvas_data.update_image_rendering(),
+            _ => unreachable!(),
         }
     }
 
     fn recreate(&mut self, size: Option<Size2D<u64>>) {
         match self {
+            #[cfg(feature = "raqote")]
             Canvas::Raqote(canvas_data) => canvas_data.recreate(size),
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.recreate(size),
             #[cfg(feature = "vello_cpu")]
             Canvas::VelloCPU(canvas_data) => canvas_data.recreate(size),
+            _ => unreachable!(),
         }
     }
 }

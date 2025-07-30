@@ -48,12 +48,12 @@ refcell_backtrace = ["libservo/refcell_backtrace"]
 tracing = ["dep:tracing", "dep:tracing-subscriber", "libservo/tracing"]
 tracing-hitrace = ["tracing", "dep:hitrace"]
 tracing-perfetto = ["tracing", "dep:tracing-perfetto"]
-webdriver = ["libservo/webdriver"]
 webgl_backtrace = ["libservo/webgl_backtrace"]
 webgpu = ["libservo/webgpu"]
 webxr = ["libservo/webxr"]
 vello = ["libservo/vello"]
 vello_cpu = ["libservo/vello_cpu"]
+raqote = ["libservo/raqote"]
 
 [dependencies]
 cfg-if = { workspace = true }
@@ -123,7 +123,7 @@ serde_json = { workspace = true }
 # For optional feature servo_allocator/use-system-allocator
 servo_allocator = { path = "../../components/allocator" }
 surfman = { workspace = true, features = ["sm-raw-window-handle-06", "sm-x11"] }
-winit = "0.30.11"
+winit = { workspace = true }
 
 [target.'cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos"))'.dependencies]
 sig = "1.0"
