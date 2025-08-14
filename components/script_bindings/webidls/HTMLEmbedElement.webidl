@@ -7,23 +7,23 @@
 interface HTMLEmbedElement : HTMLElement {
   [HTMLConstructor] constructor();
 
-  // [CEReactions]
-  //         attribute DOMString src;
-  // [CEReactions]
-  //         attribute DOMString type;
-  // [CEReactions]
-  //         attribute DOMString width;
-  // [CEReactions]
-  //         attribute DOMString height;
-  //legacycaller any (any... arguments);
+  [CEReactions]
+          attribute DOMString src;
+  [CEReactions]
+          attribute DOMString type;
+  [CEReactions]
+          attribute DOMString width;
+  [CEReactions]
+          attribute DOMString height;
+  Document? getSVGDocument();
 
   // also has obsolete members
 };
 
 // https://html.spec.whatwg.org/multipage/#HTMLEmbedElement-partial
 partial interface HTMLEmbedElement {
-  // [CEReactions]
-  //         attribute DOMString align;
-  // [CEReactions]
-  //         attribute DOMString name;
+  [CEReactions]
+          attribute DOMString align;
+  [CEReactions]
+          attribute DOMString name;
 };
