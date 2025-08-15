@@ -2,12 +2,17 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use content_security_policy::Destination;
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Prefix};
 use js::rust::HandleObject;
+use net_traits::request::{CredentialsMode, RequestMode};
+use net_traits::request::{Referrer, RequestBuilder};
 use script_bindings::inheritance::Castable;
-use script_bindings::str::{DOMString, USVString};
+use script_bindings::str::DOMString;
+use url::Url;
 use xml5ever::local_name;
+use servo_url::ServoUrl;
 
 use crate::dom::bindings::codegen::Bindings::HTMLEmbedElementBinding::HTMLEmbedElementMethods;
 use crate::dom::bindings::root::DomRoot;
@@ -88,11 +93,44 @@ impl HTMLEmbedElement {
     }
 
     /// https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-embed-element-setup-steps
-    /// TODO: the line above says this is called by the user agent, so I assume it must be available
-    /// from somewhere else, hence the pub(crate)?
+    /// TODO: the line above says this is called by the user agent, so I assume
+    /// it must be available from somewhere else, hence the pub(crate)?
     /// Need to investigate this - there's a convenient link, at least!
-    pub(crate) fn element_setup_steps(&self) {
-
+    pub(crate) fn element_setup(&self) {
+        let element = self.upcast::<Element>();
+        let src_attr = &local_name!("src");
+        let type_attr = &local_name!("type");
+        // TODO: 1. If another task has since been queued to run the embed element setup steps for element, then return.
+        // 2. If element has a src attribute set, then:
+        if element.has_attribute(src_attr){
+            // 1. Let url be the result of encoding-parsing a URL given element's src
+            // attribute's value, relative to element's node document.
+            // 2. If url is failure, then return.
+            let url_options = Url::options();
+            // TODO: Do the element encoding. How do I get the node document?
+            let url = match url_options.parse(
+                &element.get_string_attribute(src_attr).to_string()
+                ) {
+                    Ok(value) => ServoUrl::from_url(value),
+                    Err(_) => return,
+            };
+            // 3. Let request be a new request whose URL is url, client is element's node
+            // document's relevant settings object, destination is "embed", credentials
+            // mode is "include", mode is "navigate", initiator type is "embed", and
+            // whose use-URL-credentials flag is set.
+            // TODO: What goes in webview in the builder? What is the element's node document's relevant
+            // settings object and how do I get it?
+            let request = RequestBuilder::new(None, url, Referrer::NoReferrer)
+                .destination(Destination::Embed)
+                .credentials_mode(CredentialsMode::Include)
+                .mode(RequestMode::Navigate)
+                // TODO: How to set initiator type?
+                //.initiator_type(InitiatorType::Embed)
+                .use_url_credentials(true)
+                .build();
+            // 4. Fetch request, with processResponse set to the following steps given response response:
+            fetch()
+        }
     }
 }
 
