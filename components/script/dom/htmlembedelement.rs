@@ -61,6 +61,7 @@ impl HTMLEmbedElement {
     /// TODO: get link to this. There's no heading, but it's above concept-embed-active
     fn represents_nothing(&self) -> bool {
         let element = self.upcast::<Element>();
+        let node = self.upcast::<Node>();
         let src_attr = &local_name!("src");
         let type_attr = &local_name!("type");
         // The element has neither a src attribute nor a type attribute.
@@ -68,7 +69,7 @@ impl HTMLEmbedElement {
             && !element.has_attribute(type_attr);
         // The element has a media element ancestor.
         // TODO: Is there a better way to do this?
-        let media_element_descendant = node.ancestors().find(|&ancestor| {
+        let media_element_descendant = node.ancestors().find(|ancestor| {
             ancestor.downcast::<HTMLMediaElement>().is_some()
         }).is_some();
         // TODO: The element has an ancestor object element that is not showing its fallback content.
@@ -100,7 +101,7 @@ impl HTMLEmbedElement {
         }
         // The element is not a descendant of a media element.
         // TODO: Is there a better way to do this?
-        let not_media_element_descendant = node.ancestors().find(|&ancestor| {
+        let not_media_element_descendant = node.ancestors().find(|ancestor| {
             ancestor.downcast::<HTMLMediaElement>().is_some()
         }).is_none();
         // TODO: The element is not a descendant of an object element that is not showing its fallback content.
@@ -180,11 +181,13 @@ impl HTMLEmbedElementMethods<crate::DomTypeHolder> for HTMLEmbedElement {
         todo!()
     }
 
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-embed-align
     make_getter!(Align, "align");
-
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-embed-align
     make_setter!(SetAlign, "align");
 
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-embed-name
     make_getter!(Name, "name");
-
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-embed-name
     make_setter!(SetName, "name");
 }
