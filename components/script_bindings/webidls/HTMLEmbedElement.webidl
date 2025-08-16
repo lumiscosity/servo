@@ -8,7 +8,7 @@ interface HTMLEmbedElement : HTMLElement {
   [HTMLConstructor] constructor();
 
   [CEReactions]
-          attribute DOMString src;
+          attribute USVString src;
   [CEReactions]
           attribute DOMString type;
   [CEReactions]

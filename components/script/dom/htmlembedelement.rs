@@ -9,7 +9,8 @@ use js::rust::HandleObject;
 use net_traits::request::{CredentialsMode, RequestMode};
 use net_traits::request::{Referrer, RequestBuilder};
 use script_bindings::inheritance::Castable;
-use script_bindings::str::DOMString;
+use script_bindings::str::{DOMString, USVString};
+use style::attr::AttrValue;
 use url::Url;
 use xml5ever::local_name;
 use servo_url::ServoUrl;
@@ -19,12 +20,13 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::document::Document;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::node::Node;
-use crate::dom::types::Element;
+use crate::dom::types::{Element, HTMLMediaElement};
 use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct HTMLEmbedElement {
     htmlelement: HTMLElement,
+    // TODO: Content navigable? Content document?
 }
 
 impl HTMLEmbedElement {
@@ -64,18 +66,28 @@ impl HTMLEmbedElement {
         // The element has neither a src attribute nor a type attribute.
         let neither_src_nor_type = !element.has_attribute(src_attr)
             && !element.has_attribute(type_attr);
-        // TODO: The element has a media element ancestor.
+        // The element has a media element ancestor.
+        // TODO: Is there a better way to do this?
+        let media_element_descendant = node.ancestors().find(|&ancestor| {
+            ancestor.downcast::<HTMLMediaElement>().is_some()
+        }).is_some();
         // TODO: The element has an ancestor object element that is not showing its fallback content.
-        neither_src_nor_type
+        // Does the object element have fallback content yet?
+        neither_src_nor_type || media_element_descendant
     }
 
     /// https://html.spec.whatwg.org/multipage/iframe-embed-object.html#concept-embed-active
     fn potentially_active(&self) -> bool {
         let element = self.upcast::<Element>();
+        let node = self.upcast::<Node>();
         let src_attr = &local_name!("src");
         let type_attr = &local_name!("type");
-        // TODO: The element is in a document or was in a document the last time the event loop reached step 1.
-        // TODO: The element's node document is fully active.
+        // The element is in a document or was in a document the last time the event loop reached step 1.
+        // TODO: This is definitely the first half, but what about the second?
+        let in_a_document = node.is_in_a_document_tree();
+        // The element's node document is fully active.
+        // TODO: Is the `owner_doc` the node document?
+        let node_document_active = node.owner_doc().is_fully_active();
         // The element has either a src attribute set or a type attribute set (or both).
         let has_src_or_type = element.has_attribute(src_attr)
             || element.has_attribute(type_attr);
@@ -86,17 +98,24 @@ impl HTMLEmbedElement {
         } else {
             src_attr_absent_or_not_empty = true;
         }
-        // TODO: The element is not a descendant of a media element.
+        // The element is not a descendant of a media element.
+        // TODO: Is there a better way to do this?
+        let not_media_element_descendant = node.ancestors().find(|&ancestor| {
+            ancestor.downcast::<HTMLMediaElement>().is_some()
+        }).is_none();
         // TODO: The element is not a descendant of an object element that is not showing its fallback content.
+        // Does the object element have fallback content yet?
         // TODO: The element is being rendered, or was being rendered the last time the event loop reached step 1.
-        has_src_or_type && src_attr_absent_or_not_empty
+        in_a_document && node_document_active && has_src_or_type && src_attr_absent_or_not_empty
+        && not_media_element_descendant
     }
 
     /// https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-embed-element-setup-steps
     /// TODO: the line above says this is called by the user agent, so I assume
     /// it must be available from somewhere else, hence the pub(crate)?
     /// Need to investigate this - there's a convenient link, at least!
-    pub(crate) fn element_setup(&self) {
+    /// Note to self: we probably pass the node document or whatever into here.
+    pub(crate) fn setup(&self) {
         let element = self.upcast::<Element>();
         let src_attr = &local_name!("src");
         let type_attr = &local_name!("type");
@@ -128,25 +147,18 @@ impl HTMLEmbedElement {
                 //.initiator_type(InitiatorType::Embed)
                 .use_url_credentials(true)
                 .build();
-            // 4. Fetch request, with processResponse set to the following steps given response response:
-            fetch()
+            // TODO: 4. Fetch request, with processResponse set to the following steps given response response:
         }
     }
 }
 
 impl HTMLEmbedElementMethods<crate::DomTypeHolder> for HTMLEmbedElement {
-    fn Src(&self, ) -> DOMString {
-        let element = self.upcast::<Element>();
-        let attr = &local_name!("src");
-        if element.has_attribute(attr) {
-            element.get_string_attribute(attr)
-        } else {
-            DOMString::new()
-        }
-    }
+    // https://html.spec.whatwg.org/multipage/#dom-embed-src
+    make_url_getter!(Src, "src");
+    // https://html.spec.whatwg.org/multipage/#dom-embed-src
+    make_url_setter!(SetSrc, "src");
 
-    make_setter!(SetSrc, "src");
-
+    // https://html.spec.whatwg.org/multipage/#dom-embed-type
     fn Type(&self, ) -> DOMString {
         let element = self.upcast::<Element>();
         let attr = &local_name!("type");
@@ -156,46 +168,31 @@ impl HTMLEmbedElementMethods<crate::DomTypeHolder> for HTMLEmbedElement {
             DOMString::new()
         }
     }
+    // https://html.spec.whatwg.org/multipage/#dom-embed-type
+    make_setter!(SetType, "type");
 
-   make_setter!(SetType, "type");
+    // https://html.spec.whatwg.org/multipage/#dom-embed-width
+    make_getter!(Width, "width");
+    // https://html.spec.whatwg.org/multipage/#dom-embed-width
+    make_dimension_setter!(SetWidth, "width");
 
-    fn Width(&self, ) -> DOMString {
-        let element = self.upcast::<Element>();
-        let attr = &local_name!("width");
-        if element.has_attribute(attr) {
-            element.get_string_attribute(attr)
-        } else {
-            DOMString::new()
-        }
-    }
+    // https://html.spec.whatwg.org/multipage/#dom-embed-height
+    make_getter!(Height, "height");
+    // https://html.spec.whatwg.org/multipage/#dom-embed-height
+    make_dimension_setter!(SetHeight, "height");
 
-    make_setter!(SetWidth, "width");
-
-    fn Height(&self, ) -> DOMString {
-        let element = self.upcast::<Element>();
-        let attr = &local_name!("height");
-        if element.has_attribute(attr) {
-            element.get_string_attribute(attr)
-        } else {
-            DOMString::new()
-        }
-    }
-
-    make_setter!(SetHeight, "height");
-
+    // https://html.spec.whatwg.org/multipage/embedded-content-other.html#dom-media-getsvgdocument
+    // TODO: According to the spec, <iframe> and <object> should also have this!
+    // Maybe it should be generic between the three somehow? SVGDocument trait with a getter/setter? Macro?
     fn GetSVGDocument(&self, ) -> Option<DomRoot<<crate::DomTypeHolder as script_bindings::DomTypes>::Document>> {
         todo!()
     }
 
-    fn Align(&self, ) -> DOMString {
-        todo!()
-    }
+    make_getter!(Align, "align");
 
     make_setter!(SetAlign, "align");
 
-    fn Name(&self, ) -> DOMString {
-        todo!()
-    }
+    make_getter!(Name, "name");
 
     make_setter!(SetName, "name");
 }
