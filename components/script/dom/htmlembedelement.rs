@@ -159,15 +159,7 @@ impl HTMLEmbedElementMethods<crate::DomTypeHolder> for HTMLEmbedElement {
     make_url_setter!(SetSrc, "src");
 
     // https://html.spec.whatwg.org/multipage/#dom-embed-type
-    fn Type(&self, ) -> DOMString {
-        let element = self.upcast::<Element>();
-        let attr = &local_name!("type");
-        if element.has_attribute(attr) {
-            element.get_string_attribute(attr)
-        } else {
-            DOMString::new()
-        }
-    }
+    make_getter!(Type, "type");
     // https://html.spec.whatwg.org/multipage/#dom-embed-type
     make_setter!(SetType, "type");
 
