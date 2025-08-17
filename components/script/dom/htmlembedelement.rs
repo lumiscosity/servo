@@ -11,22 +11,19 @@ use net_traits::request::{Referrer, RequestBuilder};
 use script_bindings::inheritance::Castable;
 use script_bindings::str::{DOMString, USVString};
 use style::attr::AttrValue;
-use url::Url;
 use xml5ever::local_name;
-use servo_url::ServoUrl;
 
 use crate::dom::bindings::codegen::Bindings::HTMLEmbedElementBinding::HTMLEmbedElementMethods;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::document::Document;
 use crate::dom::htmlelement::HTMLElement;
-use crate::dom::node::Node;
+use crate::dom::node::{Node, NodeTraits};
 use crate::dom::types::{Element, HTMLMediaElement};
 use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct HTMLEmbedElement {
     htmlelement: HTMLElement,
-    // TODO: Content navigable? Content document?
 }
 
 impl HTMLEmbedElement {
@@ -87,7 +84,6 @@ impl HTMLEmbedElement {
         // TODO: This is definitely the first half, but what about the second?
         let in_a_document = node.is_in_a_document_tree();
         // The element's node document is fully active.
-        // TODO: Is the `owner_doc` the node document?
         let node_document_active = node.owner_doc().is_fully_active();
         // The element has either a src attribute set or a type attribute set (or both).
         let has_src_or_type = element.has_attribute(src_attr)
@@ -118,29 +114,30 @@ impl HTMLEmbedElement {
     /// Note to self: we probably pass the node document or whatever into here.
     pub(crate) fn setup(&self) {
         let element = self.upcast::<Element>();
+        let document = self.owner_document();
         let src_attr = &local_name!("src");
-        let type_attr = &local_name!("type");
         // TODO: 1. If another task has since been queued to run the embed element setup steps for element, then return.
         // 2. If element has a src attribute set, then:
         if element.has_attribute(src_attr){
             // 1. Let url be the result of encoding-parsing a URL given element's src
             // attribute's value, relative to element's node document.
             // 2. If url is failure, then return.
-            let url_options = Url::options();
-            // TODO: Do the element encoding. How do I get the node document?
-            let url = match url_options.parse(
+            let url = match document.encoding_parse_a_url(
                 &element.get_string_attribute(src_attr).to_string()
                 ) {
-                    Ok(value) => ServoUrl::from_url(value),
+                    Ok(value) => value,
                     Err(_) => return,
             };
             // 3. Let request be a new request whose URL is url, client is element's node
             // document's relevant settings object, destination is "embed", credentials
             // mode is "include", mode is "navigate", initiator type is "embed", and
             // whose use-URL-credentials flag is set.
-            // TODO: What goes in webview in the builder? What is the element's node document's relevant
-            // settings object and how do I get it?
-            let request = RequestBuilder::new(None, url, Referrer::NoReferrer)
+            // TODO: Is the client field what we do with the webview ID?
+            let request = RequestBuilder::new(
+                Some(document.webview_id()),
+                url,
+                Referrer::NoReferrer
+            )
                 .destination(Destination::Embed)
                 .credentials_mode(CredentialsMode::Include)
                 .mode(RequestMode::Navigate)
@@ -148,7 +145,8 @@ impl HTMLEmbedElement {
                 //.initiator_type(InitiatorType::Embed)
                 .use_url_credentials(true)
                 .build();
-            // TODO: 4. Fetch request, with processResponse set to the following steps given response response:
+            // TODO: 4. Fetch request, with processResponse set to the following steps given
+            // response response:
         }
     }
 }
