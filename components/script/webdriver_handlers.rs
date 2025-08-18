@@ -59,6 +59,7 @@ use crate::dom::bindings::error::{Error, report_pending_exception, throw_dom_exc
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::{DomGlobal, DomObject};
 use crate::dom::bindings::root::DomRoot;
+use crate::dom::bindings::settings_stack::AutoEntryScript;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
 use crate::dom::domrect::DOMRect;
@@ -345,6 +346,7 @@ pub(crate) fn jsval_to_webdriver(
     realm: InRealm,
     can_gc: CanGc,
 ) -> WebDriverJSResult {
+    let _aes = AutoEntryScript::new(global_scope);
     let mut seen = HashSet::new();
     let result = unsafe { jsval_to_webdriver_inner(*cx, global_scope, val, &mut seen) };
     if result.is_err() {
@@ -367,14 +369,7 @@ unsafe fn jsval_to_webdriver_inner(
         Ok(WebDriverJSValue::Null)
     } else if val.get().is_boolean() {
         Ok(WebDriverJSValue::Boolean(val.get().to_boolean()))
-    } else if val.get().is_int32() {
-        Ok(WebDriverJSValue::Int(
-            match FromJSValConvertible::from_jsval(cx, val, ConversionBehavior::Default).unwrap() {
-                ConversionResult::Success(c) => c,
-                _ => unreachable!(),
-            },
-        ))
-    } else if val.get().is_double() {
+    } else if val.get().is_number() {
         Ok(WebDriverJSValue::Number(
             match FromJSValConvertible::from_jsval(cx, val, ()).unwrap() {
                 ConversionResult::Success(c) => c,
@@ -2084,5 +2079,18 @@ pub(crate) fn handle_remove_load_status_sender(
     if let Some(document) = documents.find_document(pipeline) {
         let window = document.window();
         window.set_webdriver_load_status_sender(None);
+    }
+}
+
+pub(crate) fn handle_get_window_handle(
+    pipeline_id: PipelineId,
+    reply: IpcSender<Result<String, ErrorStatus>>,
+) {
+    if let Some(res) = ScriptThread::find_document(pipeline_id)
+        .map(|document| document.upcast::<Node>().unique_id(pipeline_id))
+    {
+        reply.send(Ok(res)).ok();
+    } else {
+        reply.send(Err(ErrorStatus::NoSuchWindow)).ok();
     }
 }
