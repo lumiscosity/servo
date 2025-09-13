@@ -178,7 +178,7 @@ impl GPUAdapterMethods<crate::DomTypeHolder> for GPUAdapter {
 
     /// <https://gpuweb.github.io/gpuweb/#dom-gpuadapter-isfallbackadapter>
     fn IsFallbackAdapter(&self) -> bool {
-        //TODO
+        // TODO
         false
     }
 
@@ -269,7 +269,7 @@ impl RoutedPromiseListener<WebGPUDeviceResponse> for GPUAdapter {
                     can_gc,
                 );
                 // 2. Lose the device(device, "unknown").
-                device.lose(GPUDeviceLostReason::Unknown, e, can_gc);
+                device.lose(GPUDeviceLostReason::Unknown, e);
                 promise.resolve_native(&device, can_gc);
             },
         }

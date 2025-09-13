@@ -9,12 +9,13 @@ use std::mem;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use base::generic_channel;
 use constellation_traits::ScriptToConstellationMessage;
 use embedder_traits::{
     Cursor, EditingActionEvent, EmbedderMsg, GamepadEvent as EmbedderGamepadEvent,
     GamepadSupportedHapticEffects, GamepadUpdateType, ImeEvent, InputEvent,
     KeyboardEvent as EmbedderKeyboardEvent, MouseButton, MouseButtonAction, MouseButtonEvent,
-    MouseLeaveEvent, ScrollEvent, TouchEvent as EmbedderTouchEvent, TouchEventType, TouchId,
+    MouseLeftViewportEvent, ScrollEvent, TouchEvent as EmbedderTouchEvent, TouchEventType, TouchId,
     UntrustedNodeAddress, WheelEvent as EmbedderWheelEvent,
 };
 use euclid::Point2D;
@@ -44,15 +45,15 @@ use crate::dom::bindings::root::MutNullableDom;
 use crate::dom::clipboardevent::ClipboardEventType;
 use crate::dom::document::{FireMouseEventType, FocusInitiator, TouchEventResult};
 use crate::dom::event::{EventBubbles, EventCancelable, EventDefault};
-use crate::dom::gamepad::contains_user_gesture;
-use crate::dom::gamepadevent::GamepadEventType;
+use crate::dom::gamepad::gamepad::{Gamepad, contains_user_gesture};
+use crate::dom::gamepad::gamepadevent::GamepadEventType;
 use crate::dom::inputevent::HitTestResult;
 use crate::dom::node::{self, Node, ShadowIncluding};
 use crate::dom::pointerevent::PointerId;
 use crate::dom::types::{
-    ClipboardEvent, CompositionEvent, DataTransfer, Element, Event, EventTarget, Gamepad,
-    GlobalScope, HTMLAnchorElement, KeyboardEvent, MouseEvent, PointerEvent, Touch, TouchEvent,
-    TouchList, WheelEvent, Window,
+    ClipboardEvent, CompositionEvent, DataTransfer, Element, Event, EventTarget, GlobalScope,
+    HTMLAnchorElement, KeyboardEvent, MouseEvent, PointerEvent, Touch, TouchEvent, TouchList,
+    WheelEvent, Window,
 };
 use crate::drag_data_store::{DragDataStore, Kind, Mode};
 use crate::realms::enter_realm;
@@ -79,7 +80,7 @@ pub(crate) struct DocumentEventHandler {
     current_hover_target: MutNullableDom<Element>,
     /// The most recent mouse movement point, used for processing `mouseleave` events.
     #[no_trace]
-    most_recent_mousemove_point: Point2D<f32, CSSPixel>,
+    most_recent_mousemove_point: Cell<Option<Point2D<f32, CSSPixel>>>,
     /// The currently set [`Cursor`] or `None` if the `Document` isn't being hovered
     /// by the cursor.
     #[no_trace]
@@ -160,13 +161,13 @@ impl DocumentEventHandler {
 
             match event.event.clone() {
                 InputEvent::MouseButton(mouse_button_event) => {
-                    self.handle_mouse_button_event(mouse_button_event, &event, can_gc);
+                    self.handle_native_mouse_button_event(mouse_button_event, &event, can_gc);
                 },
                 InputEvent::MouseMove(_) => {
-                    self.handle_mouse_move_event(&event, can_gc);
+                    self.handle_native_mouse_move_event(&event, can_gc);
                 },
-                InputEvent::MouseLeave(mouse_leave_event) => {
-                    self.handle_mouse_leave_event(&event, &mouse_leave_event, can_gc);
+                InputEvent::MouseLeftViewport(mouse_leave_event) => {
+                    self.handle_mouse_left_viewport_event(&event, &mouse_leave_event, can_gc);
                 },
                 InputEvent::Touch(touch_event) => {
                     self.handle_touch_event(touch_event, &event, can_gc);
@@ -212,19 +213,21 @@ impl DocumentEventHandler {
             }));
     }
 
-    pub(crate) fn set_cursor(&self, cursor: Cursor) {
-        if Some(cursor) == self.current_cursor.get() {
+    pub(crate) fn set_cursor(&self, cursor: Option<Cursor>) {
+        if cursor == self.current_cursor.get() {
             return;
         }
-        self.current_cursor.set(Some(cursor));
-        self.window
-            .send_to_embedder(EmbedderMsg::SetCursor(self.window.webview_id(), cursor));
+        self.current_cursor.set(cursor);
+        self.window.send_to_embedder(EmbedderMsg::SetCursor(
+            self.window.webview_id(),
+            cursor.unwrap_or_default(),
+        ));
     }
 
-    fn handle_mouse_leave_event(
+    fn handle_mouse_left_viewport_event(
         &self,
         input_event: &ConstellationInputEvent,
-        mouse_leave_event: &MouseLeaveEvent,
+        mouse_leave_event: &MouseLeftViewportEvent,
         can_gc: CanGc,
     ) {
         if let Some(current_hover_target) = self.current_hover_target.get() {
@@ -238,8 +241,9 @@ impl DocumentEventHandler {
             }
 
             if let Some(hit_test_result) = self
-                .window
-                .hit_test_from_point_in_viewport(self.most_recent_mousemove_point)
+                .most_recent_mousemove_point
+                .get()
+                .and_then(|point| self.window.hit_test_from_point_in_viewport(point))
             {
                 MouseEvent::new_simple(
                     &self.window,
@@ -263,15 +267,23 @@ impl DocumentEventHandler {
             }
         }
 
-        self.current_cursor.set(None);
-        self.current_hover_target.set(None);
-
-        // If focus is moving to another frame, it will decide what the new status text is, but if
-        // this mouse leave event is leaving the WebView entirely, then clear it.
+        // We do not want to always inform the embedder that cursor has been set to the
+        // default cursor, in order to avoid a timing issue when moving between `<iframe>`
+        // elements. There is currently no way to control which `SetCursor` message will
+        // reach the embedder first. This is safer when leaving the `WebView` entirely.
         if !mouse_leave_event.focus_moving_to_another_iframe {
+            // If focus is moving to another frame, it will decide what the new status
+            // text is, but if this mouse leave event is leaving the WebView entirely,
+            // then clear it.
             self.window
                 .send_to_embedder(EmbedderMsg::Status(self.window.webview_id(), None));
+            self.set_cursor(None);
+        } else {
+            self.current_cursor.set(None);
         }
+
+        self.current_hover_target.set(None);
+        self.most_recent_mousemove_point.set(None);
     }
 
     fn handle_mouse_enter_leave_event(
@@ -328,14 +340,15 @@ impl DocumentEventHandler {
         }
     }
 
-    fn handle_mouse_move_event(&self, input_event: &ConstellationInputEvent, can_gc: CanGc) {
+    /// <https://w3c.github.io/uievents/#handle-native-mouse-move>
+    fn handle_native_mouse_move_event(&self, input_event: &ConstellationInputEvent, can_gc: CanGc) {
         // Ignore all incoming events without a hit test.
         let Some(hit_test_result) = self.window.hit_test_from_input_event(input_event) else {
             return;
         };
 
         // Update the cursor when the mouse moves, if it has changed.
-        self.set_cursor(hit_test_result.cursor);
+        self.set_cursor(Some(hit_test_result.cursor));
 
         let Some(new_target) = hit_test_result
             .node
@@ -349,8 +362,7 @@ impl DocumentEventHandler {
         let target_has_changed = self
             .current_hover_target
             .get()
-            .as_ref()
-            .is_none_or(|old_target| old_target != &new_target);
+            .is_none_or(|old_target| old_target != new_target);
 
         // Here we know the target has changed, so we must update the state,
         // dispatch mouseout to the previous one, mouseover to the new one.
@@ -451,6 +463,8 @@ impl DocumentEventHandler {
         .fire(new_target.upcast(), can_gc);
 
         self.update_current_hover_target_and_status(Some(new_target));
+        self.most_recent_mousemove_point
+            .set(Some(hit_test_result.point_in_frame));
     }
 
     fn update_current_hover_target_and_status(&self, new_hover_target: Option<DomRoot<Element>>) {
@@ -502,8 +516,24 @@ impl DocumentEventHandler {
         }
     }
 
+    pub(crate) fn handle_refresh_cursor(&self) {
+        let Some(most_recent_mousemove_point) = self.most_recent_mousemove_point.get() else {
+            return;
+        };
+
+        let Some(hit_test_result) = self
+            .window
+            .hit_test_from_point_in_viewport(most_recent_mousemove_point)
+        else {
+            return;
+        };
+
+        self.set_cursor(Some(hit_test_result.cursor));
+    }
+
     /// <https://w3c.github.io/uievents/#mouseevent-algorithms>
-    fn handle_mouse_button_event(
+    /// Handles native mouse down, mouse up, mouse click.
+    fn handle_native_mouse_button_event(
         &self,
         event: MouseButtonEvent,
         input_event: &ConstellationInputEvent,
@@ -530,12 +560,12 @@ impl DocumentEventHandler {
 
         let node = el.upcast::<Node>();
         debug!("{:?} on {:?}", event.action, node.debug_str());
-        // Prevent click event if form control element is disabled.
-        if let MouseButtonAction::Click = event.action {
-            // The click event is filtered by the disabled state.
-            if el.is_actually_disabled() {
-                return;
-            }
+
+        // https://w3c.github.io/uievents/#hit-test
+        // Prevent mouse event if element is disabled.
+        // TODO: also inert.
+        if el.is_actually_disabled() {
+            return;
         }
 
         let dom_event = DomRoot::upcast::<Event>(MouseEvent::for_platform_mouse_event(
@@ -660,7 +690,8 @@ impl DocumentEventHandler {
 
         // Step 4. If result is true, then show the UA context menu
         if result {
-            let (sender, receiver) = ipc::channel().expect("Failed to create IPC channel.");
+            let (sender, receiver) =
+                generic_channel::channel().expect("Failed to create IPC channel.");
             self.window.send_to_embedder(EmbedderMsg::ShowContextMenu(
                 self.window.webview_id(),
                 sender,
@@ -1274,7 +1305,7 @@ impl DocumentEventHandler {
                 _ => (),
             }
         }
-        //Step 5
+        // Step 5
         true
     }
 
@@ -1314,10 +1345,10 @@ impl DocumentEventHandler {
             },
             ClipboardEventType::Paste => {
                 let (sender, receiver) = ipc::channel().unwrap();
-                self.window
-                    .send_to_constellation(ScriptToConstellationMessage::ForwardToEmbedder(
-                        EmbedderMsg::GetClipboardText(self.window.webview_id(), sender),
-                    ));
+                self.window.send_to_embedder(EmbedderMsg::GetClipboardText(
+                    self.window.webview_id(),
+                    sender,
+                ));
                 let text_contents = receiver
                     .recv()
                     .map(Result::unwrap_or_default)

@@ -13,6 +13,7 @@ use bitflags::bitflags;
 use embedder_traits::ViewportDetails;
 use euclid::SideOffsets2D;
 use malloc_size_of_derive::MallocSizeOf;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use servo_geometry::FastLayoutTransform;
 use style::values::specified::Overflow;
@@ -56,14 +57,14 @@ pub struct AxesScrollSensitivity {
     pub y: ScrollType,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
 pub enum SpatialTreeNodeInfo {
     ReferenceFrame(ReferenceFrameNodeInfo),
     Scroll(ScrollableNodeInfo),
     Sticky(StickyNodeInfo),
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct StickyNodeInfo {
     pub frame_rect: LayoutRect,
     pub margins: SideOffsets2D<Option<f32>, LayoutPixel>,
@@ -160,7 +161,7 @@ impl StickyNodeInfo {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct ReferenceFrameNodeInfo {
     pub origin: LayoutPoint,
     /// Origin of this frame relative to the document for bounding box queries.
@@ -172,7 +173,7 @@ pub struct ReferenceFrameNodeInfo {
 
 /// Data stored for nodes in the [ScrollTree] that actually scroll,
 /// as opposed to reference frames and sticky nodes which do not.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct ScrollableNodeInfo {
     /// The external scroll id of this node, used to track
     /// it between successive re-layouts.
@@ -278,7 +279,7 @@ impl ScrollableNodeInfo {
 /// Potential ideas for improvement:
 ///  - Test optimizing simple translations to avoid having to do full matrix
 ///    multiplication when transforms are not involved.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, MallocSizeOf, Serialize)]
 pub struct ScrollTreeNodeTransformationCache {
     node_to_root_transform: FastLayoutTransform,
     root_to_node_transform: Option<FastLayoutTransform>,
@@ -290,7 +291,7 @@ struct AncestorStickyInfo {
     nearest_scrolling_ancestor_viewport: LayoutRect,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
 /// A node in a tree of scroll nodes. This may either be a scrollable
 /// node which responds to scroll events or a non-scrollable one.
 pub struct ScrollTreeNode {
@@ -421,7 +422,7 @@ impl ScrollTreeNode {
 /// A tree of spatial nodes, which mirrors the spatial nodes in the WebRender
 /// display list, except these are used to scrolling in the compositor so that
 /// new offsets can be sent to WebRender.
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, MallocSizeOf, Serialize)]
 pub struct ScrollTree {
     /// A list of compositor-side scroll nodes that describe the tree
     /// of WebRender spatial nodes, used by the compositor to scroll the
@@ -558,7 +559,10 @@ impl ScrollTree {
 
     /// Given a set of all scroll offsets coming from the Servo renderer, update all of the offsets
     /// for nodes that actually exist in this tree.
-    pub fn set_all_scroll_offsets(&mut self, offsets: &HashMap<ExternalScrollId, LayoutVector2D>) {
+    pub fn set_all_scroll_offsets(
+        &mut self,
+        offsets: &FxHashMap<ExternalScrollId, LayoutVector2D>,
+    ) {
         for node in self.nodes.iter_mut() {
             if let SpatialTreeNodeInfo::Scroll(ref mut scroll_info) = node.info {
                 if let Some(offset) = offsets.get(&scroll_info.external_id) {
@@ -583,7 +587,7 @@ impl ScrollTree {
 
     /// Collect all of the scroll offsets of the scrolling nodes of this tree into a
     /// [`HashMap`] which can be applied to another tree.
-    pub fn scroll_offsets(&self) -> HashMap<ExternalScrollId, LayoutVector2D> {
+    pub fn scroll_offsets(&self) -> FxHashMap<ExternalScrollId, LayoutVector2D> {
         HashMap::from_iter(self.nodes.iter().filter_map(|node| match node.info {
             SpatialTreeNodeInfo::Scroll(ref scroll_info) => {
                 Some((scroll_info.external_id, scroll_info.offset))
@@ -778,7 +782,7 @@ impl ScrollTree {
 
 /// A data structure which stores compositor-side information about
 /// display lists sent to the compositor.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct CompositorDisplayListInfo {
     /// The WebRender [PipelineId] of this display list.
     pub pipeline_id: PipelineId,

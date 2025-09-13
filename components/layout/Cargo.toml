@@ -26,7 +26,6 @@ cssparser = { workspace = true }
 data-url = { workspace = true }
 embedder_traits = { workspace = true }
 euclid = { workspace = true }
-fnv = { workspace = true }
 fonts = { path = "../fonts" }
 fonts_traits = { workspace = true }
 fxhash = { workspace = true }
@@ -46,6 +45,7 @@ pixels = { path = "../pixels" }
 profile_traits = { workspace = true }
 range = { path = "../range" }
 rayon = { workspace = true }
+rustc-hash = { workspace = true }
 script = { path = "../script" }
 script_traits = { workspace = true }
 selectors = { workspace = true }

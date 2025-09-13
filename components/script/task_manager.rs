@@ -5,9 +5,9 @@
 use core::cell::RefCell;
 use core::sync::atomic::Ordering;
 use std::cell::Ref;
-use std::collections::HashMap;
 
 use base::id::PipelineId;
+use rustc_hash::FxHashMap;
 use strum::VariantArray;
 
 use crate::messaging::ScriptEventLoopSender;
@@ -20,7 +20,7 @@ enum TaskCancellers {
     /// of them need to have the same canceller flag for all task sources.
     Shared(TaskCanceller),
     /// For `Window` each `TaskSource` has its own canceller.
-    OnePerTaskSource(RefCell<HashMap<TaskSourceName, TaskCanceller>>),
+    OnePerTaskSource(RefCell<FxHashMap<TaskSourceName, TaskCanceller>>),
 }
 
 impl TaskCancellers {
@@ -65,7 +65,7 @@ impl TaskCancellers {
 
 macro_rules! task_source_functions {
     ($self:ident, $task_source:ident, $task_source_name:ident) => {
-        pub(crate) fn $task_source(&$self) -> TaskSource {
+        pub(crate) fn $task_source(&$self) -> TaskSource<'_> {
             TaskSource {
                 task_manager: $self,
                 name: TaskSourceName::$task_source_name,
@@ -105,7 +105,7 @@ impl TaskManager {
         self.pipeline_id
     }
 
-    pub(crate) fn sender(&self) -> Ref<Option<ScriptEventLoopSender>> {
+    pub(crate) fn sender(&self) -> Ref<'_, Option<ScriptEventLoopSender>> {
         self.sender.borrow()
     }
 
@@ -153,4 +153,5 @@ impl TaskManager {
         intersection_observer_task_source,
         IntersectionObserver
     );
+    task_source_functions!(self, webgpu_task_source, WebGPU);
 }

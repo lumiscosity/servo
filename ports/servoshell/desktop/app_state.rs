@@ -5,6 +5,7 @@
 use std::cell::{Ref, RefCell, RefMut};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::mem;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -13,17 +14,17 @@ use embedder_traits::webdriver::WebDriverSenders;
 use euclid::Vector2D;
 use keyboard_types::{Key, Modifiers, NamedKey, ShortcutMatcher};
 use log::{error, info};
+use servo::base::generic_channel::GenericSender;
 use servo::base::id::WebViewId;
 use servo::config::pref;
 use servo::ipc_channel::ipc::IpcSender;
 use servo::webrender_api::ScrollLocation;
 use servo::webrender_api::units::{DeviceIntPoint, DeviceIntSize};
 use servo::{
-    AllowOrDenyRequest, AuthenticationRequest, FilterPattern, FocusId, FormControl,
-    GamepadHapticEffectType, KeyboardEvent, LoadStatus, PermissionRequest, Servo, ServoDelegate,
-    ServoError, SimpleDialog, TraversalId, WebDriverCommandMsg, WebDriverJSResult,
-    WebDriverJSValue, WebDriverLoadStatus, WebDriverUserPrompt, WebView, WebViewBuilder,
-    WebViewDelegate,
+    AllowOrDenyRequest, AuthenticationRequest, FilterPattern, FormControl, GamepadHapticEffectType,
+    JSValue, KeyboardEvent, LoadStatus, PermissionRequest, Servo, ServoDelegate, ServoError,
+    SimpleDialog, TraversalId, WebDriverCommandMsg, WebDriverJSResult, WebDriverLoadStatus,
+    WebDriverUserPrompt, WebView, WebViewBuilder, WebViewDelegate,
 };
 use url::Url;
 
@@ -84,6 +85,14 @@ pub struct RunningAppStateInner {
     /// Whether or not Servo needs to repaint its display. Currently this is global
     /// because every `WebView` shares a `RenderingContext`.
     need_repaint: bool,
+
+    /// Whether or not the amount of dialogs on the currently rendered webview
+    /// has just changed.
+    dialog_amount_changed: bool,
+
+    /// List of webviews that have favicon textures which are not yet uploaded
+    /// to the GPU by egui.
+    pending_favicon_loads: Vec<WebViewId>,
 }
 
 impl Drop for RunningAppState {
@@ -114,14 +123,15 @@ impl RunningAppState {
                 gamepad_support: GamepadSupport::maybe_new(),
                 need_update: false,
                 need_repaint: false,
+                dialog_amount_changed: false,
+                pending_favicon_loads: Default::default(),
             }),
         }
     }
 
     pub(crate) fn create_and_focus_toplevel_webview(self: &Rc<Self>, url: Url) {
         let webview = self.create_toplevel_webview(url);
-        webview.focus();
-        webview.raise_to_top(true);
+        webview.focus_and_raise_to_top(true);
     }
 
     pub(crate) fn create_toplevel_webview(self: &Rc<Self>, url: Url) -> WebView {
@@ -136,11 +146,11 @@ impl RunningAppState {
         webview
     }
 
-    pub(crate) fn inner(&self) -> Ref<RunningAppStateInner> {
+    pub(crate) fn inner(&self) -> Ref<'_, RunningAppStateInner> {
         self.inner.borrow()
     }
 
-    pub(crate) fn inner_mut(&self) -> RefMut<RunningAppStateInner> {
+    pub(crate) fn inner_mut(&self) -> RefMut<'_, RunningAppStateInner> {
         self.inner.borrow_mut()
     }
 
@@ -205,8 +215,12 @@ impl RunningAppState {
 
         // Delegate handlers may have asked us to present or update compositor contents.
         // Currently, egui-file-dialog dialogs need to be constantly redrawn or animations aren't fluid.
-        let need_window_redraw = self.inner().need_repaint || self.has_active_dialog();
+        let need_window_redraw = self.inner().need_repaint ||
+            self.has_active_dialog() ||
+            self.inner().dialog_amount_changed;
         let need_update = std::mem::replace(&mut self.inner_mut().need_update, false);
+
+        self.inner_mut().dialog_amount_changed = false;
 
         PumpResult::Continue {
             need_update,
@@ -234,8 +248,13 @@ impl RunningAppState {
             return;
         };
 
-        if let Some(dialogs) = self.inner_mut().dialogs.get_mut(&webview_id) {
+        let mut inner = self.inner_mut();
+        if let Some(dialogs) = inner.dialogs.get_mut(&webview_id) {
+            let length = dialogs.len();
             dialogs.retain_mut(callback);
+            if length != dialogs.len() {
+                inner.dialog_amount_changed = true;
+            }
         }
     }
 
@@ -430,11 +449,11 @@ impl RunningAppState {
                 webview.notify_scroll_event(ScrollLocation::End, origin);
             })
             .shortcut(Modifiers::empty(), Key::Named(NamedKey::ArrowUp), || {
-                let location = ScrollLocation::Delta(Vector2D::new(0.0, -1.0 * LINE_HEIGHT));
+                let location = ScrollLocation::Delta(Vector2D::new(0.0, -LINE_HEIGHT));
                 webview.notify_scroll_event(location, origin);
             })
             .shortcut(Modifiers::empty(), Key::Named(NamedKey::ArrowDown), || {
-                let location = ScrollLocation::Delta(Vector2D::new(0.0, 1.0 * LINE_HEIGHT));
+                let location = ScrollLocation::Delta(Vector2D::new(0.0, LINE_HEIGHT));
                 webview.notify_scroll_event(location, origin);
             })
             .shortcut(Modifiers::empty(), Key::Named(NamedKey::ArrowLeft), || {
@@ -447,17 +466,10 @@ impl RunningAppState {
             });
     }
 
-    pub(crate) fn set_pending_focus(&self, focus_id: FocusId, sender: IpcSender<bool>) {
-        self.webdriver_senders
-            .borrow_mut()
-            .pending_focus
-            .insert(focus_id, sender);
-    }
-
     pub(crate) fn set_pending_traversal(
         &self,
         traversal_id: TraversalId,
-        sender: IpcSender<WebDriverLoadStatus>,
+        sender: GenericSender<WebDriverLoadStatus>,
     ) {
         self.webdriver_senders
             .borrow_mut()
@@ -468,7 +480,7 @@ impl RunningAppState {
     pub(crate) fn set_load_status_sender(
         &self,
         webview_id: WebViewId,
-        sender: IpcSender<WebDriverLoadStatus>,
+        sender: GenericSender<WebDriverLoadStatus>,
     ) {
         self.webdriver_senders
             .borrow_mut()
@@ -500,8 +512,10 @@ impl RunningAppState {
             .borrow()
             .script_evaluation_interrupt_sender
         {
-            sender.send(Ok(WebDriverJSValue::Null)).unwrap_or_else(|err| {
-                info!("Notify dialog appear failed. Maybe the channel to webdriver is closed: {err}");
+            sender.send(Ok(JSValue::Null)).unwrap_or_else(|err| {
+                info!(
+                    "Notify dialog appear failed. Maybe the channel to webdriver is closed: {err}"
+                );
             });
         }
     }
@@ -511,6 +525,11 @@ impl RunningAppState {
             .borrow_mut()
             .load_status_senders
             .remove(&webview_id);
+    }
+
+    /// Return a list of all webviews that have favicons that have not yet been loaded by egui.
+    pub(crate) fn take_pending_favicon_loads(&self) -> Vec<WebViewId> {
+        mem::take(&mut self.inner_mut().pending_favicon_loads)
     }
 }
 
@@ -632,8 +651,7 @@ impl WebViewDelegate for RunningAppState {
         // as that is what the specification expects. Otherwise, we would like `window.open()`
         // to create a new foreground tab
         if self.servoshell_preferences.webdriver_port.is_none() {
-            webview.focus();
-            webview.raise_to_top(true);
+            webview.focus_and_raise_to_top(true);
         }
         self.add(webview.clone());
         Some(webview)
@@ -641,14 +659,6 @@ impl WebViewDelegate for RunningAppState {
 
     fn notify_closed(&self, webview: servo::WebView) {
         self.close_webview(webview.id());
-    }
-
-    fn notify_focus_complete(&self, webview: servo::WebView, focus_id: FocusId) {
-        let mut webdriver_state = self.webdriver_senders.borrow_mut();
-        if let Entry::Occupied(entry) = webdriver_state.pending_focus.entry(focus_id) {
-            let sender = entry.remove();
-            let _ = sender.send(webview.focused());
-        }
     }
 
     fn notify_focus_changed(&self, webview: servo::WebView, focused: bool) {
@@ -693,7 +703,7 @@ impl WebViewDelegate for RunningAppState {
         &self,
         webview: servo::WebView,
         devices: Vec<String>,
-        response_sender: IpcSender<Option<String>>,
+        response_sender: GenericSender<Option<String>>,
     ) {
         self.add_dialog(
             webview,
@@ -706,7 +716,7 @@ impl WebViewDelegate for RunningAppState {
         webview: servo::WebView,
         filter_pattern: Vec<FilterPattern>,
         allow_select_mutiple: bool,
-        response_sender: IpcSender<Option<Vec<PathBuf>>>,
+        response_sender: GenericSender<Option<Vec<PathBuf>>>,
     ) {
         let file_dialog =
             Dialog::new_file_dialog(allow_select_mutiple, response_sender, filter_pattern);
@@ -799,5 +809,11 @@ impl WebViewDelegate for RunningAppState {
                 );
             },
         }
+    }
+
+    fn notify_favicon_changed(&self, webview: WebView) {
+        let mut inner = self.inner_mut();
+        inner.pending_favicon_loads.push(webview.id());
+        inner.need_repaint = true;
     }
 }

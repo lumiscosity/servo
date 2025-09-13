@@ -7,14 +7,15 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::thread;
 
+use base::generic_channel::{self, GenericReceiver, GenericSender};
 use base::id::WebViewId;
-use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
 use malloc_size_of::MallocSizeOf;
 use net_traits::storage_thread::{StorageThreadMsg, StorageType};
 use profile_traits::mem::{
     ProcessReports, ProfilerChan as MemProfilerChan, Report, ReportKind, perform_memory_report,
 };
 use profile_traits::path;
+use rustc_hash::FxHashMap;
 use servo_url::ServoUrl;
 
 use crate::resource_thread;
@@ -25,13 +26,13 @@ pub trait StorageThreadFactory {
     fn new(config_dir: Option<PathBuf>, mem_profiler_chan: MemProfilerChan) -> Self;
 }
 
-impl StorageThreadFactory for IpcSender<StorageThreadMsg> {
+impl StorageThreadFactory for GenericSender<StorageThreadMsg> {
     /// Create a storage thread
     fn new(
         config_dir: Option<PathBuf>,
         mem_profiler_chan: MemProfilerChan,
-    ) -> IpcSender<StorageThreadMsg> {
-        let (chan, port) = ipc::channel().unwrap();
+    ) -> GenericSender<StorageThreadMsg> {
+        let (chan, port) = generic_channel::channel().unwrap();
         let chan2 = chan.clone();
         thread::Builder::new()
             .name("StorageManager".to_owned())
@@ -51,21 +52,21 @@ impl StorageThreadFactory for IpcSender<StorageThreadMsg> {
 type OriginEntry = (usize, BTreeMap<String, String>);
 
 struct StorageManager {
-    port: IpcReceiver<StorageThreadMsg>,
-    session_data: HashMap<WebViewId, HashMap<String, OriginEntry>>,
+    port: GenericReceiver<StorageThreadMsg>,
+    session_data: FxHashMap<WebViewId, HashMap<String, OriginEntry>>,
     local_data: HashMap<String, OriginEntry>,
     config_dir: Option<PathBuf>,
 }
 
 impl StorageManager {
-    fn new(port: IpcReceiver<StorageThreadMsg>, config_dir: Option<PathBuf>) -> StorageManager {
+    fn new(port: GenericReceiver<StorageThreadMsg>, config_dir: Option<PathBuf>) -> StorageManager {
         let mut local_data = HashMap::new();
         if let Some(ref config_dir) = config_dir {
             resource_thread::read_json_from_file(&mut local_data, config_dir, "local_data.json");
         }
         StorageManager {
             port,
-            session_data: HashMap::new(),
+            session_data: FxHashMap::default(),
             local_data,
             config_dir,
         }
@@ -194,7 +195,7 @@ impl StorageManager {
 
     fn length(
         &self,
-        sender: IpcSender<usize>,
+        sender: GenericSender<usize>,
         storage_type: StorageType,
         webview_id: WebViewId,
         url: ServoUrl,
@@ -208,7 +209,7 @@ impl StorageManager {
 
     fn key(
         &self,
-        sender: IpcSender<Option<String>>,
+        sender: GenericSender<Option<String>>,
         storage_type: StorageType,
         webview_id: WebViewId,
         url: ServoUrl,
@@ -224,7 +225,7 @@ impl StorageManager {
 
     fn keys(
         &self,
-        sender: IpcSender<Vec<String>>,
+        sender: GenericSender<Vec<String>>,
         storage_type: StorageType,
         webview_id: WebViewId,
         url: ServoUrl,
@@ -242,7 +243,7 @@ impl StorageManager {
     /// exceeding the quota limit
     fn set_item(
         &mut self,
-        sender: IpcSender<Result<(bool, Option<String>), ()>>,
+        sender: GenericSender<Result<(bool, Option<String>), ()>>,
         storage_type: StorageType,
         webview_id: WebViewId,
         url: ServoUrl,
@@ -291,7 +292,7 @@ impl StorageManager {
 
     fn request_item(
         &self,
-        sender: IpcSender<Option<String>>,
+        sender: GenericSender<Option<String>>,
         storage_type: StorageType,
         webview_id: WebViewId,
         url: ServoUrl,
@@ -307,7 +308,7 @@ impl StorageManager {
     /// Sends Some(old_value) in case there was a previous value with the key name, otherwise sends None
     fn remove_item(
         &mut self,
-        sender: IpcSender<Option<String>>,
+        sender: GenericSender<Option<String>>,
         storage_type: StorageType,
         webview_id: WebViewId,
         url: ServoUrl,
@@ -325,7 +326,7 @@ impl StorageManager {
 
     fn clear(
         &mut self,
-        sender: IpcSender<bool>,
+        sender: GenericSender<bool>,
         storage_type: StorageType,
         webview_id: WebViewId,
         url: ServoUrl,

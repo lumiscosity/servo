@@ -5,6 +5,7 @@
 use std::num::NonZero;
 use std::ptr;
 use std::rc::Rc;
+use std::str::FromStr;
 
 use aes::cipher::block_padding::Pkcs7;
 use aes::cipher::generic_array::GenericArray;
@@ -18,8 +19,9 @@ use cipher::consts::{U12, U16, U32};
 use dom_struct::dom_struct;
 use js::conversions::ConversionResult;
 use js::jsapi::{JS_NewObject, JSObject};
-use js::jsval::ObjectValue;
-use js::rust::MutableHandleObject;
+use js::jsval::{ObjectValue, UndefinedValue};
+use js::rust::wrappers::JS_ParseJSON;
+use js::rust::{HandleValue, MutableHandleObject};
 use js::typedarray::ArrayBufferU8;
 use servo_rand::{RngCore, ServoRng};
 
@@ -32,16 +34,17 @@ use crate::dom::bindings::codegen::Bindings::SubtleCryptoBinding::{
     AesCbcParams, AesCtrParams, AesDerivedKeyParams, AesGcmParams, AesKeyAlgorithm,
     AesKeyGenParams, Algorithm, AlgorithmIdentifier, HkdfParams, HmacImportParams,
     HmacKeyAlgorithm, HmacKeyGenParams, JsonWebKey, KeyAlgorithm, KeyFormat, Pbkdf2Params,
-    SubtleCryptoMethods,
+    RsaOtherPrimesInfo, SubtleCryptoMethods,
 };
 use crate::dom::bindings::codegen::UnionTypes::{
     ArrayBufferViewOrArrayBuffer, ArrayBufferViewOrArrayBufferOrJsonWebKey,
 };
+use crate::dom::bindings::conversions::SafeToJSValConvertible;
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::refcounted::{Trusted, TrustedPromise};
 use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object};
 use crate::dom::bindings::root::DomRoot;
-use crate::dom::bindings::str::DOMString;
+use crate::dom::bindings::str::{DOMString, serialize_jsval_to_json_utf8};
 use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::cryptokey::{CryptoKey, Handle};
 use crate::dom::globalscope::GlobalScope;
@@ -143,14 +146,14 @@ impl SubtleCryptoMethods<crate::DomTypeHolder> for SubtleCrypto {
         can_gc: CanGc,
     ) -> Rc<Promise> {
         let promise = Promise::new_in_current_realm(comp, can_gc);
-        let normalized_algorithm = match normalize_algorithm_for_encrypt_or_decrypt(cx, &algorithm)
-        {
-            Ok(algorithm) => algorithm,
-            Err(e) => {
-                promise.reject_error(e, can_gc);
-                return promise;
-            },
-        };
+        let normalized_algorithm =
+            match normalize_algorithm_for_encrypt_or_decrypt(cx, &algorithm, can_gc) {
+                Ok(algorithm) => algorithm,
+                Err(e) => {
+                    promise.reject_error(e, can_gc);
+                    return promise;
+                },
+            };
         let data = match data {
             ArrayBufferViewOrArrayBuffer::ArrayBufferView(view) => view.to_vec(),
             ArrayBufferViewOrArrayBuffer::ArrayBuffer(buffer) => buffer.to_vec(),
@@ -204,14 +207,14 @@ impl SubtleCryptoMethods<crate::DomTypeHolder> for SubtleCrypto {
         can_gc: CanGc,
     ) -> Rc<Promise> {
         let promise = Promise::new_in_current_realm(comp, can_gc);
-        let normalized_algorithm = match normalize_algorithm_for_encrypt_or_decrypt(cx, &algorithm)
-        {
-            Ok(algorithm) => algorithm,
-            Err(e) => {
-                promise.reject_error(e, can_gc);
-                return promise;
-            },
-        };
+        let normalized_algorithm =
+            match normalize_algorithm_for_encrypt_or_decrypt(cx, &algorithm, can_gc) {
+                Ok(algorithm) => algorithm,
+                Err(e) => {
+                    promise.reject_error(e, can_gc);
+                    return promise;
+                },
+            };
         let data = match data {
             ArrayBufferViewOrArrayBuffer::ArrayBufferView(view) => view.to_vec(),
             ArrayBufferViewOrArrayBuffer::ArrayBuffer(buffer) => buffer.to_vec(),
@@ -276,14 +279,15 @@ impl SubtleCryptoMethods<crate::DomTypeHolder> for SubtleCrypto {
         // Step 3. Let normalizedAlgorithm be the result of normalizing an algorithm, with alg set to algorithm and
         // op set to "sign".
         let promise = Promise::new_in_current_realm(comp, can_gc);
-        let normalized_algorithm = match normalize_algorithm_for_sign_or_verify(cx, &algorithm) {
-            Ok(algorithm) => algorithm,
-            Err(e) => {
-                // Step 4. If an error occurred, return a Promise rejected with normalizedAlgorithm.
-                promise.reject_error(e, can_gc);
-                return promise;
-            },
-        };
+        let normalized_algorithm =
+            match normalize_algorithm_for_sign_or_verify(cx, &algorithm, can_gc) {
+                Ok(algorithm) => algorithm,
+                Err(e) => {
+                    // Step 4. If an error occurred, return a Promise rejected with normalizedAlgorithm.
+                    promise.reject_error(e, can_gc);
+                    return promise;
+                },
+            };
 
         // Step 5. Let promise be a new Promise.
         // NOTE: We did that in preparation of Step 4.
@@ -318,7 +322,7 @@ impl SubtleCryptoMethods<crate::DomTypeHolder> for SubtleCrypto {
                 // Step 10.  Let result be the result of performing the sign operation specified by normalizedAlgorithm
                 // using key and algorithm and with data as message.
                 let cx = GlobalScope::get_cx();
-                let result = match normalized_algorithm.sign(cx, &key, &data) {
+                let result = match normalized_algorithm.sign(cx, &key, &data, CanGc::note()) {
                     Ok(signature) => signature,
                     Err(e) => {
                         promise.reject_error(e, CanGc::note());
@@ -368,14 +372,15 @@ impl SubtleCryptoMethods<crate::DomTypeHolder> for SubtleCrypto {
         // Step 4. Let normalizedAlgorithm be the result of normalizing an algorithm, with alg set to
         // algorithm and op set to "verify".
         let promise = Promise::new_in_current_realm(comp, can_gc);
-        let normalized_algorithm = match normalize_algorithm_for_sign_or_verify(cx, &algorithm) {
-            Ok(algorithm) => algorithm,
-            Err(e) => {
-                // Step 5. If an error occurred, return a Promise rejected with normalizedAlgorithm.
-                promise.reject_error(e, can_gc);
-                return promise;
-            },
-        };
+        let normalized_algorithm =
+            match normalize_algorithm_for_sign_or_verify(cx, &algorithm, can_gc) {
+                Ok(algorithm) => algorithm,
+                Err(e) => {
+                    // Step 5. If an error occurred, return a Promise rejected with normalizedAlgorithm.
+                    promise.reject_error(e, can_gc);
+                    return promise;
+                },
+            };
 
         // Step 6. Let promise be a new Promise.
         // NOTE: We did that in preparation of Step 6.
@@ -410,7 +415,7 @@ impl SubtleCryptoMethods<crate::DomTypeHolder> for SubtleCrypto {
                 // Step 1. Let result be the result of performing the verify operation specified by normalizedAlgorithm
                 // using key, algorithm and signature and with data as message.
                 let cx = GlobalScope::get_cx();
-                let result = match normalized_algorithm.verify(cx, &key, &data, &signature) {
+                let result = match normalized_algorithm.verify(cx, &key, &data, &signature, CanGc::note()) {
                     Ok(result) => result,
                     Err(e) => {
                         promise.reject_error(e, CanGc::note());
@@ -446,7 +451,7 @@ impl SubtleCryptoMethods<crate::DomTypeHolder> for SubtleCrypto {
         // Step 3. Let normalizedAlgorithm be the result of normalizing an algorithm,
         // with alg set to algorithm and op set to "digest".
         let promise = Promise::new_in_current_realm(comp, can_gc);
-        let normalized_algorithm = match normalize_algorithm_for_digest(cx, &algorithm) {
+        let normalized_algorithm = match normalize_algorithm_for_digest(cx, &algorithm, can_gc) {
             Ok(normalized_algorithm) => normalized_algorithm,
             Err(e) => {
                 // Step 4. If an error occurred, return a Promise rejected with normalizedAlgorithm.
@@ -502,13 +507,14 @@ impl SubtleCryptoMethods<crate::DomTypeHolder> for SubtleCrypto {
         can_gc: CanGc,
     ) -> Rc<Promise> {
         let promise = Promise::new_in_current_realm(comp, can_gc);
-        let normalized_algorithm = match normalize_algorithm_for_generate_key(cx, &algorithm) {
-            Ok(algorithm) => algorithm,
-            Err(e) => {
-                promise.reject_error(e, can_gc);
-                return promise;
-            },
-        };
+        let normalized_algorithm =
+            match normalize_algorithm_for_generate_key(cx, &algorithm, can_gc) {
+                Ok(algorithm) => algorithm,
+                Err(e) => {
+                    promise.reject_error(e, can_gc);
+                    return promise;
+                },
+            };
 
         let this = Trusted::new(self);
         let trusted_promise = TrustedPromise::new(promise.clone());
@@ -547,7 +553,8 @@ impl SubtleCryptoMethods<crate::DomTypeHolder> for SubtleCrypto {
         // Step 2. Let normalizedAlgorithm be the result of normalizing an algorithm, with alg set to algorithm
         // and op set to "deriveBits".
         let promise = Promise::new_in_current_realm(comp, can_gc);
-        let normalized_algorithm = match normalize_algorithm_for_derive_bits(cx, &algorithm) {
+        let normalized_algorithm = match normalize_algorithm_for_derive_bits(cx, &algorithm, can_gc)
+        {
             Ok(algorithm) => algorithm,
             Err(e) => {
                 // Step 3. If an error occurred, return a Promise rejected with normalizedAlgorithm.
@@ -559,7 +566,7 @@ impl SubtleCryptoMethods<crate::DomTypeHolder> for SubtleCrypto {
         // Step 4. Let normalizedDerivedKeyAlgorithmImport be the result of normalizing an algorithm,
         // with alg set to derivedKeyType and op set to "importKey".
         let normalized_derived_key_algorithm_import =
-            match normalize_algorithm_for_import_key(cx, &derived_key_type) {
+            match normalize_algorithm_for_import_key(cx, &derived_key_type, can_gc) {
                 Ok(algorithm) => algorithm,
                 Err(e) => {
                     // Step 5. If an error occurred, return a Promise rejected with normalizedDerivedKeyAlgorithmImport.
@@ -571,7 +578,7 @@ impl SubtleCryptoMethods<crate::DomTypeHolder> for SubtleCrypto {
         // Step 6. Let normalizedDerivedKeyAlgorithmLength be the result of normalizing an algorithm, with alg set
         // to derivedKeyType and op set to "get key length".
         let normalized_derived_key_algorithm_length =
-            match normalize_algorithm_for_get_key_length(cx, &derived_key_type) {
+            match normalize_algorithm_for_get_key_length(cx, &derived_key_type, can_gc) {
                 Ok(algorithm) => algorithm,
                 Err(e) => {
                     // Step 7. If an error occurred, return a Promise rejected with normalizedDerivedKeyAlgorithmLength.
@@ -647,7 +654,7 @@ impl SubtleCryptoMethods<crate::DomTypeHolder> for SubtleCrypto {
                 // Step 17. If the [[type]] internal slot of result is "secret" or "private" and usages
                 // is empty, then throw a SyntaxError.
                 if matches!(result.Type(), KeyType::Secret | KeyType::Private) && result.usages().is_empty() {
-                    promise.reject_error(Error::Syntax, CanGc::note());
+                    promise.reject_error(Error::Syntax(None), CanGc::note());
                     return;
                 }
 
@@ -675,7 +682,8 @@ impl SubtleCryptoMethods<crate::DomTypeHolder> for SubtleCrypto {
         // Step 2. Let normalizedAlgorithm be the result of normalizing an algorithm,
         // with alg set to algorithm and op set to "deriveBits".
         let promise = Promise::new_in_current_realm(comp, can_gc);
-        let normalized_algorithm = match normalize_algorithm_for_derive_bits(cx, &algorithm) {
+        let normalized_algorithm = match normalize_algorithm_for_derive_bits(cx, &algorithm, can_gc)
+        {
             Ok(algorithm) => algorithm,
             Err(e) => {
                 // Step 3. If an error occurred, return a Promise rejected with normalizedAlgorithm.
@@ -744,41 +752,84 @@ impl SubtleCryptoMethods<crate::DomTypeHolder> for SubtleCrypto {
         comp: InRealm,
         can_gc: CanGc,
     ) -> Rc<Promise> {
+        // Step 1. Let format, algorithm, extractable and usages, be the format, algorithm,
+        // extractable and keyUsages parameters passed to the importKey() method, respectively.
+
+        // Step 5. Let realm be the relevant realm of this.
+        // Step 6. Let promise be a new Promise.
         let promise = Promise::new_in_current_realm(comp, can_gc);
-        let normalized_algorithm = match normalize_algorithm_for_import_key(cx, &algorithm) {
+
+        // Step 2.
+        let key_data = match format {
+            // If format is equal to the string "raw", "pkcs8", or "spki":
+            KeyFormat::Raw | KeyFormat::Pkcs8 | KeyFormat::Spki => {
+                match key_data {
+                    // Step 2.1. If the keyData parameter passed to the importKey() method is a
+                    // JsonWebKey dictionary, throw a TypeError.
+                    ArrayBufferViewOrArrayBufferOrJsonWebKey::JsonWebKey(_) => {
+                        promise.reject_error(
+                            Error::Type("The keyData type does not match the format".to_string()),
+                            can_gc,
+                        );
+                        return promise;
+                    },
+
+                    // Step 2.2. Let keyData be the result of getting a copy of the bytes held by
+                    // the keyData parameter passed to the importKey() method.
+                    ArrayBufferViewOrArrayBufferOrJsonWebKey::ArrayBufferView(view) => {
+                        view.to_vec()
+                    },
+                    ArrayBufferViewOrArrayBufferOrJsonWebKey::ArrayBuffer(buffer) => {
+                        buffer.to_vec()
+                    },
+                }
+            },
+            // If format is equal to the string "jwk":
+            KeyFormat::Jwk => {
+                match key_data {
+                    ArrayBufferViewOrArrayBufferOrJsonWebKey::ArrayBufferView(_) |
+                    ArrayBufferViewOrArrayBufferOrJsonWebKey::ArrayBuffer(_) => {
+                        // Step 2.1. If the keyData parameter passed to the importKey() method is
+                        // not a JsonWebKey dictionary, throw a TypeError.
+                        promise.reject_error(
+                            Error::Type("The keyData type does not match the format".to_string()),
+                            can_gc,
+                        );
+                        return promise;
+                    },
+
+                    ArrayBufferViewOrArrayBufferOrJsonWebKey::JsonWebKey(jwk) => {
+                        // Step 2.2. Let keyData be the keyData parameter passed to the importKey() method.
+                        //
+                        // NOTE: Serialize JsonWebKey throught stringifying it.
+                        // JsonWebKey::stringify internally relies on ToJSON, so it will raise an
+                        // exception when a JS error is thrown. When this happens, we report the
+                        // error.
+                        match jwk.stringify(cx) {
+                            Ok(stringified) => stringified.as_bytes().to_vec(),
+                            Err(error) => {
+                                promise.reject_error(error, can_gc);
+                                return promise;
+                            },
+                        }
+                    },
+                }
+            },
+        };
+
+        // Step 3. Let normalizedAlgorithm be the result of normalizing an algorithm, with alg set
+        // to algorithm and op set to "importKey".
+        let normalized_algorithm = match normalize_algorithm_for_import_key(cx, &algorithm, can_gc)
+        {
             Ok(algorithm) => algorithm,
-            Err(e) => {
-                promise.reject_error(e, can_gc);
+            Err(error) => {
+                // Step 4. If an error occurred, return a Promise rejected with normalizedAlgorithm.
+                promise.reject_error(error, can_gc);
                 return promise;
             },
         };
 
-        let data = match key_data {
-            ArrayBufferViewOrArrayBufferOrJsonWebKey::ArrayBufferView(view) => view.to_vec(),
-            ArrayBufferViewOrArrayBufferOrJsonWebKey::JsonWebKey(json_web_key) => {
-                let data_string = match json_web_key.k {
-                    Some(s) => s.to_string(),
-                    None => {
-                        promise.reject_error(Error::Syntax, can_gc);
-                        return promise;
-                    },
-                };
-
-                match base64::engine::general_purpose::STANDARD_NO_PAD
-                    .decode(data_string.as_bytes())
-                {
-                    Ok(data) => data,
-                    Err(_) => {
-                        promise.reject_error(Error::Syntax, can_gc);
-                        return promise;
-                    },
-                }
-            },
-            ArrayBufferViewOrArrayBufferOrJsonWebKey::ArrayBuffer(array_buffer) => {
-                array_buffer.to_vec()
-            },
-        };
-
+        // Step 7. Return promise and perform the remaining steps in parallel.
         let this = Trusted::new(self);
         let trusted_promise = TrustedPromise::new(promise.clone());
         self.global()
@@ -787,12 +838,50 @@ impl SubtleCryptoMethods<crate::DomTypeHolder> for SubtleCrypto {
             .queue(task!(import_key: move || {
                 let subtle = this.root();
                 let promise = trusted_promise.root();
-                let imported_key = normalized_algorithm.import_key(&subtle,
-                    format, &data, extractable, key_usages, CanGc::note());
-                match imported_key {
-                    Ok(k) => promise.resolve_native(&k, CanGc::note()),
-                    Err(e) => promise.reject_error(e, CanGc::note()),
+
+                // TODO: Step 8. If the following steps or referenced procedures say to throw an
+                // error, queue a global task on the crypto task source, given realm's global
+                // object, to reject promise with the returned error; and then terminate the
+                // algorithm.
+
+                // Step 9. Let result be the CryptoKey object that results from performing the
+                // import key operation specified by normalizedAlgorithm using keyData, algorithm,
+                // format, extractable and usages.
+                let result = match normalized_algorithm.import_key(
+                    &subtle,
+                    format,
+                    &key_data,
+                    extractable,
+                    key_usages.clone(),
+                    CanGc::note()
+                ) {
+                    Ok(key) => key,
+                    Err(error) => {
+                        promise.reject_error(error, CanGc::note());
+                        return;
+                    },
                 };
+
+                // Step 10. If the [[type]] internal slot of result is "secret" or "private" and
+                // usages is empty, then throw a SyntaxError.
+                if matches!(result.Type(), KeyType::Secret | KeyType::Private) && key_usages.is_empty() {
+                    promise.reject_error(Error::Syntax(None), CanGc::note());
+                    return;
+                }
+
+                // Step 11. Set the [[extractable]] internal slot of result to extractable.
+                result.set_extractable(extractable);
+
+                // Step 12. Set the [[usages]] internal slot of result to the normalized value of usages.
+                result.set_usages(&key_usages);
+
+                // TODO: Step 13. Queue a global task on the crypto task source, given realm's
+                // global object, to perform the remaining steps.
+
+                // Step 14. Let result be the result of converting result to an ECMAScript Object
+                // in realm, as defined by [WebIDL].
+                // Step 15. Resolve promise with result.
+                promise.resolve_native(&result, CanGc::note());
             }));
 
         promise
@@ -829,12 +918,13 @@ impl SubtleCryptoMethods<crate::DomTypeHolder> for SubtleCrypto {
                 }
                 let exported_key = match alg_name.as_str() {
                     ALG_AES_CBC | ALG_AES_CTR | ALG_AES_KW | ALG_AES_GCM => subtle.export_key_aes(format, &key),
+                    ALG_HMAC => subtle.export_key_hmac(format, &key),
                     _ => Err(Error::NotSupported),
                 };
                 match exported_key {
                     Ok(k) => {
                         match k {
-                            AesExportedKey::Raw(k) => {
+                            ExportedKey::Raw(k) => {
                                 let cx = GlobalScope::get_cx();
                                 rooted!(in(*cx) let mut array_buffer_ptr = ptr::null_mut::<JSObject>());
                                 create_buffer_source::<ArrayBufferU8>(cx, &k, array_buffer_ptr.handle_mut(),
@@ -842,7 +932,7 @@ impl SubtleCryptoMethods<crate::DomTypeHolder> for SubtleCrypto {
                                     .expect("failed to create buffer source for exported key.");
                                 promise.resolve_native(&array_buffer_ptr.get(), CanGc::note())
                             },
-                            AesExportedKey::Jwk(k) => {
+                            ExportedKey::Jwk(k) => {
                                 promise.resolve_native(&k, CanGc::note())
                             },
                         }
@@ -867,13 +957,14 @@ impl SubtleCryptoMethods<crate::DomTypeHolder> for SubtleCrypto {
         can_gc: CanGc,
     ) -> Rc<Promise> {
         let promise = Promise::new_in_current_realm(comp, can_gc);
-        let normalized_algorithm = match normalize_algorithm_for_key_wrap(cx, &wrap_algorithm) {
-            Ok(algorithm) => algorithm,
-            Err(e) => {
-                promise.reject_error(e, can_gc);
-                return promise;
-            },
-        };
+        let normalized_algorithm =
+            match normalize_algorithm_for_key_wrap(cx, &wrap_algorithm, can_gc) {
+                Ok(algorithm) => algorithm,
+                Err(e) => {
+                    promise.reject_error(e, can_gc);
+                    return promise;
+                },
+            };
 
         let this = Trusted::new(self);
         let trusted_key = Trusted::new(key);
@@ -911,26 +1002,26 @@ impl SubtleCryptoMethods<crate::DomTypeHolder> for SubtleCrypto {
                 };
 
                 let bytes = match exported_key {
-                    AesExportedKey::Raw(k) => k,
-                    AesExportedKey::Jwk(key) => {
+                    ExportedKey::Raw(k) => k,
+                    ExportedKey::Jwk(key) => {
                         // The spec states to convert this to an ECMAscript object and stringify it, but since we know
                         // that the output will be a string of JSON we can just construct it manually
                         // TODO: Support more than just a subset of the JWK dict, or find a way to
                         // stringify via SM internals
                         let Some(k) = key.k else {
-                            promise.reject_error(Error::Syntax, CanGc::note());
+                            promise.reject_error(Error::Syntax(None), CanGc::note());
                             return;
                         };
                         let Some(alg) = key.alg else {
-                            promise.reject_error(Error::Syntax, CanGc::note());
+                            promise.reject_error(Error::Syntax(None), CanGc::note());
                             return;
                         };
                         let Some(ext) = key.ext else {
-                            promise.reject_error(Error::Syntax, CanGc::note());
+                            promise.reject_error(Error::Syntax(None), CanGc::note());
                             return;
                         };
                         let Some(key_ops) = key.key_ops else {
-                            promise.reject_error(Error::Syntax, CanGc::note());
+                            promise.reject_error(Error::Syntax(None), CanGc::note());
                             return;
                         };
                         let key_ops_str = key_ops.iter().map(|op| op.to_string()).collect::<Vec<String>>();
@@ -997,15 +1088,16 @@ impl SubtleCryptoMethods<crate::DomTypeHolder> for SubtleCrypto {
             ArrayBufferViewOrArrayBuffer::ArrayBufferView(view) => view.to_vec(),
             ArrayBufferViewOrArrayBuffer::ArrayBuffer(buffer) => buffer.to_vec(),
         };
-        let normalized_algorithm = match normalize_algorithm_for_key_wrap(cx, &unwrap_algorithm) {
-            Ok(algorithm) => algorithm,
-            Err(e) => {
-                promise.reject_error(e, can_gc);
-                return promise;
-            },
-        };
+        let normalized_algorithm =
+            match normalize_algorithm_for_key_wrap(cx, &unwrap_algorithm, can_gc) {
+                Ok(algorithm) => algorithm,
+                Err(e) => {
+                    promise.reject_error(e, can_gc);
+                    return promise;
+                },
+            };
         let normalized_key_algorithm =
-            match normalize_algorithm_for_import_key(cx, &unwrapped_key_algorithm) {
+            match normalize_algorithm_for_import_key(cx, &unwrapped_key_algorithm, can_gc) {
                 Ok(algorithm) => algorithm,
                 Err(e) => {
                     promise.reject_error(e, can_gc);
@@ -1065,18 +1157,37 @@ impl SubtleCryptoMethods<crate::DomTypeHolder> for SubtleCrypto {
                     },
                 };
 
+                // Step 15.
                 let import_key_bytes = match format {
-                    KeyFormat::Raw | KeyFormat::Spki | KeyFormat::Pkcs8 => bytes,
+                    // If format is equal to the strings "raw", "pkcs8", or "spki":
+                    KeyFormat::Raw | KeyFormat::Pkcs8 | KeyFormat::Spki => {
+                        // Let key be bytes.
+                        bytes
+                    },
+                    // If format is equal to the string "jwk":
                     KeyFormat::Jwk => {
-                        match parse_jwk(&bytes, normalized_key_algorithm.clone(), extractable, &key_usages) {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                promise.reject_error(e, CanGc::note());
+                        // Let key be the result of executing the parse a JWK algorithm, with bytes
+                        // as the data to be parsed.
+                        let jwk = match JsonWebKey::parse(cx, &bytes) {
+                            Ok(jwk) => jwk,
+                            Err(error) => {
+                                promise.reject_error(error, CanGc::note());
                                 return;
-                            }
+                            },
+                        };
+
+                        // NOTE: Further convert the stringified JsonWebKey to the bytes so that we
+                        // can pass it to normialized algorithm.
+                        match jwk.stringify(cx) {
+                            Ok(stringified) => stringified.as_bytes().to_vec(),
+                            Err(error) => {
+                                promise.reject_error(error, CanGc::note());
+                                return;
+                            },
                         }
                     },
                 };
+
                 match normalized_key_algorithm.import_key(&subtle, format, &import_key_bytes,
                     extractable, key_usages, CanGc::note()) {
                     Ok(imported_key) => promise.resolve_native(&imported_key, CanGc::note()),
@@ -1092,6 +1203,7 @@ impl SubtleCryptoMethods<crate::DomTypeHolder> for SubtleCrypto {
 // These "subtle" structs are proxies for the codegen'd dicts which don't hold a DOMString
 // so they can be sent safely when running steps in parallel.
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct SubtleAlgorithm {
     #[allow(dead_code)]
@@ -1201,8 +1313,12 @@ struct SubtleHmacImportParams {
 }
 
 impl SubtleHmacImportParams {
-    fn new(cx: JSContext, params: RootedTraceableBox<HmacImportParams>) -> Fallible<Self> {
-        let hash = normalize_algorithm_for_digest(cx, &params.hash)?;
+    fn new(
+        cx: JSContext,
+        params: RootedTraceableBox<HmacImportParams>,
+        can_gc: CanGc,
+    ) -> Fallible<Self> {
+        let hash = normalize_algorithm_for_digest(cx, &params.hash, can_gc)?;
         let params = Self {
             hash,
             length: params.length,
@@ -1251,8 +1367,12 @@ struct SubtleHmacKeyGenParams {
 }
 
 impl SubtleHmacKeyGenParams {
-    fn new(cx: JSContext, params: RootedTraceableBox<HmacKeyGenParams>) -> Fallible<Self> {
-        let hash = normalize_algorithm_for_digest(cx, &params.hash)?;
+    fn new(
+        cx: JSContext,
+        params: RootedTraceableBox<HmacKeyGenParams>,
+        can_gc: CanGc,
+    ) -> Fallible<Self> {
+        let hash = normalize_algorithm_for_digest(cx, &params.hash, can_gc)?;
         let params = Self {
             hash,
             length: params.length,
@@ -1274,8 +1394,8 @@ pub(crate) struct SubtleHkdfParams {
 }
 
 impl SubtleHkdfParams {
-    fn new(cx: JSContext, params: RootedTraceableBox<HkdfParams>) -> Fallible<Self> {
-        let hash = normalize_algorithm_for_digest(cx, &params.hash)?;
+    fn new(cx: JSContext, params: RootedTraceableBox<HkdfParams>, can_gc: CanGc) -> Fallible<Self> {
+        let hash = normalize_algorithm_for_digest(cx, &params.hash, can_gc)?;
         let salt = match &params.salt {
             ArrayBufferViewOrArrayBuffer::ArrayBufferView(view) => view.to_vec(),
             ArrayBufferViewOrArrayBuffer::ArrayBuffer(buffer) => buffer.to_vec(),
@@ -1305,7 +1425,11 @@ pub(crate) struct SubtlePbkdf2Params {
 }
 
 impl SubtlePbkdf2Params {
-    fn new(cx: JSContext, params: RootedTraceableBox<Pbkdf2Params>) -> Fallible<Self> {
+    fn new(
+        cx: JSContext,
+        params: RootedTraceableBox<Pbkdf2Params>,
+        can_gc: CanGc,
+    ) -> Fallible<Self> {
         let salt = match &params.salt {
             ArrayBufferViewOrArrayBuffer::ArrayBufferView(view) => view.to_vec(),
             ArrayBufferViewOrArrayBuffer::ArrayBuffer(buffer) => buffer.to_vec(),
@@ -1314,7 +1438,7 @@ impl SubtlePbkdf2Params {
         let params = Self {
             salt,
             iterations: params.iterations,
-            hash: normalize_algorithm_for_digest(cx, &params.hash)?,
+            hash: normalize_algorithm_for_digest(cx, &params.hash, can_gc)?,
         };
 
         Ok(params)
@@ -1399,36 +1523,181 @@ enum KeyWrapAlgorithm {
     AesGcm(SubtleAesGcmParams),
 }
 
-macro_rules! value_from_js_object {
-    ($t: ty, $cx: ident, $value: ident) => {{
-        let params_result = <$t>::new($cx, $value.handle()).map_err(|_| Error::JSFailed)?;
-        let ConversionResult::Success(params) = params_result else {
-            return Err(Error::Syntax);
-        };
-        params
-    }};
+/// Helper to abstract the conversion process of a JS value into many different WebIDL dictionaries.
+trait DictionaryFromJSVal: Sized {
+    fn create(
+        cx: JSContext,
+        value: HandleValue,
+        can_gc: CanGc,
+    ) -> Result<ConversionResult<Self>, ()>;
+}
+
+impl DictionaryFromJSVal for Algorithm {
+    fn create(
+        cx: JSContext,
+        value: HandleValue,
+        can_gc: CanGc,
+    ) -> Result<ConversionResult<Self>, ()> {
+        Self::new(cx, value, can_gc)
+    }
+}
+
+impl DictionaryFromJSVal for AesDerivedKeyParams {
+    fn create(
+        cx: JSContext,
+        value: HandleValue,
+        can_gc: CanGc,
+    ) -> Result<ConversionResult<Self>, ()> {
+        Self::new(cx, value, can_gc)
+    }
+}
+
+impl DictionaryFromJSVal for AesKeyGenParams {
+    fn create(
+        cx: JSContext,
+        value: HandleValue,
+        can_gc: CanGc,
+    ) -> Result<ConversionResult<Self>, ()> {
+        Self::new(cx, value, can_gc)
+    }
+}
+
+impl DictionaryFromJSVal for RootedTraceableBox<HmacImportParams> {
+    fn create(
+        cx: JSContext,
+        value: HandleValue,
+        can_gc: CanGc,
+    ) -> Result<ConversionResult<Self>, ()> {
+        HmacImportParams::new(cx, value, can_gc)
+    }
+}
+
+impl DictionaryFromJSVal for RootedTraceableBox<HmacKeyGenParams> {
+    fn create(
+        cx: JSContext,
+        value: HandleValue,
+        can_gc: CanGc,
+    ) -> Result<ConversionResult<Self>, ()> {
+        HmacKeyGenParams::new(cx, value, can_gc)
+    }
+}
+
+impl DictionaryFromJSVal for HmacKeyAlgorithm {
+    fn create(
+        cx: JSContext,
+        value: HandleValue,
+        can_gc: CanGc,
+    ) -> Result<ConversionResult<Self>, ()> {
+        Self::new(cx, value, can_gc)
+    }
+}
+
+impl DictionaryFromJSVal for RootedTraceableBox<AesCbcParams> {
+    fn create(
+        cx: JSContext,
+        value: HandleValue,
+        can_gc: CanGc,
+    ) -> Result<ConversionResult<Self>, ()> {
+        AesCbcParams::new(cx, value, can_gc)
+    }
+}
+
+impl DictionaryFromJSVal for RootedTraceableBox<AesCtrParams> {
+    fn create(
+        cx: JSContext,
+        value: HandleValue,
+        can_gc: CanGc,
+    ) -> Result<ConversionResult<Self>, ()> {
+        AesCtrParams::new(cx, value, can_gc)
+    }
+}
+
+impl DictionaryFromJSVal for RootedTraceableBox<AesGcmParams> {
+    fn create(
+        cx: JSContext,
+        value: HandleValue,
+        can_gc: CanGc,
+    ) -> Result<ConversionResult<Self>, ()> {
+        AesGcmParams::new(cx, value, can_gc)
+    }
+}
+
+impl DictionaryFromJSVal for RootedTraceableBox<Pbkdf2Params> {
+    fn create(
+        cx: JSContext,
+        value: HandleValue,
+        can_gc: CanGc,
+    ) -> Result<ConversionResult<Self>, ()> {
+        Pbkdf2Params::new(cx, value, can_gc)
+    }
+}
+
+impl DictionaryFromJSVal for RootedTraceableBox<HkdfParams> {
+    fn create(
+        cx: JSContext,
+        value: HandleValue,
+        can_gc: CanGc,
+    ) -> Result<ConversionResult<Self>, ()> {
+        HkdfParams::new(cx, value, can_gc)
+    }
+}
+
+fn extract_native_dict<T>(converted: Result<ConversionResult<T>, ()>) -> Fallible<T> {
+    let params_result = converted.map_err(|_| Error::JSFailed)?;
+    let ConversionResult::Success(params) = params_result else {
+        return Err(Error::Syntax(None));
+    };
+    Ok(params)
+}
+
+fn value_from_js_object<T: DictionaryFromJSVal>(
+    cx: JSContext,
+    value: HandleValue,
+    can_gc: CanGc,
+) -> Fallible<T> {
+    extract_native_dict(T::create(cx, value, can_gc))
+}
+
+trait DictionaryFromJSValType: crate::JSTraceable {}
+impl<T: crate::JSTraceable + 'static> DictionaryFromJSValType for T where
+    RootedTraceableBox<T>: DictionaryFromJSVal
+{
+}
+
+fn boxed_value_from_js_object<T: DictionaryFromJSValType>(
+    cx: JSContext,
+    value: HandleValue,
+    can_gc: CanGc,
+) -> Fallible<RootedTraceableBox<T>>
+where
+    RootedTraceableBox<T>: DictionaryFromJSVal,
+{
+    extract_native_dict(<RootedTraceableBox<T>>::create(cx, value, can_gc))
 }
 
 /// <https://w3c.github.io/webcrypto/#algorithm-normalization-normalize-an-algorithm> with operation `"get key length"`
 fn normalize_algorithm_for_get_key_length(
     cx: JSContext,
     algorithm: &AlgorithmIdentifier,
+    can_gc: CanGc,
 ) -> Result<GetKeyLengthAlgorithm, Error> {
     match algorithm {
         AlgorithmIdentifier::Object(obj) => {
             rooted!(in(*cx) let value = ObjectValue(obj.get()));
-            let algorithm = value_from_js_object!(Algorithm, cx, value);
+            let algorithm = value_from_js_object::<Algorithm>(cx, value.handle(), can_gc)?;
 
             let name = algorithm.name.str();
             let normalized_algorithm = if name.eq_ignore_ascii_case(ALG_AES_CBC) ||
                 name.eq_ignore_ascii_case(ALG_AES_CTR) ||
                 name.eq_ignore_ascii_case(ALG_AES_GCM)
             {
-                let params = value_from_js_object!(AesDerivedKeyParams, cx, value);
+                let params =
+                    value_from_js_object::<AesDerivedKeyParams>(cx, value.handle(), can_gc)?;
                 GetKeyLengthAlgorithm::Aes(params.length)
             } else if name.eq_ignore_ascii_case(ALG_HMAC) {
-                let params = value_from_js_object!(HmacImportParams, cx, value);
-                let subtle_params = SubtleHmacImportParams::new(cx, params)?;
+                let params =
+                    boxed_value_from_js_object::<HmacImportParams>(cx, value.handle(), can_gc)?;
+                let subtle_params = SubtleHmacImportParams::new(cx, params, can_gc)?;
                 return Ok(GetKeyLengthAlgorithm::Hmac(subtle_params));
             } else {
                 return Err(Error::NotSupported);
@@ -1447,11 +1716,12 @@ fn normalize_algorithm_for_get_key_length(
 fn normalize_algorithm_for_digest(
     cx: JSContext,
     algorithm: &AlgorithmIdentifier,
+    can_gc: CanGc,
 ) -> Result<DigestAlgorithm, Error> {
     let name = match algorithm {
         AlgorithmIdentifier::Object(obj) => {
             rooted!(in(*cx) let value = ObjectValue(obj.get()));
-            let algorithm = value_from_js_object!(Algorithm, cx, value);
+            let algorithm = value_from_js_object::<Algorithm>(cx, value.handle(), can_gc)?;
 
             algorithm.name.str().to_uppercase()
         },
@@ -1473,16 +1743,18 @@ fn normalize_algorithm_for_digest(
 fn normalize_algorithm_for_import_key(
     cx: JSContext,
     algorithm: &AlgorithmIdentifier,
+    can_gc: CanGc,
 ) -> Result<ImportKeyAlgorithm, Error> {
     let name = match algorithm {
         AlgorithmIdentifier::Object(obj) => {
             rooted!(in(*cx) let value = ObjectValue(obj.get()));
-            let algorithm = value_from_js_object!(Algorithm, cx, value);
+            let algorithm = value_from_js_object::<Algorithm>(cx, value.handle(), can_gc)?;
 
             let name = algorithm.name.str().to_uppercase();
             if name == ALG_HMAC {
-                let params = value_from_js_object!(HmacImportParams, cx, value);
-                let subtle_params = SubtleHmacImportParams::new(cx, params)?;
+                let params =
+                    boxed_value_from_js_object::<HmacImportParams>(cx, value.handle(), can_gc)?;
+                let subtle_params = SubtleHmacImportParams::new(cx, params, can_gc)?;
                 return Ok(ImportKeyAlgorithm::Hmac(subtle_params));
             }
 
@@ -1508,6 +1780,7 @@ fn normalize_algorithm_for_import_key(
 fn normalize_algorithm_for_derive_bits(
     cx: JSContext,
     algorithm: &AlgorithmIdentifier,
+    can_gc: CanGc,
 ) -> Result<DeriveBitsAlgorithm, Error> {
     let AlgorithmIdentifier::Object(obj) = algorithm else {
         // All algorithms that support "deriveBits" require additional parameters
@@ -1515,15 +1788,15 @@ fn normalize_algorithm_for_derive_bits(
     };
 
     rooted!(in(*cx) let value = ObjectValue(obj.get()));
-    let algorithm = value_from_js_object!(Algorithm, cx, value);
+    let algorithm = value_from_js_object::<Algorithm>(cx, value.handle(), can_gc)?;
 
     let normalized_algorithm = if algorithm.name.str().eq_ignore_ascii_case(ALG_PBKDF2) {
-        let params = value_from_js_object!(Pbkdf2Params, cx, value);
-        let subtle_params = SubtlePbkdf2Params::new(cx, params)?;
+        let params = boxed_value_from_js_object::<Pbkdf2Params>(cx, value.handle(), can_gc)?;
+        let subtle_params = SubtlePbkdf2Params::new(cx, params, can_gc)?;
         DeriveBitsAlgorithm::Pbkdf2(subtle_params)
     } else if algorithm.name.str().eq_ignore_ascii_case(ALG_HKDF) {
-        let params = value_from_js_object!(HkdfParams, cx, value);
-        let subtle_params = SubtleHkdfParams::new(cx, params)?;
+        let params = boxed_value_from_js_object::<HkdfParams>(cx, value.handle(), can_gc)?;
+        let subtle_params = SubtleHkdfParams::new(cx, params, can_gc)?;
         DeriveBitsAlgorithm::Hkdf(subtle_params)
     } else {
         return Err(Error::NotSupported);
@@ -1536,6 +1809,7 @@ fn normalize_algorithm_for_derive_bits(
 fn normalize_algorithm_for_encrypt_or_decrypt(
     cx: JSContext,
     algorithm: &AlgorithmIdentifier,
+    can_gc: CanGc,
 ) -> Result<EncryptionAlgorithm, Error> {
     let AlgorithmIdentifier::Object(obj) = algorithm else {
         // All algorithms that support "encrypt" or "decrypt" require additional parameters
@@ -1543,17 +1817,17 @@ fn normalize_algorithm_for_encrypt_or_decrypt(
     };
 
     rooted!(in(*cx) let value = ObjectValue(obj.get()));
-    let algorithm = value_from_js_object!(Algorithm, cx, value);
+    let algorithm = value_from_js_object::<Algorithm>(cx, value.handle(), can_gc)?;
 
     let name = algorithm.name.str();
     let normalized_algorithm = if name.eq_ignore_ascii_case(ALG_AES_CBC) {
-        let params = value_from_js_object!(AesCbcParams, cx, value);
+        let params = boxed_value_from_js_object::<AesCbcParams>(cx, value.handle(), can_gc)?;
         EncryptionAlgorithm::AesCbc(params.into())
     } else if name.eq_ignore_ascii_case(ALG_AES_CTR) {
-        let params = value_from_js_object!(AesCtrParams, cx, value);
+        let params = boxed_value_from_js_object::<AesCtrParams>(cx, value.handle(), can_gc)?;
         EncryptionAlgorithm::AesCtr(params.into())
     } else if name.eq_ignore_ascii_case(ALG_AES_GCM) {
-        let params = value_from_js_object!(AesGcmParams, cx, value);
+        let params = boxed_value_from_js_object::<AesGcmParams>(cx, value.handle(), can_gc)?;
         EncryptionAlgorithm::AesGcm(params.into())
     } else {
         return Err(Error::NotSupported);
@@ -1567,11 +1841,12 @@ fn normalize_algorithm_for_encrypt_or_decrypt(
 fn normalize_algorithm_for_sign_or_verify(
     cx: JSContext,
     algorithm: &AlgorithmIdentifier,
+    can_gc: CanGc,
 ) -> Result<SignatureAlgorithm, Error> {
     let name = match algorithm {
         AlgorithmIdentifier::Object(obj) => {
             rooted!(in(*cx) let value = ObjectValue(obj.get()));
-            let algorithm = value_from_js_object!(Algorithm, cx, value);
+            let algorithm = value_from_js_object::<Algorithm>(cx, value.handle(), can_gc)?;
 
             algorithm.name.str().to_uppercase()
         },
@@ -1590,6 +1865,7 @@ fn normalize_algorithm_for_sign_or_verify(
 fn normalize_algorithm_for_generate_key(
     cx: JSContext,
     algorithm: &AlgorithmIdentifier,
+    can_gc: CanGc,
 ) -> Result<KeyGenerationAlgorithm, Error> {
     let AlgorithmIdentifier::Object(obj) = algorithm else {
         // All algorithms that support "generateKey" require additional parameters
@@ -1597,7 +1873,7 @@ fn normalize_algorithm_for_generate_key(
     };
 
     rooted!(in(*cx) let value = ObjectValue(obj.get()));
-    let algorithm = value_from_js_object!(Algorithm, cx, value);
+    let algorithm = value_from_js_object::<Algorithm>(cx, value.handle(), can_gc)?;
 
     let name = algorithm.name.str();
     let normalized_algorithm = if name.eq_ignore_ascii_case(ALG_AES_CBC) ||
@@ -1605,11 +1881,11 @@ fn normalize_algorithm_for_generate_key(
         name.eq_ignore_ascii_case(ALG_AES_KW) ||
         name.eq_ignore_ascii_case(ALG_AES_GCM)
     {
-        let params = value_from_js_object!(AesKeyGenParams, cx, value);
+        let params = value_from_js_object::<AesKeyGenParams>(cx, value.handle(), can_gc)?;
         KeyGenerationAlgorithm::Aes(params.into())
     } else if name.eq_ignore_ascii_case(ALG_HMAC) {
-        let params = value_from_js_object!(HmacKeyGenParams, cx, value);
-        let subtle_params = SubtleHmacKeyGenParams::new(cx, params)?;
+        let params = boxed_value_from_js_object::<HmacKeyGenParams>(cx, value.handle(), can_gc)?;
+        let subtle_params = SubtleHmacKeyGenParams::new(cx, params, can_gc)?;
         KeyGenerationAlgorithm::Hmac(subtle_params)
     } else {
         return Err(Error::NotSupported);
@@ -1622,11 +1898,12 @@ fn normalize_algorithm_for_generate_key(
 fn normalize_algorithm_for_key_wrap(
     cx: JSContext,
     algorithm: &AlgorithmIdentifier,
+    can_gc: CanGc,
 ) -> Result<KeyWrapAlgorithm, Error> {
     let name = match algorithm {
         AlgorithmIdentifier::Object(obj) => {
             rooted!(in(*cx) let value = ObjectValue(obj.get()));
-            let algorithm = value_from_js_object!(Algorithm, cx, value);
+            let algorithm = value_from_js_object::<Algorithm>(cx, value.handle(), can_gc)?;
 
             algorithm.name.str().to_uppercase()
         },
@@ -1637,24 +1914,30 @@ fn normalize_algorithm_for_key_wrap(
         ALG_AES_KW => KeyWrapAlgorithm::AesKw,
         ALG_AES_CBC => {
             let AlgorithmIdentifier::Object(obj) = algorithm else {
-                return Err(Error::Syntax);
+                return Err(Error::Syntax(None));
             };
             rooted!(in(*cx) let value = ObjectValue(obj.get()));
-            KeyWrapAlgorithm::AesCbc(value_from_js_object!(AesCbcParams, cx, value).into())
+            KeyWrapAlgorithm::AesCbc(
+                boxed_value_from_js_object::<AesCbcParams>(cx, value.handle(), can_gc)?.into(),
+            )
         },
         ALG_AES_CTR => {
             let AlgorithmIdentifier::Object(obj) = algorithm else {
-                return Err(Error::Syntax);
+                return Err(Error::Syntax(None));
             };
             rooted!(in(*cx) let value = ObjectValue(obj.get()));
-            KeyWrapAlgorithm::AesCtr(value_from_js_object!(AesCtrParams, cx, value).into())
+            KeyWrapAlgorithm::AesCtr(
+                boxed_value_from_js_object::<AesCtrParams>(cx, value.handle(), can_gc)?.into(),
+            )
         },
         ALG_AES_GCM => {
             let AlgorithmIdentifier::Object(obj) = algorithm else {
-                return Err(Error::Syntax);
+                return Err(Error::Syntax(None));
             };
             rooted!(in(*cx) let value = ObjectValue(obj.get()));
-            KeyWrapAlgorithm::AesGcm(value_from_js_object!(AesGcmParams, cx, value).into())
+            KeyWrapAlgorithm::AesGcm(
+                boxed_value_from_js_object::<AesGcmParams>(cx, value.handle(), can_gc)?.into(),
+            )
         },
         _ => return Err(Error::NotSupported),
     };
@@ -2064,7 +2347,7 @@ impl SubtleCrypto {
                     )
                 }) || usages.is_empty()
                 {
-                    return Err(Error::Syntax);
+                    return Err(Error::Syntax(None));
                 }
             },
             ALG_AES_KW => {
@@ -2073,7 +2356,7 @@ impl SubtleCrypto {
                     .any(|usage| !matches!(usage, KeyUsage::WrapKey | KeyUsage::UnwrapKey)) ||
                     usages.is_empty()
                 {
-                    return Err(Error::Syntax);
+                    return Err(Error::Syntax(None));
                 }
             },
             _ => return Err(Error::NotSupported),
@@ -2126,7 +2409,7 @@ impl SubtleCrypto {
             .iter()
             .any(|usage| !matches!(usage, KeyUsage::Sign | KeyUsage::Verify))
         {
-            return Err(Error::Syntax);
+            return Err(Error::Syntax(None));
         }
 
         // Step 2.
@@ -2192,18 +2475,22 @@ impl SubtleCrypto {
         Ok(key)
     }
 
-    /// <https://w3c.github.io/webcrypto/#aes-cbc-operations>
-    /// <https://w3c.github.io/webcrypto/#aes-ctr-operations>
+    /// <https://w3c.github.io/webcrypto/#aes-ctr-operations-import-key>
+    /// <https://w3c.github.io/webcrypto/#aes-cbc-operations-import-key>
+    /// <https://w3c.github.io/webcrypto/#aes-gcm-operations-import-key>
+    /// <https://w3c.github.io/webcrypto/#aes-kw-operations-import-key>
     #[allow(unsafe_code)]
     fn import_key_aes(
         &self,
         format: KeyFormat,
-        data: &[u8],
+        key_data: &[u8],
         extractable: bool,
         usages: Vec<KeyUsage>,
         alg_name: &str,
         can_gc: CanGc,
     ) -> Result<DomRoot<CryptoKey>, Error> {
+        // Step 1. If usages contains an entry which is not one of "encrypt", "decrypt", "wrapKey"
+        // or "unwrapKey", then throw a SyntaxError.
         if usages.iter().any(|usage| {
             !matches!(
                 usage,
@@ -2211,11 +2498,136 @@ impl SubtleCrypto {
             )
         }) || usages.is_empty()
         {
-            return Err(Error::Syntax);
+            return Err(Error::Syntax(None));
         }
-        if !matches!(format, KeyFormat::Raw | KeyFormat::Jwk) {
-            return Err(Error::NotSupported);
-        }
+
+        // Step 2.
+        let data;
+        match format {
+            // If format is "raw":
+            KeyFormat::Raw => {
+                // Step 2.1. Let data be keyData.
+                data = key_data.to_vec();
+
+                // Step 2.2. If the length in bits of data is not 128, 192 or 256 then throw a DataError.
+                if !matches!(data.len() * 8, 128 | 192 | 256) {
+                    return Err(Error::Data);
+                }
+            },
+            // If format is "jwk":
+            KeyFormat::Jwk => {
+                // Step 2.1. If keyData is a JsonWebKey dictionary: Let jwk equal keyData.
+                // Otherwise: Throw a DataError.
+                // NOTE: Deserialize keyData to JsonWebKey dictionary by calling JsonWebKey::parse
+                let jwk = JsonWebKey::parse(GlobalScope::get_cx(), key_data)?;
+
+                // Step 2.2. If the kty field of jwk is not "oct", then throw a DataError.
+                if jwk.kty.as_ref().is_none_or(|kty| kty != "oct") {
+                    return Err(Error::Data);
+                }
+
+                // Step 2.3. If jwk does not meet the requirements of Section 6.4 of JSON Web
+                // Algorithms [JWA], then throw a DataError.
+                // NOTE: Done by Step 2.4 and 2.5.
+
+                // Step 2.4. Let data be the byte sequence obtained by decoding the k field of jwk.
+                data = base64::engine::general_purpose::STANDARD_NO_PAD
+                    .decode(jwk.k.as_ref().ok_or(Error::Data)?.as_bytes())
+                    .map_err(|_| Error::Data)?;
+
+                // NOTE: This function is shared by AES-CBC, AES-CTR, AES-GCM and AES-KW.
+                // Different static texts are used in different AES types, in the following step.
+                let alg_matching = match alg_name {
+                    ALG_AES_CBC => ["A128CBC", "A192CBC", "A256CBC"],
+                    ALG_AES_CTR => ["A128CTR", "A192CTR", "A256CTR"],
+                    ALG_AES_GCM => ["A128GCM", "A192GCM", "A256GCM"],
+                    ALG_AES_KW => ["A128KW", "A192KW", "A256KW"],
+                    _ => unreachable!(),
+                };
+
+                // Step 2.5.
+                match data.len() * 8 {
+                    // If the length in bits of data is 128:
+                    128 => {
+                        // If the alg field of jwk is present, and is not "A128CBC", then throw a DataError.
+                        // If the alg field of jwk is present, and is not "A128CTR", then throw a DataError.
+                        // If the alg field of jwk is present, and is not "A128GCM", then throw a DataError.
+                        // If the alg field of jwk is present, and is not "A128KW", then throw a DataError.
+                        // NOTE: Only perform the step of the corresponding AES type.
+                        if jwk.alg.as_ref().is_some_and(|alg| alg != alg_matching[0]) {
+                            return Err(Error::Data);
+                        }
+                    },
+                    // If the length in bits of data is 192:
+                    192 => {
+                        // If the alg field of jwk is present, and is not "A192CBC", then throw a DataError.
+                        // If the alg field of jwk is present, and is not "A192CTR", then throw a DataError.
+                        // If the alg field of jwk is present, and is not "A192GCM", then throw a DataError.
+                        // If the alg field of jwk is present, and is not "A192KW", then throw a DataError.
+                        // NOTE: Only perform the step of the corresponding AES type.
+                        if jwk.alg.as_ref().is_some_and(|alg| alg != alg_matching[1]) {
+                            return Err(Error::Data);
+                        }
+                    },
+                    // If the length in bits of data is 256:
+                    256 => {
+                        // If the alg field of jwk is present, and is not "A256CBC", then throw a DataError.
+                        // If the alg field of jwk is present, and is not "A256CTR", then throw a DataError.
+                        // If the alg field of jwk is present, and is not "A256GCM", then throw a DataError.
+                        // If the alg field of jwk is present, and is not "A256KW", then throw a DataError.
+                        // NOTE: Only perform the step of the corresponding AES type.
+                        if jwk.alg.as_ref().is_some_and(|alg| alg != alg_matching[2]) {
+                            return Err(Error::Data);
+                        }
+                    },
+                    // Otherwise:
+                    _ => {
+                        // throw a DataError.
+                        return Err(Error::Data);
+                    },
+                }
+
+                // Step 2.6. If usages is non-empty and the use field of jwk is present and is not
+                // "enc", then throw a DataError.
+                if !usages.is_empty() && jwk.use_.as_ref().is_some_and(|use_| use_ != "enc") {
+                    return Err(Error::Data);
+                }
+
+                // Step 2.7. If the key_ops field of jwk is present, and is invalid according to
+                // the requirements of JSON Web Key [JWK] or does not contain all of the specified
+                // usages values, then throw a DataError.
+                jwk.check_key_ops(&usages)?;
+
+                // Step 2.8. If the ext field of jwk is present and has the value false and
+                // extractable is true, then throw a DataError.
+                if jwk.ext.is_some_and(|ext| !ext) && extractable {
+                    return Err(Error::Data);
+                }
+            },
+            // Otherwise:
+            _ => {
+                // throw a NotSupportedError
+                return Err(Error::NotSupported);
+            },
+        };
+
+        // Step 5. Let algorithm be a new AesKeyAlgorithm.
+        // Step 6. Set the name attribute of algorithm to "AES-CBC".
+        // Step 7. Set the length attribute of algorithm to the length, in bits, of data.
+        let name = DOMString::from(alg_name.to_string());
+        let cx = GlobalScope::get_cx();
+        rooted!(in(*cx) let mut algorithm_object = unsafe { JS_NewObject(*cx, ptr::null()) });
+        assert!(!algorithm_object.is_null());
+        AesKeyAlgorithm::from_name_and_size(
+            name.clone(),
+            (data.len() * 8) as u16,
+            algorithm_object.handle_mut(),
+            cx,
+        );
+
+        // Step 3. Let key be a new CryptoKey object representing an AES key with value data.
+        // Step 4. Set the [[type]] internal slot of key to "secret".
+        // Step 8. Set the [[algorithm]] internal slot of key to algorithm.
         let handle = match data.len() * 8 {
             128 => Handle::Aes128(data.to_vec()),
             192 => Handle::Aes192(data.to_vec()),
@@ -2224,20 +2636,7 @@ impl SubtleCrypto {
                 return Err(Error::Data);
             },
         };
-
-        let name = DOMString::from(alg_name.to_string());
-
-        let cx = GlobalScope::get_cx();
-        rooted!(in(*cx) let mut algorithm_object = unsafe { JS_NewObject(*cx, ptr::null()) });
-        assert!(!algorithm_object.is_null());
-
-        AesKeyAlgorithm::from_name_and_size(
-            name.clone(),
-            (data.len() * 8) as u16,
-            algorithm_object.handle_mut(),
-            cx,
-        );
-        let crypto_key = CryptoKey::new(
+        let key = CryptoKey::new(
             &self.global(),
             KeyType::Secret,
             extractable,
@@ -2248,61 +2647,121 @@ impl SubtleCrypto {
             can_gc,
         );
 
-        Ok(crypto_key)
+        // Return key.
+        Ok(key)
     }
 
-    /// <https://w3c.github.io/webcrypto/#aes-cbc-operations>
-    /// <https://w3c.github.io/webcrypto/#aes-ctr-operations>
-    fn export_key_aes(&self, format: KeyFormat, key: &CryptoKey) -> Result<AesExportedKey, Error> {
+    /// <https://w3c.github.io/webcrypto/#aes-ctr-operations-export-key>
+    /// <https://w3c.github.io/webcrypto/#aes-cbc-operations-export-key>
+    /// <https://w3c.github.io/webcrypto/#aes-gcm-operations-export-key>
+    /// <https://w3c.github.io/webcrypto/#aes-kw-operations-export-key>
+    fn export_key_aes(&self, format: KeyFormat, key: &CryptoKey) -> Result<ExportedKey, Error> {
+        // Step 1. If the underlying cryptographic key material represented by the [[handle]]
+        // internal slot of key cannot be accessed, then throw an OperationError.
+        // NOTE: key.handle() guarantees access.
+
+        // Step 2.
+        let result;
         match format {
+            // If format is "raw":
             KeyFormat::Raw => match key.handle() {
-                Handle::Aes128(key_data) => Ok(AesExportedKey::Raw(key_data.as_slice().to_vec())),
-                Handle::Aes192(key_data) => Ok(AesExportedKey::Raw(key_data.as_slice().to_vec())),
-                Handle::Aes256(key_data) => Ok(AesExportedKey::Raw(key_data.as_slice().to_vec())),
-                _ => Err(Error::Data),
+                // Step 2.1. Let data be a byte sequence containing the raw octets of the key
+                // represented by the [[handle]] internal slot of key.
+                // Step 2.2. Let result be data.
+                Handle::Aes128(key_data) => {
+                    result = ExportedKey::Raw(key_data.clone());
+                },
+                Handle::Aes192(key_data) => {
+                    result = ExportedKey::Raw(key_data.clone());
+                },
+                Handle::Aes256(key_data) => {
+                    result = ExportedKey::Raw(key_data.clone());
+                },
+                _ => unreachable!(),
             },
+            // If format is "jwk":
             KeyFormat::Jwk => {
-                let (alg, k) = match key.handle() {
-                    Handle::Aes128(key_data) => {
-                        data_to_jwk_params(key.algorithm().as_str(), "128", key_data.as_slice())
+                // Step 2.3. Set the k attribute of jwk to be a string containing the raw octets of
+                // the key represented by the [[handle]] internal slot of key, encoded according to
+                // Section 6.4 of JSON Web Algorithms [JWA].
+                let k = match key.handle() {
+                    Handle::Aes128(key) => {
+                        base64::engine::general_purpose::STANDARD_NO_PAD.encode(key)
                     },
-                    Handle::Aes192(key_data) => {
-                        data_to_jwk_params(key.algorithm().as_str(), "192", key_data.as_slice())
+                    Handle::Aes192(key) => {
+                        base64::engine::general_purpose::STANDARD_NO_PAD.encode(key)
                     },
-                    Handle::Aes256(key_data) => {
-                        data_to_jwk_params(key.algorithm().as_str(), "256", key_data.as_slice())
+                    Handle::Aes256(key) => {
+                        base64::engine::general_purpose::STANDARD_NO_PAD.encode(key)
                     },
-                    _ => return Err(Error::Data),
+                    _ => unreachable!(),
                 };
+
+                // Step 2.4.
+                // If the length attribute of key is 128: Set the alg attribute of jwk to the string "A128CTR".
+                // If the length attribute of key is 192: Set the alg attribute of jwk to the string "A192CTR".
+                // If the length attribute of key is 256: Set the alg attribute of jwk to the string "A256CTR".
+                //
+                // If the length attribute of key is 128: Set the alg attribute of jwk to the string "A128CTR".
+                // If the length attribute of key is 192: Set the alg attribute of jwk to the string "A192CTR".
+                // If the length attribute of key is 256: Set the alg attribute of jwk to the string "A256CTR".
+                //
+                // If the length attribute of key is 128: Set the alg attribute of jwk to the string "A128CTR".
+                // If the length attribute of key is 192: Set the alg attribute of jwk to the string "A192CTR".
+                // If the length attribute of key is 256: Set the alg attribute of jwk to the string "A256CTR".
+                //
+                // If the length attribute of key is 128: Set the alg attribute of jwk to the string "A128CTR".
+                // If the length attribute of key is 192: Set the alg attribute of jwk to the string "A192CTR".
+                // If the length attribute of key is 256: Set the alg attribute of jwk to the string "A256CTR".
+                //
+                // NOTE: Check key length via key.handle()
+                let alg = match (key.handle(), key.algorithm().as_str()) {
+                    (Handle::Aes128(_), ALG_AES_CTR) => "A128CTR",
+                    (Handle::Aes192(_), ALG_AES_CTR) => "A192CTR",
+                    (Handle::Aes256(_), ALG_AES_CTR) => "A256CTR",
+                    (Handle::Aes128(_), ALG_AES_CBC) => "A128CBC",
+                    (Handle::Aes192(_), ALG_AES_CBC) => "A192CBC",
+                    (Handle::Aes256(_), ALG_AES_CBC) => "A256CBC",
+                    (Handle::Aes128(_), ALG_AES_GCM) => "A128GCM",
+                    (Handle::Aes192(_), ALG_AES_GCM) => "A192GCM",
+                    (Handle::Aes256(_), ALG_AES_GCM) => "A256GCM",
+                    (Handle::Aes128(_), ALG_AES_KW) => "A128KW",
+                    (Handle::Aes192(_), ALG_AES_KW) => "A192KW",
+                    (Handle::Aes256(_), ALG_AES_KW) => "A256KW",
+                    _ => unreachable!(),
+                };
+
+                // Step 2.5. Set the key_ops attribute of jwk to equal the [[usages]] internal slot of key.
                 let key_ops = key
                     .usages()
                     .iter()
                     .map(|usage| DOMString::from(usage.as_str()))
                     .collect::<Vec<DOMString>>();
+
+                // Step 2.1. Let jwk be a new JsonWebKey dictionary.
+                // Step 2.2. Set the kty attribute of jwk to the string "oct".
+                // Step 2.6. Set the ext attribute of jwk to equal the [[extractable]] internal slot of key.
                 let jwk = JsonWebKey {
-                    alg: Some(alg),
-                    crv: None,
-                    d: None,
-                    dp: None,
-                    dq: None,
-                    e: None,
-                    ext: Some(key.Extractable()),
-                    k: Some(k),
-                    key_ops: Some(key_ops),
                     kty: Some(DOMString::from("oct")),
-                    n: None,
-                    oth: None,
-                    p: None,
-                    q: None,
-                    qi: None,
-                    use_: None,
-                    x: None,
-                    y: None,
+                    k: Some(DOMString::from(k)),
+                    alg: Some(DOMString::from(alg)),
+                    key_ops: Some(key_ops),
+                    ext: Some(key.Extractable()),
+                    ..Default::default()
                 };
-                Ok(AesExportedKey::Jwk(Box::new(jwk)))
+
+                // Step 2.7. Let result be jwk.
+                result = ExportedKey::Jwk(Box::new(jwk));
             },
-            _ => Err(Error::NotSupported),
-        }
+            // Otherwise:
+            _ => {
+                // throw a NotSupportedError.
+                return Err(Error::NotSupported);
+            },
+        };
+
+        // Step 3. Return result.
+        Ok(result)
     }
 
     /// <https://w3c.github.io/webcrypto/#hkdf-operations>
@@ -2324,12 +2783,12 @@ impl SubtleCrypto {
                 .any(|usage| !matches!(usage, KeyUsage::DeriveKey | KeyUsage::DeriveBits)) ||
                 usages.is_empty()
             {
-                return Err(Error::Syntax);
+                return Err(Error::Syntax(None));
             }
 
             // Step 2. If extractable is not false, then throw a SyntaxError.
             if extractable {
-                return Err(Error::Syntax);
+                return Err(Error::Syntax(None));
             }
 
             // Step 3. Let key be a new CryptoKey representing the key data provided in keyData.
@@ -2362,7 +2821,7 @@ impl SubtleCrypto {
         }
     }
 
-    /// <https://w3c.github.io/webcrypto/#hmac-operations>
+    /// <https://w3c.github.io/webcrypto/#hmac-operations-import-key>
     #[allow(unsafe_code)]
     fn import_key_hmac(
         &self,
@@ -2381,7 +2840,7 @@ impl SubtleCrypto {
             .any(|usage| !matches!(usage, KeyUsage::Sign | KeyUsage::Verify)) ||
             usages.is_empty()
         {
-            return Err(Error::Syntax);
+            return Err(Error::Syntax(None));
         }
 
         // Step 3. Let hash be a new KeyAlgorithm.
@@ -2390,14 +2849,94 @@ impl SubtleCrypto {
         // Step 4.
         let data;
         match format {
-            // Key data has already been extracted in the case of JWK,
-            // so both raw and jwk can be treated the same here.
-            KeyFormat::Raw | KeyFormat::Jwk => {
-                // Step 4.1 Let data be the octet string contained in keyData.
+            // If format is "raw":
+            KeyFormat::Raw => {
+                // Step 4.1. Let data be keyData.
                 data = key_data.to_vec();
 
-                // Step 4.2 Set hash to equal the hash member of normalizedAlgorithm.
+                // Step 4.2. Set hash to equal the hash member of normalizedAlgorithm.
                 hash = normalized_algorithm.hash;
+            },
+            // If format is "jwk":
+            KeyFormat::Jwk => {
+                // Step 2.1. If keyData is a JsonWebKey dictionary: Let jwk equal keyData.
+                // Otherwise: Throw a DataError.
+                // NOTE: Deserialize keyData to JsonWebKey dictionary by running JsonWebKey::parse
+                let jwk = JsonWebKey::parse(GlobalScope::get_cx(), key_data)?;
+
+                // Step 2.2. If the kty field of jwk is not "oct", then throw a DataError.
+                if jwk.kty.as_ref().is_none_or(|kty| kty != "oct") {
+                    return Err(Error::Data);
+                }
+
+                // Step 2.3. If jwk does not meet the requirements of Section 6.4 of JSON Web
+                // Algorithms [JWA], then throw a DataError.
+                // NOTE: Done by Step 2.4 and 2.6.
+
+                // Step 2.4. Let data be the byte sequence obtained by decoding the k field of jwk.
+                data = base64::engine::general_purpose::STANDARD_NO_PAD
+                    .decode(jwk.k.as_ref().ok_or(Error::Data)?.as_bytes())
+                    .map_err(|_| Error::Data)?;
+
+                // Step 2.5. Set the hash to equal the hash member of normalizedAlgorithm.
+                hash = normalized_algorithm.hash;
+
+                // Step 2.6.
+                match hash.name().to_string().as_str() {
+                    // If the name attribute of hash is "SHA-1":
+                    ALG_SHA1 => {
+                        // If the alg field of jwk is present and is not "HS1", then throw a DataError.
+                        if jwk.alg.as_ref().is_some_and(|alg| alg != "HS1") {
+                            return Err(Error::Data);
+                        }
+                    },
+                    // If the name attribute of hash is "SHA-256":
+                    ALG_SHA256 => {
+                        // If the alg field of jwk is present and is not "HS256", then throw a DataError.
+                        if jwk.alg.as_ref().is_some_and(|alg| alg != "HS256") {
+                            return Err(Error::Data);
+                        }
+                    },
+                    // If the name attribute of hash is "SHA-384":
+                    ALG_SHA384 => {
+                        // If the alg field of jwk is present and is not "HS384", then throw a DataError.
+                        if jwk.alg.as_ref().is_some_and(|alg| alg != "HS384") {
+                            return Err(Error::Data);
+                        }
+                    },
+                    // If the name attribute of hash is "SHA-512":
+                    ALG_SHA512 => {
+                        // If the alg field of jwk is present and is not "HS512", then throw a DataError.
+                        if jwk.alg.as_ref().is_some_and(|alg| alg != "HS512") {
+                            return Err(Error::Data);
+                        }
+                    },
+                    // Otherwise,
+                    _name => {
+                        // if the name attribute of hash is defined in another applicable specification:
+                        // Perform any key import steps defined by other applicable specifications,
+                        // passing format, jwk and hash and obtaining hash
+                        // NOTE: Currently not support applicable specification.
+                        return Err(Error::NotSupported);
+                    },
+                }
+
+                // Step 2.7. If usages is non-empty and the use field of jwk is present and is not
+                // "sig", then throw a DataError.
+                if !usages.is_empty() && jwk.use_.as_ref().is_some_and(|use_| use_ != "sig") {
+                    return Err(Error::Data);
+                }
+
+                // Step 2.8. If the key_ops field of jwk is present, and is invalid according to
+                // the requirements of JSON Web Key [JWK] or does not contain all of the specified
+                // usages values, then throw a DataError.
+                jwk.check_key_ops(&usages)?;
+
+                // Step 2.9. If the ext field of jwk is present and has the value false and
+                // extractable is true, then throw a DataError.
+                if jwk.ext.is_some_and(|ext| !ext) && extractable {
+                    return Err(Error::Data);
+                }
             },
             // Otherwise:
             _ => {
@@ -2455,6 +2994,18 @@ impl SubtleCrypto {
 
         // Step 15. Return key.
         Ok(key)
+    }
+
+    /// <https://w3c.github.io/webcrypto/#hmac-operations-export-key>
+    fn export_key_hmac(&self, format: KeyFormat, key: &CryptoKey) -> Result<ExportedKey, Error> {
+        match format {
+            KeyFormat::Raw => match key.handle() {
+                Handle::Hmac(key_data) => Ok(ExportedKey::Raw(key_data.as_slice().to_vec())),
+                _ => Err(Error::Operation),
+            },
+            // FIXME: Implement JWK export for HMAC keys
+            _ => Err(Error::NotSupported),
+        }
     }
 
     /// <https://w3c.github.io/webcrypto/#aes-kw-operations>
@@ -2578,12 +3129,12 @@ impl SubtleCrypto {
             .any(|usage| !matches!(usage, KeyUsage::DeriveKey | KeyUsage::DeriveBits)) ||
             usages.is_empty()
         {
-            return Err(Error::Syntax);
+            return Err(Error::Syntax(None));
         }
 
         // Step 3. If extractable is not false, then throw a SyntaxError.
         if extractable {
-            return Err(Error::Syntax);
+            return Err(Error::Syntax(None));
         }
 
         // Step 4. Let key be a new CryptoKey representing keyData.
@@ -2613,21 +3164,9 @@ impl SubtleCrypto {
     }
 }
 
-pub(crate) enum AesExportedKey {
+pub(crate) enum ExportedKey {
     Raw(Vec<u8>),
     Jwk(Box<JsonWebKey>),
-}
-
-fn data_to_jwk_params(alg: &str, size: &str, key: &[u8]) -> (DOMString, DOMString) {
-    let jwk_alg = match alg {
-        ALG_AES_CBC => DOMString::from(format!("A{}CBC", size)),
-        ALG_AES_CTR => DOMString::from(format!("A{}CTR", size)),
-        ALG_AES_KW => DOMString::from(format!("A{}KW", size)),
-        ALG_AES_GCM => DOMString::from(format!("A{}GCM", size)),
-        _ => unreachable!(),
-    };
-    let data = base64::engine::general_purpose::STANDARD_NO_PAD.encode(key);
-    (jwk_alg, DOMString::from(data))
 }
 
 trait AlgorithmFromName {
@@ -2853,31 +3392,51 @@ impl ImportKeyAlgorithm {
         &self,
         subtle: &SubtleCrypto,
         format: KeyFormat,
-        secret: &[u8],
+        key_data: &[u8],
         extractable: bool,
         key_usages: Vec<KeyUsage>,
         can_gc: CanGc,
     ) -> Result<DomRoot<CryptoKey>, Error> {
         match self {
-            Self::AesCbc => {
-                subtle.import_key_aes(format, secret, extractable, key_usages, ALG_AES_CBC, can_gc)
-            },
-            Self::AesCtr => {
-                subtle.import_key_aes(format, secret, extractable, key_usages, ALG_AES_CTR, can_gc)
-            },
-            Self::AesKw => {
-                subtle.import_key_aes(format, secret, extractable, key_usages, ALG_AES_KW, can_gc)
-            },
-            Self::AesGcm => {
-                subtle.import_key_aes(format, secret, extractable, key_usages, ALG_AES_GCM, can_gc)
-            },
+            Self::AesCbc => subtle.import_key_aes(
+                format,
+                key_data,
+                extractable,
+                key_usages,
+                ALG_AES_CBC,
+                can_gc,
+            ),
+            Self::AesCtr => subtle.import_key_aes(
+                format,
+                key_data,
+                extractable,
+                key_usages,
+                ALG_AES_CTR,
+                can_gc,
+            ),
+            Self::AesKw => subtle.import_key_aes(
+                format,
+                key_data,
+                extractable,
+                key_usages,
+                ALG_AES_KW,
+                can_gc,
+            ),
+            Self::AesGcm => subtle.import_key_aes(
+                format,
+                key_data,
+                extractable,
+                key_usages,
+                ALG_AES_GCM,
+                can_gc,
+            ),
             Self::Hmac(params) => {
-                subtle.import_key_hmac(params, format, secret, extractable, key_usages, can_gc)
+                subtle.import_key_hmac(params, format, key_data, extractable, key_usages, can_gc)
             },
             Self::Pbkdf2 => {
-                subtle.import_key_pbkdf2(format, secret, extractable, key_usages, can_gc)
+                subtle.import_key_pbkdf2(format, key_data, extractable, key_usages, can_gc)
             },
-            Self::Hkdf => subtle.import_key_hkdf(format, secret, extractable, key_usages, can_gc),
+            Self::Hkdf => subtle.import_key_hkdf(format, key_data, extractable, key_usages, can_gc),
         }
     }
 }
@@ -2947,9 +3506,15 @@ impl SignatureAlgorithm {
         }
     }
 
-    fn sign(&self, cx: JSContext, key: &CryptoKey, data: &[u8]) -> Result<Vec<u8>, Error> {
+    fn sign(
+        &self,
+        cx: JSContext,
+        key: &CryptoKey,
+        data: &[u8],
+        can_gc: CanGc,
+    ) -> Result<Vec<u8>, Error> {
         match self {
-            Self::Hmac => sign_hmac(cx, key, data).map(|s| s.as_ref().to_vec()),
+            Self::Hmac => sign_hmac(cx, key, data, can_gc).map(|s| s.as_ref().to_vec()),
         }
     }
 
@@ -2959,9 +3524,10 @@ impl SignatureAlgorithm {
         key: &CryptoKey,
         data: &[u8],
         signature: &[u8],
+        can_gc: CanGc,
     ) -> Result<bool, Error> {
         match self {
-            Self::Hmac => verify_hmac(cx, key, data, signature),
+            Self::Hmac => verify_hmac(cx, key, data, signature, can_gc),
         }
     }
 }
@@ -2983,12 +3549,17 @@ impl KeyGenerationAlgorithm {
 }
 
 /// <https://w3c.github.io/webcrypto/#hmac-operations>
-fn sign_hmac(cx: JSContext, key: &CryptoKey, data: &[u8]) -> Result<impl AsRef<[u8]>, Error> {
+fn sign_hmac(
+    cx: JSContext,
+    key: &CryptoKey,
+    data: &[u8],
+    can_gc: CanGc,
+) -> Result<impl AsRef<[u8]>, Error> {
     // Step 1. Let mac be the result of performing the MAC Generation operation described in Section 4 of [FIPS-198-1]
     // using the key represented by [[handle]] internal slot of key, the hash function identified by the hash attribute
     // of the [[algorithm]] internal slot of key and message as the input data text.
     rooted!(in(*cx) let mut algorithm_slot = ObjectValue(key.Algorithm(cx).as_ptr()));
-    let params = value_from_js_object!(HmacKeyAlgorithm, cx, algorithm_slot);
+    let params = value_from_js_object::<HmacKeyAlgorithm>(cx, algorithm_slot.handle(), can_gc)?;
 
     let hash_algorithm = match params.hash.name.str() {
         ALG_SHA1 => hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
@@ -3012,11 +3583,12 @@ fn verify_hmac(
     key: &CryptoKey,
     data: &[u8],
     signature: &[u8],
+    can_gc: CanGc,
 ) -> Result<bool, Error> {
     // Step 1. Let mac be the result of performing the MAC Generation operation described in Section 4 of [FIPS-198-1]
     // using the key represented by [[handle]] internal slot of key, the hash function identified by the hash attribute
     // of the [[algorithm]] internal slot of key and message as the input data text.
-    let mac = sign_hmac(cx, key, data)?;
+    let mac = sign_hmac(cx, key, data, can_gc)?;
 
     // Step 2. Return true if mac is equal to signature and false otherwise.
     let is_valid = mac.as_ref() == signature;
@@ -3035,157 +3607,152 @@ impl KeyWrapAlgorithm {
     }
 }
 
-/// <https://w3c.github.io/webcrypto/#concept-parse-a-jwk>
-fn parse_jwk(
-    bytes: &[u8],
-    import_alg: ImportKeyAlgorithm,
-    extractable: bool,
-    key_usages: &[KeyUsage],
-) -> Result<Vec<u8>, Error> {
-    let value = serde_json::from_slice(bytes)
-        .map_err(|_| Error::Type("Failed to parse JWK string".into()))?;
-    let serde_json::Value::Object(obj) = value else {
-        return Err(Error::Data);
-    };
+#[expect(unused)]
+trait RsaOtherPrimesInfoExt {
+    fn from_value(value: &serde_json::Value) -> Result<RsaOtherPrimesInfo, Error>;
+}
 
-    let kty = get_jwk_string(&obj, "kty")?;
-    let ext = get_jwk_bool(&obj, "ext")?;
-    if !ext && extractable {
-        return Err(Error::Data);
-    }
+impl RsaOtherPrimesInfoExt for RsaOtherPrimesInfo {
+    fn from_value(value: &serde_json::Value) -> Result<RsaOtherPrimesInfo, Error> {
+        let serde_json::Value::Object(object) = value else {
+            return Err(Error::Data);
+        };
 
-    // If the key_ops field of jwk is present, and is invalid according to the requirements of JSON Web Key [JWK]
-    // or does not contain all of the specified usages values, then throw a DataError.
-    if let Some(serde_json::Value::Array(key_ops)) = obj.get("key_ops") {
-        if key_ops.iter().any(|op| {
-            let op_string = match op {
-                serde_json::Value::String(op_string) => op_string,
-                _ => return true,
-            };
-            let usage = match usage_from_str(op_string) {
-                Ok(usage) => usage,
-                Err(_) => {
-                    return true;
+        let mut rsa_other_primes_info: RsaOtherPrimesInfo = Default::default();
+        for (key, value) in object {
+            match key.as_str() {
+                "r" => {
+                    rsa_other_primes_info.r =
+                        Some(DOMString::from(value.as_str().ok_or(Error::Data)?))
                 },
-            };
-            !key_usages.contains(&usage)
-        }) {
+                "d" => {
+                    rsa_other_primes_info.d =
+                        Some(DOMString::from(value.as_str().ok_or(Error::Data)?))
+                },
+                "t" => {
+                    rsa_other_primes_info.t =
+                        Some(DOMString::from(value.as_str().ok_or(Error::Data)?))
+                },
+                _ => {
+                    // Additional members can be present in the JWK; if not understood by
+                    // implementations encountering them, they MUST be ignored.
+                },
+            }
+        }
+
+        Ok(rsa_other_primes_info)
+    }
+}
+
+trait JsonWebKeyExt {
+    fn parse(cx: JSContext, data: &[u8]) -> Result<JsonWebKey, Error>;
+    fn stringify(&self, cx: JSContext) -> Result<DOMString, Error>;
+    fn get_usages_from_key_ops(&self) -> Result<Vec<KeyUsage>, Error>;
+    #[expect(unused)]
+    fn get_rsa_other_primes_info_from_oth(&self) -> Result<&[RsaOtherPrimesInfo], Error>;
+    fn check_key_ops(&self, specified_usages: &[KeyUsage]) -> Result<(), Error>;
+}
+
+impl JsonWebKeyExt for JsonWebKey {
+    /// <https://w3c.github.io/webcrypto/#concept-parse-a-jwk>
+    #[allow(unsafe_code)]
+    fn parse(cx: JSContext, data: &[u8]) -> Result<JsonWebKey, Error> {
+        // Step 1. Let data be the sequence of bytes to be parsed.
+        // (It is given as a method paramter.)
+
+        // Step 2. Let json be the Unicode string that results from interpreting data according to UTF-8.
+        let json = String::from_utf8_lossy(data);
+
+        // Step 3. Convert json to UTF-16.
+        let json: Vec<_> = json.encode_utf16().collect();
+
+        // Step 4. Let result be the object literal that results from executing the JSON.parse
+        // internal function in the context of a new global object, with text argument set to a
+        // JavaScript String containing json.
+        rooted!(in(*cx) let mut result = UndefinedValue());
+        unsafe {
+            if !JS_ParseJSON(*cx, json.as_ptr(), json.len() as u32, result.handle_mut()) {
+                return Err(Error::JSFailed);
+            }
+        }
+
+        // Step 5. Let key be the result of converting result to the IDL dictionary type of JsonWebKey.
+        let key = match JsonWebKey::new(cx, result.handle(), CanGc::note()) {
+            Ok(ConversionResult::Success(key)) => key,
+            Ok(ConversionResult::Failure(error)) => {
+                return Err(Error::Type(error.to_string()));
+            },
+            Err(()) => {
+                return Err(Error::JSFailed);
+            },
+        };
+
+        // Step 6. If the kty field of key is not defined, then throw a DataError.
+        if key.kty.is_none() {
             return Err(Error::Data);
         }
+
+        // Step 7. Result key.
+        Ok(key)
     }
 
-    match import_alg {
-        ImportKeyAlgorithm::AesCbc |
-        ImportKeyAlgorithm::AesCtr |
-        ImportKeyAlgorithm::AesKw |
-        ImportKeyAlgorithm::AesGcm => {
-            if kty != "oct" {
+    /// Convert a JsonWebKey value to DOMString. We first convert the JsonWebKey value to
+    /// JavaScript value, and then serialize it by performing steps in
+    /// <https://infra.spec.whatwg.org/#serialize-a-javascript-value-to-a-json-string>. This acts
+    /// like the opposite of JsonWebKey::parse if you further convert the stringified result to
+    /// bytes.
+    fn stringify(&self, cx: JSContext) -> Result<DOMString, Error> {
+        rooted!(in(*cx) let mut data = UndefinedValue());
+        self.safe_to_jsval(cx, data.handle_mut());
+        serialize_jsval_to_json_utf8(cx, data.handle())
+    }
+
+    fn get_usages_from_key_ops(&self) -> Result<Vec<KeyUsage>, Error> {
+        let mut usages = vec![];
+        for op in self.key_ops.as_ref().ok_or(Error::Data)? {
+            usages.push(KeyUsage::from_str(op).map_err(|_| Error::Data)?);
+        }
+        Ok(usages)
+    }
+
+    fn get_rsa_other_primes_info_from_oth(&self) -> Result<&[RsaOtherPrimesInfo], Error> {
+        self.oth.as_deref().ok_or(Error::Data)
+    }
+
+    /// If the key_ops field of jwk is present, and is invalid according to the requirements of
+    /// JSON Web Key [JWK] or does not contain all of the specified usages values, then throw a
+    /// DataError.
+    fn check_key_ops(&self, specified_usages: &[KeyUsage]) -> Result<(), Error> {
+        // If the key_ops field of jwk is present,
+        if let Some(ref key_ops) = self.key_ops {
+            // and is invalid according to the requirements of JSON Web Key [JWK]:
+            // 1. Duplicate key operation values MUST NOT be present in the array.
+            if key_ops
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len() <
+                key_ops.len()
+            {
                 return Err(Error::Data);
             }
-            let k = get_jwk_string(&obj, "k")?;
-            let alg = get_jwk_string(&obj, "alg")?;
-
-            let data = base64::engine::general_purpose::STANDARD_NO_PAD
-                .decode(k.as_bytes())
-                .map_err(|_| Error::Data)?;
-
-            let expected_alg = match (data.len() * 8, &import_alg) {
-                (128, ImportKeyAlgorithm::AesCbc) => "A128CBC",
-                (128, ImportKeyAlgorithm::AesCtr) => "A128CTR",
-                (128, ImportKeyAlgorithm::AesKw) => "A128KW",
-                (128, ImportKeyAlgorithm::AesGcm) => "A128GCM",
-                (192, ImportKeyAlgorithm::AesCbc) => "A192CBC",
-                (192, ImportKeyAlgorithm::AesCtr) => "A192CTR",
-                (192, ImportKeyAlgorithm::AesKw) => "A192KW",
-                (192, ImportKeyAlgorithm::AesGcm) => "A192GCM",
-                (256, ImportKeyAlgorithm::AesCbc) => "A256CBC",
-                (256, ImportKeyAlgorithm::AesCtr) => "A256CTR",
-                (256, ImportKeyAlgorithm::AesKw) => "A256KW",
-                (256, ImportKeyAlgorithm::AesGcm) => "A256GCM",
-                _ => return Err(Error::Data),
-            };
-
-            if alg != expected_alg {
-                return Err(Error::Data);
-            }
-
-            if let Some(serde_json::Value::String(use_)) = obj.get("use") {
-                if use_ != "enc" {
+            // 2. The "use" and "key_ops" JWK members SHOULD NOT be used together; however, if both
+            //    are used, the information they convey MUST be consistent.
+            if let Some(ref use_) = self.use_ {
+                if key_ops.iter().any(|op| op != use_) {
                     return Err(Error::Data);
                 }
             }
 
-            Ok(data)
-        },
-        ImportKeyAlgorithm::Hmac(params) => {
-            if kty != "oct" {
+            // or does not contain all of the specified usages values
+            let key_ops_as_usages = self.get_usages_from_key_ops()?;
+            if !specified_usages
+                .iter()
+                .all(|specified_usage| key_ops_as_usages.contains(specified_usage))
+            {
                 return Err(Error::Data);
             }
-            let k = get_jwk_string(&obj, "k")?;
-            let alg = get_jwk_string(&obj, "alg")?;
+        }
 
-            let expected_alg = match params.hash {
-                DigestAlgorithm::Sha1 => "HS1",
-                DigestAlgorithm::Sha256 => "HS256",
-                DigestAlgorithm::Sha384 => "HS384",
-                DigestAlgorithm::Sha512 => "HS512",
-            };
-
-            if alg != expected_alg {
-                return Err(Error::Data);
-            }
-
-            if let Some(serde_json::Value::String(use_)) = obj.get("use") {
-                if use_ != "sign" {
-                    return Err(Error::Data);
-                }
-            }
-
-            base64::engine::general_purpose::STANDARD_NO_PAD
-                .decode(k.as_bytes())
-                .map_err(|_| Error::Data)
-        },
-        _ => Err(Error::NotSupported),
+        Ok(())
     }
-}
-
-fn get_jwk_string(
-    value: &serde_json::Map<String, serde_json::Value>,
-    key: &str,
-) -> Result<String, Error> {
-    let s = value
-        .get(key)
-        .ok_or(Error::Data)?
-        .as_str()
-        .ok_or(Error::Data)?;
-    Ok(s.to_string())
-}
-
-fn get_jwk_bool(
-    value: &serde_json::Map<String, serde_json::Value>,
-    key: &str,
-) -> Result<bool, Error> {
-    let b = value
-        .get(key)
-        .ok_or(Error::Data)?
-        .as_bool()
-        .ok_or(Error::Data)?;
-    Ok(b)
-}
-
-fn usage_from_str(op: &str) -> Result<KeyUsage, Error> {
-    let usage = match op {
-        "encrypt" => KeyUsage::Encrypt,
-        "decrypt" => KeyUsage::Decrypt,
-        "sign" => KeyUsage::Sign,
-        "verify" => KeyUsage::Verify,
-        "deriveKey" => KeyUsage::DeriveKey,
-        "deriveBits" => KeyUsage::DeriveBits,
-        "wrapKey" => KeyUsage::WrapKey,
-        "unwrapKey" => KeyUsage::UnwrapKey,
-        _ => {
-            return Err(Error::Data);
-        },
-    };
-    Ok(usage)
 }

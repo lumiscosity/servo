@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::sync::LazyLock;
 
@@ -53,7 +54,7 @@ pub(crate) enum CSSStyleOwner {
         Dom<CSSRule>,
         #[ignore_malloc_size_of = "Arc"]
         #[no_trace]
-        Arc<Locked<PropertyDeclarationBlock>>,
+        RefCell<Arc<Locked<PropertyDeclarationBlock>>>,
     ),
 }
 
@@ -76,8 +77,7 @@ impl CSSStyleOwner {
                 let document = el.owner_document();
                 let shared_lock = document.style_shared_lock();
                 let mut attr = el.style_attribute().borrow_mut().take();
-                let result = if attr.is_some() {
-                    let lock = attr.as_ref().unwrap();
+                let result = if let Some(lock) = attr.as_ref() {
                     let mut guard = shared_lock.write();
                     let pdb = lock.write_with(&mut guard);
                     f(pdb, &mut changed)
@@ -120,13 +120,12 @@ impl CSSStyleOwner {
                 result
             },
             CSSStyleOwner::CSSRule(ref rule, ref pdb) => {
+                rule.parent_stylesheet().will_modify();
                 let result = {
                     let mut guard = rule.shared_lock().write();
-                    f(&mut *pdb.write_with(&mut guard), &mut changed)
+                    f(&mut *pdb.borrow().write_with(&mut guard), &mut changed)
                 };
                 if changed {
-                    // If this is changed, see also
-                    // CSSStyleRule::SetSelectorText, which does the same thing.
                     rule.parent_stylesheet().notify_invalidations();
                 }
                 result
@@ -155,7 +154,7 @@ impl CSSStyleOwner {
             },
             CSSStyleOwner::CSSRule(ref rule, ref pdb) => {
                 let guard = rule.shared_lock().read();
-                f(pdb.read_with(&guard))
+                f(pdb.borrow().read_with(&guard))
             },
         }
     }
@@ -266,6 +265,17 @@ impl CSSStyleDeclaration {
             global,
             can_gc,
         )
+    }
+
+    pub(crate) fn update_property_declaration_block(
+        &self,
+        pdb: &Arc<Locked<PropertyDeclarationBlock>>,
+    ) {
+        if let CSSStyleOwner::CSSRule(_, pdb_cell) = &self.owner {
+            *pdb_cell.borrow_mut() = pdb.clone();
+        } else {
+            panic!("update_rule called on CSSStyleDeclaration with a Element owner");
+        }
     }
 
     fn get_computed_style(&self, property: PropertyId) -> DOMString {

@@ -21,7 +21,7 @@ bluetooth = [
     "script/bluetooth",
     "script_traits/bluetooth",
 ]
-default = ["clipboard", "raqote"]
+default = ["clipboard", "vello_cpu"]
 clipboard = ["dep:arboard"]
 crown = ["script/crown"]
 debugmozjs = ["script/debugmozjs"]
@@ -63,11 +63,11 @@ webgpu = [
 ]
 vello = ["constellation/vello"]
 vello_cpu = ["constellation/vello_cpu"]
-raqote = ["constellation/raqote"]
 
 [dependencies]
 background_hang_monitor = { path = "../background_hang_monitor" }
 base = { workspace = true }
+rustc-hash = { workspace = true }
 bincode = { workspace = true }
 bluetooth = { path = "../bluetooth", optional = true }
 bluetooth_traits = { workspace = true, optional = true }
@@ -148,4 +148,8 @@ harness = false
 
 [[test]]
 name = "servo"
+harness = false
+
+[[test]]
+name = "multiprocess"
 harness = false

@@ -11,7 +11,10 @@ use euclid::default::{Point2D, Rect};
 use euclid::{SideOffsets2D, Size2D};
 use itertools::Itertools;
 use layout_api::wrapper_traits::{LayoutNode, ThreadSafeLayoutElement, ThreadSafeLayoutNode};
-use layout_api::{LayoutElementType, LayoutNodeType, OffsetParentResponse};
+use layout_api::{
+    BoxAreaType, LayoutElementType, LayoutNodeType, OffsetParentResponse, ScrollContainerQueryType,
+    ScrollContainerResponse,
+};
 use script::layout_dom::{ServoLayoutNode, ServoThreadSafeLayoutNode};
 use servo_arc::Arc as ServoArc;
 use servo_geometry::{FastLayoutTransform, au_rect_to_f32_rect, f32_rect_to_au_rect};
@@ -47,6 +50,7 @@ use crate::flow::inline::construct::{TextTransformation, WhitespaceCollapse, cap
 use crate::fragment_tree::{
     BoxFragment, Fragment, FragmentFlags, FragmentTree, SpecificLayoutInfo,
 };
+use crate::style_ext::ComputedValuesExt;
 use crate::taffy::SpecificTaffyGridInfo;
 
 /// Get a scroll node that would represents this [`ServoLayoutNode`]'s transform and
@@ -60,21 +64,20 @@ fn root_transform_for_layout_node(
         .first()
         .and_then(Fragment::retrieve_box_fragment)?
         .borrow();
-    let scroll_tree_node_id = box_fragment
-        .spatial_tree_node
-        .borrow()
-        .expect("Should always have a scroll tree node when querying bounding box.");
+    let scroll_tree_node_id = box_fragment.spatial_tree_node.borrow();
+    let scroll_tree_node_id = (*scroll_tree_node_id)?;
     Some(scroll_tree.cumulative_node_to_root_transform(&scroll_tree_node_id))
 }
 
-pub(crate) fn process_content_box_request(
+pub(crate) fn process_box_area_request(
     stacking_context_tree: &StackingContextTree,
     node: ServoThreadSafeLayoutNode<'_>,
+    area: BoxAreaType,
 ) -> Option<Rect<Au>> {
     let rects: Vec<_> = node
         .fragments_for_pseudo(None)
         .iter()
-        .filter_map(Fragment::cumulative_border_box_rect)
+        .filter_map(|node| node.cumulative_box_area_rect(area))
         .collect();
     if rects.is_empty() {
         return None;
@@ -86,29 +89,32 @@ pub(crate) fn process_content_box_request(
     let Some(transform) =
         root_transform_for_layout_node(&stacking_context_tree.compositor_info.scroll_tree, node)
     else {
-        return Some(rect_union);
+        return Some(Rect::new(rect_union.origin, Size2D::zero()));
     };
 
     transform_au_rectangle(rect_union, transform)
 }
 
-pub(crate) fn process_content_boxes_request(
+pub(crate) fn process_box_areas_request(
     stacking_context_tree: &StackingContextTree,
     node: ServoThreadSafeLayoutNode<'_>,
+    area: BoxAreaType,
 ) -> Vec<Rect<Au>> {
     let fragments = node.fragments_for_pseudo(None);
-    let content_boxes = fragments
+    let box_areas = fragments
         .iter()
-        .filter_map(Fragment::cumulative_border_box_rect)
+        .filter_map(|node| node.cumulative_box_area_rect(area))
         .map(|rect| rect.to_untyped());
 
     let Some(transform) =
         root_transform_for_layout_node(&stacking_context_tree.compositor_info.scroll_tree, node)
     else {
-        return content_boxes.collect();
+        return box_areas
+            .map(|rect| Rect::new(rect.origin, Size2D::zero()))
+            .collect();
     };
 
-    content_boxes
+    box_areas
         .filter_map(|rect| transform_au_rectangle(rect, transform))
         .collect()
 }
@@ -463,7 +469,13 @@ fn shorthand_to_css_string(
     let mut dest = String::new();
     for longhand in id.longhands() {
         block.push(
-            style.computed_or_resolved_declaration(longhand, Some(&Context { style })),
+            style.computed_or_resolved_declaration(
+                longhand,
+                Some(&Context {
+                    style,
+                    for_property: longhand.into(),
+                }),
+            ),
             Importance::Normal,
         );
     }
@@ -575,7 +587,7 @@ pub fn process_offset_parent_query(node: ServoLayoutNode<'_>) -> Option<OffsetPa
         .fragments_for_pseudo(None)
         .first()
         .cloned()?;
-    let mut border_box = fragment.cumulative_border_box_rect()?;
+    let mut border_box = fragment.cumulative_box_area_rect(BoxAreaType::Border)?;
 
     // 2.  If the offsetParent of the element is null return the x-coordinate of the left
     //     border edge of the first CSS layout box associated with the element, relative to
@@ -634,6 +646,104 @@ pub fn process_offset_parent_query(node: ServoLayoutNode<'_>) -> Option<OffsetPa
         node_address: parent_fragment.base.tag.map(|tag| tag.node.into()),
         rect: border_box.to_untyped(),
     })
+}
+
+/// An implementation of `scrollParent` that can also be used to for `scrollIntoView`:
+/// <https://drafts.csswg.org/cssom-view/#dom-htmlelement-scrollparent>.
+///
+#[inline]
+pub(crate) fn process_scroll_container_query(
+    node: ServoLayoutNode<'_>,
+    query_type: ScrollContainerQueryType,
+) -> Option<ScrollContainerResponse> {
+    let layout_data = node.to_threadsafe().inner_layout_data()?;
+
+    // 1. If any of the following holds true, return null and terminate this algorithm:
+    //  - The element does not have an associated box.
+    let layout_box = layout_data.self_box.borrow();
+    let layout_box = layout_box.as_ref()?;
+
+    let (mut current_position_value, flags) = layout_box
+        .with_first_base(|base| (base.style.clone_position(), base.base_fragment_info.flags))?;
+
+    // - The element is the root element.
+    // - The element is the body element.
+    //
+    // Note: We only do this for `scrollParent`, which needs to be null. But `scrollIntoView` on the
+    // `<body>` or root element should still bring it into view by scrolling the viewport.
+    if query_type == ScrollContainerQueryType::ForScrollParent &&
+        flags.intersects(
+            FragmentFlags::IS_ROOT_ELEMENT | FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT,
+        )
+    {
+        return None;
+    }
+
+    // - The element’s computed value of the position property is fixed and no ancestor
+    //   establishes a fixed position containing block.
+    //
+    // This is handled below in step 2.
+
+    // 2. Let ancestor be the containing block of the element in the flat tree and repeat these substeps:
+    // - If ancestor is the initial containing block, return the scrollingElement for the
+    //   element’s document if it is not closed-shadow-hidden from the element, otherwise
+    //   return null.
+    // - If ancestor is not closed-shadow-hidden from the element, and is a scroll
+    //   container, terminate this algorithm and return ancestor.
+    // - If the computed value of the position property of ancestor is fixed, and no
+    //   ancestor establishes a fixed position containing block, terminate this algorithm
+    //   and return null.
+    // - Let ancestor be the containing block of ancestor in the flat tree.
+    //
+    // Notes: We don't follow the specification exactly below, but we follow the spirit.
+    //
+    // TODO: Handle the situation where the ancestor is "closed-shadow-hidden" from the element.
+    let mut current_ancestor = node.as_element()?;
+    while let Some(ancestor) = current_ancestor.traversal_parent() {
+        current_ancestor = ancestor;
+
+        let Some(layout_data) = ancestor.as_node().to_threadsafe().inner_layout_data() else {
+            continue;
+        };
+        let ancestor_layout_box = layout_data.self_box.borrow();
+        let Some(ancestor_layout_box) = ancestor_layout_box.as_ref() else {
+            continue;
+        };
+
+        let Some((ancestor_style, ancestor_flags)) = ancestor_layout_box
+            .with_first_base(|base| (base.style.clone(), base.base_fragment_info.flags))
+        else {
+            continue;
+        };
+
+        let is_containing_block = match current_position_value {
+            Position::Static | Position::Relative | Position::Sticky => {
+                !ancestor_style.is_inline_box(ancestor_flags)
+            },
+            Position::Absolute => {
+                ancestor_style.establishes_containing_block_for_absolute_descendants(ancestor_flags)
+            },
+            Position::Fixed => {
+                ancestor_style.establishes_containing_block_for_all_descendants(ancestor_flags)
+            },
+        };
+        if !is_containing_block {
+            continue;
+        }
+
+        if ancestor_style.establishes_scroll_container(ancestor_flags) {
+            return Some(ScrollContainerResponse::Element(
+                ancestor.as_node().opaque().into(),
+            ));
+        }
+
+        current_position_value = ancestor_style.clone_position();
+    }
+
+    match current_position_value {
+        Position::Fixed => None,
+        _ => Some(ScrollContainerResponse::Viewport),
+    }
 }
 
 /// <https://html.spec.whatwg.org/multipage/#get-the-text-steps>

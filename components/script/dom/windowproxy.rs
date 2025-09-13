@@ -5,6 +5,8 @@
 use std::cell::Cell;
 use std::ptr;
 
+use base::generic_channel;
+use base::generic_channel::GenericSend;
 use base::id::{BrowsingContextId, PipelineId, WebViewId};
 use constellation_traits::{
     AuxiliaryWebViewCreationRequest, LoadData, LoadOrigin, NavigationHistoryBehavior,
@@ -32,7 +34,6 @@ use js::jsval::{NullValue, PrivateValue, UndefinedValue};
 use js::rust::wrappers::{JS_TransplantObject, NewWindowProxy, SetWindowProxy};
 use js::rust::{Handle, MutableHandle, MutableHandleValue, get_object_class};
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
-use net_traits::IpcSend;
 use net_traits::request::Referrer;
 use net_traits::storage_thread::StorageThreadMsg;
 use script_traits::NewLayoutInfo;
@@ -348,7 +349,7 @@ impl WindowProxy {
             // the session storage is copied over.
             // See https://html.spec.whatwg.org/multipage/#the-sessionstorage-attribute
 
-            let (sender, receiver) = ipc::channel().unwrap();
+            let (sender, receiver) = generic_channel::channel().unwrap();
 
             let msg = StorageThreadMsg::Clone {
                 sender,
@@ -356,12 +357,7 @@ impl WindowProxy {
                 dest: response.new_webview_id,
             };
 
-            document
-                .global()
-                .resource_threads()
-                .sender()
-                .send(msg)
-                .unwrap();
+            GenericSend::send(document.global().resource_threads(), msg).unwrap();
             receiver.recv().unwrap();
         }
         Some(new_window_proxy)
@@ -540,7 +536,7 @@ impl WindowProxy {
                 .unwrap();
             let url = match existing_document.url().join(&url) {
                 Ok(url) => url,
-                Err(_) => return Err(Error::Syntax),
+                Err(_) => return Err(Error::Syntax(None)),
             };
             let referrer = if noreferrer {
                 Referrer::NoReferrer

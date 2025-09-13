@@ -6,19 +6,18 @@ use std::cell::RefCell;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::default::Default;
 use std::ffi::CString;
-use std::hash::BuildHasherDefault;
 use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
 use deny_public_fields::DenyPublicFields;
 use dom_struct::dom_struct;
-use fnv::FnvHasher;
 use js::jsapi::JS::CompileFunction;
 use js::jsapi::{JS_GetFunctionObject, SupportUnscopables};
 use js::jsval::JSVal;
 use js::rust::{CompileOptionsWrapper, HandleObject, transform_u16_to_source_text};
 use libc::c_char;
+use rustc_hash::FxBuildHasher;
 use servo_url::ServoUrl;
 use style::str::HTML_SPACE_CHARACTERS;
 use stylo_atoms::Atom;
@@ -59,7 +58,7 @@ use crate::dom::element::Element;
 use crate::dom::errorevent::ErrorEvent;
 use crate::dom::event::{Event, EventBubbles, EventCancelable, EventComposed};
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::htmlformelement::FormControlElementHelpers;
+use crate::dom::html::htmlformelement::FormControlElementHelpers;
 use crate::dom::node::{Node, NodeTraits};
 use crate::dom::shadowroot::ShadowRoot;
 use crate::dom::virtualmethods::VirtualMethods;
@@ -68,14 +67,136 @@ use crate::dom::workerglobalscope::WorkerGlobalScope;
 use crate::realms::{InRealm, enter_realm};
 use crate::script_runtime::CanGc;
 
+/// <https://html.spec.whatwg.org/multipage/#event-handler-content-attributes>
+/// containing the values from
+/// <https://html.spec.whatwg.org/multipage/#globaleventhandlers> and
+/// <https://html.spec.whatwg.org/multipage/#windoweventhandlers> as well as
+/// specific attributes for elements
+static CONTENT_EVENT_HANDLER_NAMES: [&str; 108] = [
+    "onabort",
+    "onauxclick",
+    "onbeforeinput",
+    "onbeforematch",
+    "onbeforetoggle",
+    "onblur",
+    "oncancel",
+    "oncanplay",
+    "oncanplaythrough",
+    "onchange",
+    "onclick",
+    "onclose",
+    "oncommand",
+    "oncontextlost",
+    "oncontextmenu",
+    "oncontextrestored",
+    "oncopy",
+    "oncuechange",
+    "oncut",
+    "ondblclick",
+    "ondrag",
+    "ondragend",
+    "ondragenter",
+    "ondragleave",
+    "ondragover",
+    "ondragstart",
+    "ondrop",
+    "ondurationchange",
+    "onemptied",
+    "onended",
+    "onerror",
+    "onfocus",
+    "onformdata",
+    "oninput",
+    "oninvalid",
+    "onkeydown",
+    "onkeypress",
+    "onkeyup",
+    "onload",
+    "onloadeddata",
+    "onloadedmetadata",
+    "onloadstart",
+    "onmousedown",
+    "onmouseenter",
+    "onmouseleave",
+    "onmousemove",
+    "onmouseout",
+    "onmouseover",
+    "onmouseup",
+    "onpaste",
+    "onpause",
+    "onplay",
+    "onplaying",
+    "onprogress",
+    "onratechange",
+    "onreset",
+    "onresize",
+    "onscroll",
+    "onscrollend",
+    "onsecuritypolicyviolation",
+    "onseeked",
+    "onseeking",
+    "onselect",
+    "onslotchange",
+    "onstalled",
+    "onsubmit",
+    "onsuspend",
+    "ontimeupdate",
+    "ontoggle",
+    "onvolumechange",
+    "onwaiting",
+    "onwebkitanimationend",
+    "onwebkitanimationiteration",
+    "onwebkitanimationstart",
+    "onwebkittransitionend",
+    "onwheel",
+    // https://drafts.csswg.org/css-animations/#interface-globaleventhandlers-idl
+    "onanimationstart",
+    "onanimationiteration",
+    "onanimationend",
+    "onanimationcancel",
+    // https://drafts.csswg.org/css-transitions/#interface-globaleventhandlers-idl
+    "ontransitionrun",
+    "ontransitionend",
+    "ontransitioncancel",
+    // https://w3c.github.io/selection-api/#extensions-to-globaleventhandlers-interface
+    "onselectstart",
+    "onselectionchange",
+    // https://html.spec.whatwg.org/multipage/#windoweventhandlers
+    "onafterprint",
+    "onbeforeprint",
+    "onbeforeunload",
+    "onhashchange",
+    "onlanguagechange",
+    "onmessage",
+    "onmessageerror",
+    "onoffline",
+    "ononline",
+    "onpagehide",
+    "onpagereveal",
+    "onpageshow",
+    "onpageswap",
+    "onpopstate",
+    "onrejectionhandled",
+    "onstorage",
+    "onunhandledrejection",
+    "onunload",
+    // https://w3c.github.io/encrypted-media/#attributes-3
+    "onencrypted",
+    "onwaitingforkey",
+    // https://svgwg.org/svg2-draft/interact.html#AnimationEvents
+    "onbegin",
+    "onend",
+    "onrepeat",
+];
+
 #[derive(Clone, JSTraceable, MallocSizeOf, PartialEq)]
 #[allow(clippy::enum_variant_names)]
 pub(crate) enum CommonEventHandler {
-    EventHandler(#[ignore_malloc_size_of = "Rc"] Rc<EventHandlerNonNull>),
+    EventHandler(#[conditional_malloc_size_of] Rc<EventHandlerNonNull>),
 
-    ErrorEventHandler(#[ignore_malloc_size_of = "Rc"] Rc<OnErrorEventHandlerNonNull>),
+    ErrorEventHandler(#[conditional_malloc_size_of] Rc<OnErrorEventHandlerNonNull>),
 
-    BeforeUnloadEventHandler(#[ignore_malloc_size_of = "Rc"] Rc<OnBeforeUnloadEventHandlerNonNull>),
+    BeforeUnloadEventHandler(#[conditional_malloc_size_of] Rc<OnBeforeUnloadEventHandlerNonNull>),
 }
 
 impl CommonEventHandler {
@@ -139,7 +260,7 @@ fn get_compiled_handler(
 
 #[derive(Clone, JSTraceable, MallocSizeOf, PartialEq)]
 enum EventListenerType {
-    Additive(#[ignore_malloc_size_of = "Rc"] Rc<EventListener>),
+    Additive(#[conditional_malloc_size_of] Rc<EventListener>),
     Inline(RefCell<InlineEventListener>),
 }
 
@@ -285,7 +406,7 @@ impl CompiledEventListener {
                         ) {
                             let value = rooted_return_value.handle();
 
-                            //Step 5
+                            // Step 5
                             let should_cancel = value.is_boolean() && !value.to_boolean();
 
                             if should_cancel {
@@ -347,7 +468,7 @@ impl std::cmp::PartialEq for EventListenerEntry {
 #[derive(Clone, JSTraceable, MallocSizeOf)]
 /// A mix of potentially uncompiled and compiled event listeners of the same type.
 pub(crate) struct EventListeners(
-    #[ignore_malloc_size_of = "Rc"] Vec<Rc<RefCell<EventListenerEntry>>>,
+    #[conditional_malloc_size_of] Vec<Rc<RefCell<EventListenerEntry>>>,
 );
 
 impl Deref for EventListeners {
@@ -390,7 +511,7 @@ impl EventListeners {
 #[dom_struct]
 pub struct EventTarget {
     reflector_: Reflector,
-    handlers: DomRefCell<HashMapTracedValues<Atom, EventListeners, BuildHasherDefault<FnvHasher>>>,
+    handlers: DomRefCell<HashMapTracedValues<Atom, EventListeners, FxBuildHasher>>,
 }
 
 impl EventTarget {
@@ -598,7 +719,7 @@ impl EventTarget {
         };
 
         // Step 3.2
-        if !document.is_scripting_enabled() {
+        if !document.scripting_enabled() {
             return None;
         }
 
@@ -878,14 +999,10 @@ impl EventTarget {
             } else {
                 ListenerPhase::Bubbling
             };
-            let old_entry = Rc::new(RefCell::new(EventListenerEntry {
-                phase,
-                listener: EventListenerType::Additive(listener.clone()),
-                once: false,
-                passive: None,
-                removed: false,
-            }));
-            if let Some(position) = entries.iter().position(|e| *e == old_entry) {
+            if let Some(position) = entries.iter().position(|e| {
+                e.borrow().listener == EventListenerType::Additive(listener.clone()) &&
+                    e.borrow().phase == phase
+            }) {
                 entries.remove(position).borrow_mut().removed = true;
             }
         }
@@ -955,6 +1072,11 @@ impl EventTarget {
                     .upcast::<EventTarget>(),
             );
         }
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#event-handler-content-attributes>
+    pub(crate) fn is_content_event_handler(name: &str) -> bool {
+        CONTENT_EVENT_HANDLER_NAMES.contains(&name)
     }
 }
 

@@ -18,7 +18,7 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::datatransferitemlist::DataTransferItemList;
 use crate::dom::element::Element;
 use crate::dom::filelist::FileList;
-use crate::dom::htmlimageelement::HTMLImageElement;
+use crate::dom::html::htmlimageelement::HTMLImageElement;
 use crate::dom::window::Window;
 use crate::drag_data_store::{DragDataStore, Mode};
 use crate::script_runtime::{CanGc, JSContext};
@@ -85,7 +85,7 @@ impl DataTransfer {
         Self::new_with_proto(window, None, can_gc, data_store)
     }
 
-    pub(crate) fn data_store(&self) -> Option<Ref<DragDataStore>> {
+    pub(crate) fn data_store(&self) -> Option<Ref<'_, DragDataStore>> {
         Ref::filter_map(self.data_store.borrow(), |data_store| data_store.as_ref()).ok()
     }
 }
@@ -205,7 +205,7 @@ impl DataTransferMethods<crate::DomTypeHolder> for DataTransfer {
             // Step 9 If convert-to-URL is true, then parse result as appropriate for text/uri-list data,
             // and then set result to the first URL from the list, if any, or the empty string otherwise.
             if convert_to_url {
-                //TODO parse uri-list as [RFC2483]
+                // TODO parse uri-list as [RFC2483]
             }
 
             // Step 10 Return result.

@@ -14,6 +14,7 @@ use script_bindings::script_runtime::JSContext;
 use servo_arc::Arc;
 use style::author_styles::AuthorStyles;
 use style::dom::TElement;
+use style::invalidation::element::restyle_hints::RestyleHint;
 use style::shared_lock::SharedRwLockReadGuard;
 use style::stylesheets::Stylesheet;
 use style::stylist::{CascadeData, Stylist};
@@ -43,7 +44,7 @@ use crate::dom::documentorshadowroot::{
     DocumentOrShadowRoot, ServoStylesheetInDocument, StylesheetSource,
 };
 use crate::dom::element::Element;
-use crate::dom::htmlslotelement::HTMLSlotElement;
+use crate::dom::html::htmlslotelement::HTMLSlotElement;
 use crate::dom::node::{
     BindContext, Node, NodeDamage, NodeFlags, NodeTraits, ShadowIncluding, UnbindContext,
     VecPreOrderInsertionHelper,
@@ -186,7 +187,7 @@ impl ShadowRoot {
     }
 
     pub(crate) fn get_focused_element(&self) -> Option<DomRoot<Element>> {
-        //XXX get retargeted focused element
+        // XXX get retargeted focused element
         None
     }
 
@@ -241,7 +242,7 @@ impl ShadowRoot {
         debug_assert!(cssom_stylesheet.is_constructed());
 
         let stylesheets = &mut self.author_styles.borrow_mut().stylesheets;
-        let sheet = cssom_stylesheet.style_stylesheet_arc().clone();
+        let sheet = cssom_stylesheet.style_stylesheet().clone();
 
         let insertion_point = stylesheets.iter().last().cloned();
 
@@ -270,6 +271,11 @@ impl ShadowRoot {
         // Mark the host element dirty so a reflow will be performed.
         if let Some(host) = self.host.get() {
             host.upcast::<Node>().dirty(NodeDamage::Style);
+
+            // Also mark the host element with `RestyleHint::restyle_subtree` so a reflow
+            // can traverse into the shadow tree.
+            let mut restyle = self.document.ensure_pending_restyle(&host);
+            restyle.hint.insert(RestyleHint::restyle_subtree());
         }
     }
 

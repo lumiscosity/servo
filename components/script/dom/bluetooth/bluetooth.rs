@@ -87,7 +87,7 @@ impl BluetoothExtraPermissionData {
         self.allowed_devices.borrow_mut().push(allowed_device);
     }
 
-    fn get_allowed_devices(&self) -> Ref<Vec<AllowedBluetoothDevice>> {
+    fn get_allowed_devices(&self) -> Ref<'_, Vec<AllowedBluetoothDevice>> {
         self.allowed_devices.borrow()
     }
 
@@ -564,7 +564,7 @@ impl BluetoothMethods<crate::DomTypeHolder> for Bluetooth {
             sender,
             can_gc,
         );
-        //Note: Step 3 - 4. in response function, Step 5. in handle_response function.
+        // Note: Step 3 - 4. in response function, Step 5. in handle_response function.
         p
     }
 
@@ -635,12 +635,13 @@ impl PermissionAlgorithm for Bluetooth {
     fn create_descriptor(
         cx: JSContext,
         permission_descriptor_obj: *mut JSObject,
+        can_gc: CanGc,
     ) -> Result<BluetoothPermissionDescriptor, Error> {
         rooted!(in(*cx) let mut property = UndefinedValue());
         property
             .handle_mut()
             .set(ObjectValue(permission_descriptor_obj));
-        match BluetoothPermissionDescriptor::new(cx, property.handle()) {
+        match BluetoothPermissionDescriptor::new(cx, property.handle(), can_gc) {
             Ok(ConversionResult::Success(descriptor)) => Ok(descriptor),
             Ok(ConversionResult::Failure(error)) => Err(Error::Type(error.into_owned())),
             Err(_) => Err(Error::Type(String::from(BT_DESC_CONVERSION_ERROR))),

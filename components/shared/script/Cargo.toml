@@ -26,6 +26,7 @@ crossbeam-channel = { workspace = true }
 devtools_traits = { workspace = true }
 embedder_traits = { workspace = true }
 euclid = { workspace = true }
+rustc-hash = { workspace = true }
 ipc-channel = { workspace = true }
 keyboard-types = { workspace = true }
 malloc_size_of = { workspace = true }
@@ -35,6 +36,7 @@ net_traits = { workspace = true }
 pixels = { path = "../../pixels" }
 profile_traits = { workspace = true }
 serde = { workspace = true }
+servo_config = { path = "../../config" }
 servo_url = { path = "../../url" }
 strum = { workspace = true, features = ["derive"] }
 strum_macros = { workspace = true }
@@ -43,3 +45,4 @@ stylo_traits = { workspace = true }
 webgpu_traits = { workspace = true, optional = true }
 webrender_api = { workspace = true }
 webxr-api = { workspace = true, features = ["ipc"] }
+log = "0.4.27"
