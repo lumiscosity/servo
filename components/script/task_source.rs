@@ -28,6 +28,7 @@ pub(crate) enum TaskSourceName {
     Clipboard,
     DatabaseAccess,
     DOMManipulation,
+    Embed,
     FileReading,
     /// <https://drafts.csswg.org/css-font-loading/#task-source>
     FontLoading,
@@ -58,6 +59,7 @@ impl From<TaskSourceName> for ScriptThreadEventCategory {
             TaskSourceName::Clipboard => ScriptThreadEventCategory::ScriptEvent,
             TaskSourceName::DatabaseAccess => ScriptThreadEventCategory::ScriptEvent,
             TaskSourceName::DOMManipulation => ScriptThreadEventCategory::ScriptEvent,
+            TaskSourceName::Embed => ScriptThreadEventCategory::ScriptEvent,
             TaskSourceName::FileReading => ScriptThreadEventCategory::FileRead,
             TaskSourceName::FontLoading => ScriptThreadEventCategory::FontLoading,
             TaskSourceName::HistoryTraversal => ScriptThreadEventCategory::HistoryEvent,
