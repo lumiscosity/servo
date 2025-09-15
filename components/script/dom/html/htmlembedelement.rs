@@ -18,6 +18,7 @@ use style::attr::AttrValue;
 use xml5ever::local_name;
 
 use crate::dom::bindings::codegen::Bindings::HTMLEmbedElementBinding::HTMLEmbedElementMethods;
+use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::document::Document;
@@ -116,12 +117,14 @@ impl HTMLEmbedElement {
     /// https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-embed-element-setup-steps
     /// TODO: We need to hook into a lot of places to fire this from. Refer to the linked paragraph
     ///       and the `potentially_active` function above.
-    pub(crate) fn setup(self) {
-        let element = self.upcast::<Element>();
-        let document = self.owner_document();
-        let global = document.global();
-        let src_attr = &local_name!("src");
-        global.task_manager().embed_task_source().queue(task!(setup_ok: move || {
+    pub(crate) fn setup(&self) {
+        let this = Trusted::new(self);
+        self.owner_document().global().task_manager().embed_task_source().queue(task!(setup_ok: move || {
+            let binding = this.root();
+            let element = binding.upcast::<Element>();
+            let document = element.owner_document();
+            let global = document.global();
+            let src_attr = &local_name!("src");
             // TODO: 1. If another task has since been queued to run the embed element setup steps for element, then return.
             // 2. If element has a src attribute set, then:
             if element.has_attribute(src_attr){
@@ -142,7 +145,7 @@ impl HTMLEmbedElement {
                 // TODO: Is the client field what we do with the webview ID?
                 let request = RequestBuilder::new(
                     Some(document.webview_id()),
-                    url,
+                    url.clone(),
                     Referrer::NoReferrer
                 )
                     .destination(Destination::Embed)
@@ -156,8 +159,8 @@ impl HTMLEmbedElement {
                 global.fetch(
                     request,
                     Arc::new(Mutex::new(EmbedSetupFetchListener {
-                            element: self,
-                            url: url,
+                            element: this,
+                            url: url.clone(),
                             resource_timing: ResourceFetchTiming::new(ResourceTimingType::Resource),
                     })),
                     global.task_manager().embed_task_source().into()
@@ -208,7 +211,7 @@ impl HTMLEmbedElementMethods<crate::DomTypeHolder> for HTMLEmbedElement {
 
 struct EmbedSetupFetchListener {
     /// The <embed> element responsible for this fetch request.
-    element: HTMLEmbedElement,
+    element: Trusted<HTMLEmbedElement>,
     /// URL of this request.
     url: ServoUrl,
     /// Timing data for this resource.
@@ -230,7 +233,7 @@ impl FetchResponseListener for EmbedSetupFetchListener {
         // 2. If response is a network error, then fire an event named load at
         // element, and return.
         if metadata.is_err() {
-            self.element.downcast::<EventTarget>
+            self.element.root().upcast::<EventTarget>()
                 .fire_event(atom!("load"), CanGc::note());
             return;
         }
@@ -277,7 +280,7 @@ impl ResourceTimingListener for EmbedSetupFetchListener {
     }
 
     fn resource_timing_global(&self) -> DomRoot<crate::dom::types::GlobalScope> {
-        self.element.global()
+        self.element.root().global()
     }
 }
 
