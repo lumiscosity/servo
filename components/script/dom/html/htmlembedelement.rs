@@ -8,9 +8,8 @@ use content_security_policy::Destination;
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Prefix};
 use js::rust::HandleObject;
-use net_traits::request::{CredentialsMode, RequestMode};
-use net_traits::request::{Referrer, RequestBuilder};
-use net_traits::{FetchResponseListener, NetworkError, ResourceFetchTiming, ResourceTimingType};
+use net_traits::request::{CredentialsMode, Referrer, RequestBuilder, RequestMode};
+use net_traits::{FetchResponseListener, ResourceFetchTiming, ResourceTimingType};
 use script_bindings::inheritance::Castable;
 use script_bindings::str::{DOMString, USVString};
 use servo_url::ServoUrl;
@@ -26,7 +25,7 @@ use crate::dom::htmlelement::HTMLElement;
 use crate::dom::node::{Node, NodeTraits};
 use crate::dom::performanceresourcetiming::InitiatorType;
 use crate::dom::types::{Element, EventTarget, HTMLMediaElement};
-use crate::network_listener::{submit_timing, PreInvoke, ResourceTimingListener};
+use crate::network_listener::{PreInvoke, ResourceTimingListener, submit_timing};
 use crate::script_runtime::CanGc;
 
 #[dom_struct]
@@ -70,18 +69,19 @@ impl HTMLEmbedElement {
         let src_attr = &local_name!("src");
         let type_attr = &local_name!("type");
         // The element has neither a src attribute nor a type attribute.
-        let neither_src_nor_type = !element.has_attribute(src_attr)
-            && !element.has_attribute(type_attr);
+        let neither_src_nor_type =
+            !element.has_attribute(src_attr) && !element.has_attribute(type_attr);
         // The element has a media element ancestor.
-        let media_element_descendant = node.ancestors().find(|ancestor| {
-            ancestor.downcast::<HTMLMediaElement>().is_some()
-        }).is_some();
+        let media_element_descendant = node
+            .ancestors()
+            .find(|ancestor| ancestor.downcast::<HTMLMediaElement>().is_some())
+            .is_some();
         // TODO: The element has an ancestor object element that is not showing its fallback content.
         //       Blocked by the object element not having a concept of fallback content yet.
         neither_src_nor_type || media_element_descendant
     }
 
-    /// https://html.spec.whatwg.org/multipage/iframe-embed-object.html#concept-embed-active
+    /// <https://html.spec.whatwg.org/multipage/#concept-embed-active>
     fn potentially_active(&self) -> bool {
         let element = self.upcast::<Element>();
         let node = self.upcast::<Node>();
@@ -92,8 +92,7 @@ impl HTMLEmbedElement {
         // The element's node document is fully active.
         let node_document_active = node.owner_doc().is_fully_active();
         // The element has either a src attribute set or a type attribute set (or both).
-        let has_src_or_type = element.has_attribute(src_attr)
-            || element.has_attribute(type_attr);
+        let has_src_or_type = element.has_attribute(src_attr) || element.has_attribute(type_attr);
         // The element's src attribute is either absent or its value is not the empty string.
         let src_attr_absent_or_not_empty: bool;
         if element.has_attribute(src_attr) {
@@ -102,19 +101,24 @@ impl HTMLEmbedElement {
             src_attr_absent_or_not_empty = true;
         }
         // The element is not a descendant of a media element.
-        let not_media_element_descendant = node.ancestors().find(|ancestor| {
-            ancestor.downcast::<HTMLMediaElement>().is_some()
-        }).is_none();
+        let not_media_element_descendant = node
+            .ancestors()
+            .find(|ancestor| ancestor.downcast::<HTMLMediaElement>().is_some())
+            .is_none();
         // TODO: The element is not a descendant of an object element that is not showing its fallback content.
         //       Blocked by the object element not having a concept of fallback content yet.
         // The element is being rendered, or was being rendered the last time the event loop reached step 1.
-        // <https://html.spec.whatwg.org/multipage/rendering.html#being-rendered>
+        // See https://html.spec.whatwg.org/multipage/#being-rendered.
         let is_rendered = element.has_css_layout_box();
-        in_a_document && node_document_active && has_src_or_type && src_attr_absent_or_not_empty
-        && not_media_element_descendant && is_rendered
+        in_a_document &&
+            node_document_active &&
+            has_src_or_type &&
+            src_attr_absent_or_not_empty &&
+            not_media_element_descendant &&
+            is_rendered
     }
 
-    /// https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-embed-element-setup-steps
+    /// <https://html.spec.whatwg.org/multipage/#the-embed-element-setup-steps>
     /// TODO: We need to hook into a lot of places to fire this from. Refer to the linked paragraph
     ///       and the `potentially_active` function above.
     pub(crate) fn setup(&self) {
@@ -191,21 +195,23 @@ impl HTMLEmbedElementMethods<crate::DomTypeHolder> for HTMLEmbedElement {
     // https://html.spec.whatwg.org/multipage/#dom-embed-height
     make_dimension_setter!(SetHeight, "height");
 
-    // https://html.spec.whatwg.org/multipage/embedded-content-other.html#dom-media-getsvgdocument
+    // https://html.spec.whatwg.org/multipage/#dom-media-getsvgdocument
     // TODO: According to the spec, <iframe> and <object> should also have this!
     // Maybe it should be generic between the three somehow? SVGDocument trait with a getter/setter? Macro?
-    fn GetSVGDocument(&self, ) -> Option<DomRoot<<crate::DomTypeHolder as script_bindings::DomTypes>::Document>> {
+    fn GetSVGDocument(
+        &self,
+    ) -> Option<DomRoot<<crate::DomTypeHolder as script_bindings::DomTypes>::Document>> {
         todo!()
     }
 
-    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-embed-align
+    // https://html.spec.whatwg.org/multipage/#dom-embed-align
     make_getter!(Align, "align");
-    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-embed-align
+    // https://html.spec.whatwg.org/multipage/#dom-embed-align
     make_setter!(SetAlign, "align");
 
-    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-embed-name
+    // https://html.spec.whatwg.org/multipage/#dom-embed-name
     make_getter!(Name, "name");
-    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-embed-name
+    // https://html.spec.whatwg.org/multipage/#dom-embed-name
     make_setter!(SetName, "name");
 }
 
@@ -233,7 +239,9 @@ impl FetchResponseListener for EmbedSetupFetchListener {
         // 2. If response is a network error, then fire an event named load at
         // element, and return.
         if metadata.is_err() {
-            self.element.root().upcast::<EventTarget>()
+            self.element
+                .root()
+                .upcast::<EventTarget>()
                 .fire_event(atom!("load"), CanGc::note());
             return;
         }
@@ -253,7 +261,6 @@ impl FetchResponseListener for EmbedSetupFetchListener {
         response: Result<net_traits::ResourceFetchTiming, net_traits::NetworkError>,
     ) {
         _ = response
-
     }
 
     fn resource_timing_mut(&mut self) -> &mut ResourceFetchTiming {
@@ -268,7 +275,12 @@ impl FetchResponseListener for EmbedSetupFetchListener {
         submit_timing(self, CanGc::note())
     }
 
-    fn process_csp_violations(&mut self, _request_id: net_traits::request::RequestId, _violations: Vec<content_security_policy::Violation>) {}
+    fn process_csp_violations(
+        &mut self,
+        _request_id: net_traits::request::RequestId,
+        _violations: Vec<content_security_policy::Violation>,
+    ) {
+    }
 }
 
 impl ResourceTimingListener for EmbedSetupFetchListener {
@@ -286,6 +298,9 @@ impl ResourceTimingListener for EmbedSetupFetchListener {
 
 impl PreInvoke for EmbedSetupFetchListener {
     fn should_invoke(&self) -> bool {
-        true // TODO: Is this where we check if the task has been fired for step 1 of the setup steps and the inner task?
+        true // TODO: Is this correct?
+        // There's an inverse situation in step 1 of the setup task
+        // and step 1 of the fetch it makes, where instead of
+        // cancelling the new request we return early out of the existing one.
     }
 }
