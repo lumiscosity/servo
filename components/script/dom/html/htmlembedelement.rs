@@ -25,9 +25,10 @@ use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::document::Document;
 use crate::dom::htmlelement::HTMLElement;
-use crate::dom::node::{Node, NodeTraits};
+use crate::dom::node::{BindContext, Node, NodeTraits, UnbindContext};
 use crate::dom::performanceresourcetiming::InitiatorType;
 use crate::dom::types::{Element, EventTarget, HTMLMediaElement};
+use crate::dom::virtualmethods::VirtualMethods;
 use crate::network_listener::{PreInvoke, ResourceTimingListener, submit_timing};
 
 #[dom_struct]
@@ -129,7 +130,7 @@ impl HTMLEmbedElement {
             let src_attr = &local_name!("src");
             // TODO: 1. If another task has since been queued to run the embed element setup steps for element, then return.
             // 2. If element has a src attribute set, then:
-            if element.has_attribute(src_attr){
+            if element.has_attribute(src_attr) {
                 // 1. Let url be the result of encoding-parsing a URL given element's src
                 // attribute's value, relative to element's node document.
                 // 2. If url is failure, then return.
@@ -163,10 +164,13 @@ impl HTMLEmbedElement {
                     Arc::new(Mutex::new(EmbedSetupFetchListener {
                             element: this,
                             url: url.clone(),
-                            resource_timing: ResourceFetchTiming::new(ResourceTimingType::Resource),
+                            resource_timing: ResourceFetchTiming::new(ResourceTimingType::Navigation),
                     })),
                     global.task_manager().embed_task_source().into()
                 )
+            } else {
+                // 3. Otherwise, display no plugin for element.
+                binding.display_no_plugin();
             }
         }))
     }
@@ -187,7 +191,7 @@ impl HTMLEmbedElementMethods<crate::DomTypeHolder> for HTMLEmbedElement {
         if self.is_potentially_active() {
             self.setup();
         } else {
-            self.display_no_plugin();
+            // TODO: Unload plugin here.
         }
     }
 
@@ -199,7 +203,7 @@ impl HTMLEmbedElementMethods<crate::DomTypeHolder> for HTMLEmbedElement {
         if self.is_potentially_active() {
             self.setup();
         } else {
-            self.display_no_plugin();
+            // TODO: Unload plugin here.
         }
     }
 
@@ -212,8 +216,6 @@ impl HTMLEmbedElementMethods<crate::DomTypeHolder> for HTMLEmbedElement {
     make_dimension_setter!(SetHeight, "height");
 
     // https://html.spec.whatwg.org/multipage/#dom-media-getsvgdocument
-    // TODO: According to the spec, <iframe> and <object> should also have this!
-    // Maybe it should be generic between the three somehow? SVGDocument trait with a getter/setter? Macro?
     fn GetSVGDocument(&self) -> Option<DomRoot<Document>> {
         // TODO: 1. Let document be this's content document.
         // TODO: 2. If document is non-null and was created by the page load processing
@@ -231,6 +233,28 @@ impl HTMLEmbedElementMethods<crate::DomTypeHolder> for HTMLEmbedElement {
     // https://html.spec.whatwg.org/multipage/#dom-embed-name
     make_getter!(Name, "name");
     make_setter!(SetName, "name");
+}
+
+impl VirtualMethods for HTMLEmbedElement {
+    fn super_type(&self) -> Option<&dyn VirtualMethods> {
+        Some(self.upcast::<HTMLElement>() as &dyn VirtualMethods)
+    }
+
+    fn bind_to_tree(&self, context: &BindContext, can_gc: CanGc) {
+        if let Some(s) = self.super_type() {
+            s.bind_to_tree(context, can_gc);
+        }
+        if self.is_potentially_active() {
+            self.setup();
+        }
+    }
+
+    fn unbind_from_tree(&self, context: &UnbindContext, can_gc: CanGc) {
+        if let Some(s) = self.super_type() {
+            s.unbind_from_tree(context, can_gc);
+        }
+        // TODO: Unload plugin here.
+    }
 }
 
 struct EmbedSetupFetchListener {
