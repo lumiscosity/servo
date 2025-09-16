@@ -2,8 +2,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 
+use base::id::{BrowsingContextId, PipelineId, WebViewId};
 use content_security_policy::Destination;
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Prefix};
@@ -11,6 +13,7 @@ use js::rust::HandleObject;
 use net_traits::request::{CredentialsMode, Referrer, RequestBuilder, RequestMode};
 use net_traits::{FetchResponseListener, ResourceFetchTiming, ResourceTimingType};
 use script_bindings::inheritance::Castable;
+use script_bindings::script_runtime::CanGc;
 use script_bindings::str::{DOMString, USVString};
 use servo_url::ServoUrl;
 use style::attr::AttrValue;
@@ -26,11 +29,20 @@ use crate::dom::node::{Node, NodeTraits};
 use crate::dom::performanceresourcetiming::InitiatorType;
 use crate::dom::types::{Element, EventTarget, HTMLMediaElement};
 use crate::network_listener::{PreInvoke, ResourceTimingListener, submit_timing};
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct HTMLEmbedElement {
     htmlelement: HTMLElement,
+    #[no_trace]
+    webview_id: Cell<Option<WebViewId>>,
+    #[no_trace]
+    browsing_context_id: Cell<Option<BrowsingContextId>>,
+    #[no_trace]
+    pipeline_id: Cell<Option<PipelineId>>,
+    #[no_trace]
+    pending_pipeline_id: Cell<Option<PipelineId>>,
+    #[no_trace]
+    about_blank_pipeline_id: Cell<Option<PipelineId>>,
 }
 
 impl HTMLEmbedElement {
@@ -41,6 +53,11 @@ impl HTMLEmbedElement {
     ) -> HTMLEmbedElement {
         HTMLEmbedElement {
             htmlelement: HTMLElement::new_inherited(local_name, prefix, document),
+            browsing_context_id: Cell::new(None),
+            webview_id: Cell::new(None),
+            pipeline_id: Cell::new(None),
+            pending_pipeline_id: Cell::new(None),
+            about_blank_pipeline_id: Cell::new(None),
         }
     }
 
@@ -62,27 +79,8 @@ impl HTMLEmbedElement {
         )
     }
 
-    /// TODO: get link to this. There's no heading, but it's above concept-embed-active
-    fn represents_nothing(&self) -> bool {
-        let element = self.upcast::<Element>();
-        let node = self.upcast::<Node>();
-        let src_attr = &local_name!("src");
-        let type_attr = &local_name!("type");
-        // The element has neither a src attribute nor a type attribute.
-        let neither_src_nor_type =
-            !element.has_attribute(src_attr) && !element.has_attribute(type_attr);
-        // The element has a media element ancestor.
-        let media_element_descendant = node
-            .ancestors()
-            .find(|ancestor| ancestor.downcast::<HTMLMediaElement>().is_some())
-            .is_some();
-        // TODO: The element has an ancestor object element that is not showing its fallback content.
-        //       Blocked by the object element not having a concept of fallback content yet.
-        neither_src_nor_type || media_element_descendant
-    }
-
     /// <https://html.spec.whatwg.org/multipage/#concept-embed-active>
-    fn potentially_active(&self) -> bool {
+    fn is_potentially_active(&self) -> bool {
         let element = self.upcast::<Element>();
         let node = self.upcast::<Node>();
         let src_attr = &local_name!("src");
@@ -172,46 +170,66 @@ impl HTMLEmbedElement {
             }
         }))
     }
+
+    /// <https://html.spec.whatwg.org/multipage/#display-no-plugin>
+    pub(crate) fn display_no_plugin(&self) {
+        // TODO: 1. Destroy a child navigable given element.
+        // TODO: 2. Display an indication that no plugin could be found for element, as the contents of element.
+    }
 }
 
 impl HTMLEmbedElementMethods<crate::DomTypeHolder> for HTMLEmbedElement {
     // https://html.spec.whatwg.org/multipage/#dom-embed-src
     make_url_getter!(Src, "src");
-    // https://html.spec.whatwg.org/multipage/#dom-embed-src
-    make_url_setter!(SetSrc, "src");
+    fn SetSrc(&self, value: USVString) {
+        let element = self.upcast::<Element>();
+        element.set_url_attribute(&html5ever::local_name!("src"), value, CanGc::note());
+        if self.is_potentially_active() {
+            self.setup();
+        } else {
+            self.display_no_plugin();
+        }
+    }
 
     // https://html.spec.whatwg.org/multipage/#dom-embed-type
     make_getter!(Type, "type");
-    // https://html.spec.whatwg.org/multipage/#dom-embed-type
-    make_setter!(SetType, "type");
+    fn SetType(&self, value: DOMString) {
+        let element = self.upcast::<Element>();
+        element.set_string_attribute(&html5ever::local_name!("type"), value, CanGc::note());
+        if self.is_potentially_active() {
+            self.setup();
+        } else {
+            self.display_no_plugin();
+        }
+    }
 
     // https://html.spec.whatwg.org/multipage/#dom-embed-width
     make_getter!(Width, "width");
-    // https://html.spec.whatwg.org/multipage/#dom-embed-width
     make_dimension_setter!(SetWidth, "width");
 
     // https://html.spec.whatwg.org/multipage/#dom-embed-height
     make_getter!(Height, "height");
-    // https://html.spec.whatwg.org/multipage/#dom-embed-height
     make_dimension_setter!(SetHeight, "height");
 
     // https://html.spec.whatwg.org/multipage/#dom-media-getsvgdocument
     // TODO: According to the spec, <iframe> and <object> should also have this!
     // Maybe it should be generic between the three somehow? SVGDocument trait with a getter/setter? Macro?
-    fn GetSVGDocument(
-        &self,
-    ) -> Option<DomRoot<<crate::DomTypeHolder as script_bindings::DomTypes>::Document>> {
-        todo!()
+    fn GetSVGDocument(&self) -> Option<DomRoot<Document>> {
+        // TODO: 1. Let document be this's content document.
+        // TODO: 2. If document is non-null and was created by the page load processing
+        // model for XML files section because the computed type of the resource in the
+        // navigate algorithm was image/svg+xml, then return document.
+
+        // 3. Return null.
+        None
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-embed-align
     make_getter!(Align, "align");
-    // https://html.spec.whatwg.org/multipage/#dom-embed-align
     make_setter!(SetAlign, "align");
 
     // https://html.spec.whatwg.org/multipage/#dom-embed-name
     make_getter!(Name, "name");
-    // https://html.spec.whatwg.org/multipage/#dom-embed-name
     make_setter!(SetName, "name");
 }
 
