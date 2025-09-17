@@ -109,6 +109,7 @@ impl HTMLEmbedElement {
         // The element is being rendered, or was being rendered the last time the event loop reached step 1.
         // See https://html.spec.whatwg.org/multipage/#being-rendered.
         let is_rendered = element.has_css_layout_box();
+
         in_a_document &&
             node_document_active &&
             has_src_or_type &&
@@ -156,8 +157,8 @@ impl HTMLEmbedElement {
                     .mode(RequestMode::Navigate)
                     .use_url_credentials(true);
 
-                // 4. Fetch request, with processResponse set to the following steps given
-                // response response:
+                // 4. Fetch request, with processResponse set to the following steps
+                // given response response:
                 // (Continued in EmbedSetupFetchListener's impls)
                 global.fetch(
                     request,
@@ -175,10 +176,32 @@ impl HTMLEmbedElement {
         }))
     }
 
+    fn determine_content_type(&self, response: Result<net_traits::FetchMetadata, net_traits::NetworkError>) -> Option<DOMString> {
+        if let Ok(_metadata) = response {
+            let element = self.upcast::<Element>();
+            // 1. If element has a type attribute, and that attribute's value is a type
+            // that a plugin supports, then return the value of the type attribute.
+            let type_attr = &local_name!("src");
+            if element.has_attribute(type_attr) {
+                // TODO: Implement plugins!
+                return None
+            }
+            // TODO: 2. If the path component of response's url matches a pattern that
+            // a plugin supports, then return the type that that plugin can handle.
+            // TODO: 3. If response has explicit Content-Type metadata, and that value
+            // is a type that a plugin supports, then return that value.
+        }
+
+        // 4. Return null.
+        None
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#display-no-plugin>
     pub(crate) fn display_no_plugin(&self) {
         // TODO: 1. Destroy a child navigable given element.
-        // TODO: 2. Display an indication that no plugin could be found for element, as the contents of element.
+        // TODO: 2. Display an indication that no plugin could be found for element,
+        // as the contents of element.
+        // 3. element now represents nothing.
     }
 }
 
@@ -276,21 +299,30 @@ impl FetchResponseListener for EmbedSetupFetchListener {
         _: net_traits::request::RequestId,
         metadata: Result<net_traits::FetchMetadata, net_traits::NetworkError>,
     ) {
+        let rooted = self.element.root();
         // TODO: 1. If another task has since been queued to run the embed element
         // setup steps for element, then return.
         // 2. If response is a network error, then fire an event named load at
         // element, and return.
         if metadata.is_err() {
-            self.element
-                .root()
-                .upcast::<EventTarget>()
+            rooted.upcast::<EventTarget>()
                 .fire_event(atom!("load"), CanGc::note());
             return;
         }
-        // TODO: 3. Let type be the result of determining the type of content given
+        // 3. Let type be the result of determining the type of content given
         // element and response.
         // 4. Switch on type:
-        // Blocked on plugins, mostly.
+        if let Some(_type_) = rooted.determine_content_type(metadata) {
+            // TODO: 1. If element's content navigable is null, then create
+            // a new child navigable for element.
+            // TODO: 2. Navigate element's content navigable to response's URL using
+            // element's node document, with response set to response, and
+            // historyHandling set to "replace".
+            // TODO: 3. element now represents its content navigable.
+        } else {
+            // 1. Display no plugin for element.
+            rooted.display_no_plugin();
+        }
     }
 
     fn process_response_chunk(&mut self, _: net_traits::request::RequestId, chunk: Vec<u8>) {
