@@ -65,7 +65,7 @@ bitflags! {
 }
 
 #[derive(PartialEq)]
-enum PipelineType {
+pub(crate) enum PipelineType {
     InitialAboutBlank,
     Navigation,
 }

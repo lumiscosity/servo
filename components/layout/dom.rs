@@ -302,6 +302,7 @@ pub(crate) trait NodeExt<'dom> {
     fn as_image(&self) -> Option<(Option<Image>, PhysicalSize<f64>)>;
     fn as_canvas(&self) -> Option<(CanvasInfo, PhysicalSize<f64>)>;
     fn as_iframe(&self) -> Option<(PipelineId, BrowsingContextId)>;
+    fn as_embed(&self) -> Option<(PipelineId, BrowsingContextId)>;
     fn as_video(&self) -> Option<(Option<webrender_api::ImageKey>, Option<PhysicalSize<f64>>)>;
     fn as_svg(&self) -> Option<SVGElementData>;
     fn as_typeless_object_with_data_attribute(&self) -> Option<String>;
@@ -371,6 +372,15 @@ impl<'dom> NodeExt<'dom> for ServoThreadSafeLayoutNode<'dom> {
 
     fn as_iframe(&self) -> Option<(PipelineId, BrowsingContextId)> {
         match (self.iframe_pipeline_id(), self.iframe_browsing_context_id()) {
+            (Some(pipeline_id), Some(browsing_context_id)) => {
+                Some((pipeline_id, browsing_context_id))
+            },
+            _ => None,
+        }
+    }
+
+    fn as_embed(&self) -> Option<(PipelineId, BrowsingContextId)> {
+        match (self.embed_pipeline_id(), self.embed_browsing_context_id()) {
             (Some(pipeline_id), Some(browsing_context_id)) => {
                 Some((pipeline_id, browsing_context_id))
             },

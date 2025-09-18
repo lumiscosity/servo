@@ -27,7 +27,7 @@ use crate::cell::ArcRefCell;
 use crate::context::{LayoutContext, LayoutImageCacheResult};
 use crate::dom::NodeExt;
 use crate::fragment_tree::{
-    BaseFragmentInfo, CollapsedBlockMargins, Fragment, IFrameFragment, ImageFragment,
+    BaseFragmentInfo, CollapsedBlockMargins, EmbedFragment, Fragment, IFrameFragment, ImageFragment
 };
 use crate::geom::{LogicalVec2, PhysicalPoint, PhysicalRect, PhysicalSize};
 use crate::layout_box_base::{CacheableLayoutResult, LayoutBoxBase};
@@ -111,7 +111,7 @@ pub(crate) struct CanvasInfo {
 }
 
 #[derive(Debug, MallocSizeOf)]
-pub(crate) struct IFrameInfo {
+pub(crate) struct ContentNavigableInfo {
     pub pipeline_id: PipelineId,
     pub browsing_context_id: BrowsingContextId,
 }
@@ -124,7 +124,8 @@ pub(crate) struct VideoInfo {
 #[derive(Debug, MallocSizeOf)]
 pub(crate) enum ReplacedContentKind {
     Image(Option<Image>),
-    IFrame(IFrameInfo),
+    IFrame(ContentNavigableInfo),
+    Embed(ContentNavigableInfo),
     Canvas(CanvasInfo),
     Video(Option<VideoInfo>),
     SVGElement(Option<VectorImage>),
@@ -158,11 +159,19 @@ impl ReplacedContents {
                 )
             } else if let Some((pipeline_id, browsing_context_id)) = node.as_iframe() {
                 (
-                    ReplacedContentKind::IFrame(IFrameInfo {
+                    ReplacedContentKind::IFrame(ContentNavigableInfo {
                         pipeline_id,
                         browsing_context_id,
                     }),
                     NaturalSizes::empty(),
+                )
+            } else if let Some((pipeline_id, browsing_context_id)) = node.as_embed() {
+                (
+                    ReplacedContentKind::Embed(ContentNavigableInfo {
+                        pipeline_id,
+                        browsing_context_id,
+                    }),
+                 NaturalSizes::empty(),
                 )
             } else if let Some((image_key, natural_size_in_dots)) = node.as_video() {
                 (
@@ -398,6 +407,28 @@ impl ReplacedContents {
                     style: style.clone(),
                     pipeline_id: iframe.pipeline_id,
                     rect,
+                }))]
+            },
+            ReplacedContentKind::Embed(embed) => {
+                let size = Size2D::new(rect.size.width.to_f32_px(), rect.size.height.to_f32_px());
+                let hidpi_scale_factor = layout_context.style_context.device_pixel_ratio();
+
+                layout_context.iframe_sizes.lock().insert(
+                    embed.browsing_context_id,
+                    IFrameSize {
+                        browsing_context_id: embed.browsing_context_id,
+                        pipeline_id: embed.pipeline_id,
+                        viewport_details: ViewportDetails {
+                            size,
+                            hidpi_scale_factor: Scale::new(hidpi_scale_factor.0),
+                        },
+                    },
+                );
+                vec![Fragment::Embed(ArcRefCell::new(EmbedFragment {
+                    base: self.base_fragment_info.into(),
+                                                      style: style.clone(),
+                                                      pipeline_id: embed.pipeline_id,
+                                                      rect,
                 }))]
             },
             ReplacedContentKind::Canvas(canvas_info) => {

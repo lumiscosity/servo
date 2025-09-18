@@ -437,6 +437,18 @@ impl<'dom> ThreadSafeLayoutNode<'dom> for ServoThreadSafeLayoutNode<'dom> {
         this.iframe_pipeline_id()
     }
 
+    // Can return None if the embed has no nested browsing context
+    fn embed_browsing_context_id(&self) -> Option<BrowsingContextId> {
+        let this = unsafe { self.get_jsmanaged() };
+        this.iframe_browsing_context_id()
+    }
+
+    // Can return None if the embed has no nested browsing context
+    fn embed_pipeline_id(&self) -> Option<PipelineId> {
+        let this = unsafe { self.get_jsmanaged() };
+        this.iframe_pipeline_id()
+    }
+
     fn get_span(&self) -> Option<u32> {
         unsafe {
             self.get_jsmanaged()

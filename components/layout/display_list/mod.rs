@@ -547,6 +547,7 @@ impl InspectorHighlight {
             Fragment::Image(image_fragment) => image_fragment.borrow().rect,
             Fragment::AbsoluteOrFixedPositioned(_) => return,
             Fragment::IFrame(iframe_fragment) => iframe_fragment.borrow().rect,
+            Fragment::Embed(embed_fragment) => embed_fragment.borrow().rect,
         };
 
         state.content_box = state
@@ -647,6 +648,29 @@ impl Fragment {
                             },
                             iframe.pipeline_id.into(),
                             true,
+                        );
+                    },
+                    Visibility::Hidden => (),
+                    Visibility::Collapse => (),
+                }
+            },
+            Fragment::Embed(embed) => {
+                let embed = embed.borrow();
+                match embed.style.get_inherited_box().visibility {
+                    Visibility::Visible => {
+                        builder.mark_is_contentful();
+                        let rect = embed.rect.translate(containing_block.origin.to_vector());
+
+                        let common = builder.common_properties(rect.to_webrender(), &embed.style);
+                        builder.wr().push_iframe(
+                            rect.to_webrender(),
+                                                 common.clip_rect,
+                                                 &wr::SpaceAndClipInfo {
+                                                     spatial_id: common.spatial_id,
+                                                     clip_chain_id: common.clip_chain_id,
+                                                 },
+                                                 embed.pipeline_id.into(),
+                                                 true,
                         );
                     },
                     Visibility::Hidden => (),

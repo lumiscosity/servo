@@ -98,6 +98,7 @@ use crate::dom::globalscope::GlobalScope;
 use crate::dom::html::htmlcanvaselement::{HTMLCanvasElement, LayoutHTMLCanvasElementHelpers};
 use crate::dom::html::htmlcollection::HTMLCollection;
 use crate::dom::html::htmlelement::HTMLElement;
+use crate::dom::html::htmlembedelement::{HTMLEmbedElement, HTMLEmbedElementLayoutMethods};
 use crate::dom::html::htmliframeelement::{HTMLIFrameElement, HTMLIFrameElementLayoutMethods};
 use crate::dom::html::htmlimageelement::{HTMLImageElement, LayoutHTMLImageElementHelpers};
 use crate::dom::html::htmlinputelement::{
@@ -1687,6 +1688,8 @@ pub(crate) trait LayoutNodeHelpers<'dom> {
     fn svg_data(self) -> Option<SVGElementData>;
     fn iframe_browsing_context_id(self) -> Option<BrowsingContextId>;
     fn iframe_pipeline_id(self) -> Option<PipelineId>;
+    fn embed_browsing_context_id(self) -> Option<BrowsingContextId>;
+    fn embed_pipeline_id(self) -> Option<PipelineId>;
     fn opaque(self) -> OpaqueNode;
     fn implemented_pseudo_element(&self) -> Option<PseudoElement>;
     fn is_in_ua_widget(&self) -> bool;
@@ -1985,6 +1988,16 @@ impl<'dom> LayoutNodeHelpers<'dom> for LayoutDom<'dom, Node> {
     fn iframe_pipeline_id(self) -> Option<PipelineId> {
         self.downcast::<HTMLIFrameElement>()
             .and_then(|iframe_element| iframe_element.pipeline_id())
+    }
+
+    fn embed_browsing_context_id(self) -> Option<BrowsingContextId> {
+        self.downcast::<HTMLEmbedElement>()
+        .and_then(|embed_element| embed_element.browsing_context_id())
+    }
+
+    fn embed_pipeline_id(self) -> Option<PipelineId> {
+        self.downcast::<HTMLEmbedElement>()
+        .and_then(|embed_element| embed_element.pipeline_id())
     }
 
     #[allow(unsafe_code)]

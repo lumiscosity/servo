@@ -47,6 +47,7 @@ pub(crate) enum Fragment {
     Text(ArcRefCell<TextFragment>),
     Image(ArcRefCell<ImageFragment>),
     IFrame(ArcRefCell<IFrameFragment>),
+    Embed(ArcRefCell<EmbedFragment>),
 }
 
 #[derive(Clone, MallocSizeOf)]
@@ -94,6 +95,14 @@ pub(crate) struct IFrameFragment {
     pub style: ServoArc<ComputedValues>,
 }
 
+#[derive(MallocSizeOf)]
+pub(crate) struct EmbedFragment {
+    pub base: BaseFragment,
+    pub pipeline_id: PipelineId,
+    pub rect: PhysicalRect<Au>,
+    pub style: ServoArc<ComputedValues>,
+}
+
 impl Fragment {
     pub fn base(&self) -> Option<BaseFragment> {
         Some(match self {
@@ -103,6 +112,7 @@ impl Fragment {
             Fragment::Positioning(fragment) => fragment.borrow().base.clone(),
             Fragment::Image(fragment) => fragment.borrow().base.clone(),
             Fragment::IFrame(fragment) => fragment.borrow().base.clone(),
+            Fragment::Embed(fragment) => fragment.borrow().base.clone(),
             Fragment::Float(fragment) => fragment.borrow().base.clone(),
         })
     }
@@ -116,6 +126,7 @@ impl Fragment {
             Fragment::Text(text_fragment) => callback(&mut text_fragment.borrow_mut().rect),
             Fragment::Image(image_fragment) => callback(&mut image_fragment.borrow_mut().rect),
             Fragment::IFrame(iframe_fragment) => callback(&mut iframe_fragment.borrow_mut().rect),
+            Fragment::Embed(embed_fragment) => callback(&mut embed_fragment.borrow_mut().rect),
         }
     }
 
@@ -138,6 +149,7 @@ impl Fragment {
             Fragment::Text(_) => {},
             Fragment::Image(_) => {},
             Fragment::IFrame(_) => {},
+            Fragment::Embed(_) => {},
         }
     }
 
@@ -160,6 +172,7 @@ impl Fragment {
             Fragment::Text(fragment) => fragment.borrow().print(tree),
             Fragment::Image(fragment) => fragment.borrow().print(tree),
             Fragment::IFrame(fragment) => fragment.borrow().print(tree),
+            Fragment::Embed(fragment) => fragment.borrow().print(tree),
         }
     }
 
@@ -183,6 +196,7 @@ impl Fragment {
             Fragment::Text(fragment) => fragment.borrow().rect,
             Fragment::Image(fragment) => fragment.borrow().rect,
             Fragment::IFrame(fragment) => fragment.borrow().rect,
+            Fragment::Embed(fragment) => fragment.borrow().rect,
         }
     }
 
@@ -217,7 +231,8 @@ impl Fragment {
             Fragment::Text(_) |
             Fragment::AbsoluteOrFixedPositioned(_) |
             Fragment::Image(_) |
-            Fragment::IFrame(_) => None,
+            Fragment::IFrame(_) |
+            Fragment::Embed(_) => None,
         }
     }
 
@@ -325,6 +340,7 @@ impl Fragment {
             Fragment::Text(..) => unreachable!("Should never try to repair style of TextFragment"),
             Fragment::Image(image_fragment) => image_fragment.borrow_mut().style = style.clone(),
             Fragment::IFrame(iframe_fragment) => iframe_fragment.borrow_mut().style = style.clone(),
+            Fragment::Embed(embed_fragment) => embed_fragment.borrow_mut().style = style.clone(),
         }
     }
 
@@ -369,6 +385,16 @@ impl IFrameFragment {
             "IFrame\
                 \npipeline={:?} rect={:?}",
             self.pipeline_id, self.rect
+        ));
+    }
+}
+
+impl EmbedFragment {
+    pub fn print(&self, tree: &mut PrintTree) {
+        tree.add_item(format!(
+            "Embed\
+\npipeline={:?} rect={:?}",
+self.pipeline_id, self.rect
         ));
     }
 }

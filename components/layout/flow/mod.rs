@@ -359,7 +359,8 @@ impl OutsideMarker {
                             Fragment::Box(_) |
                             Fragment::Float(_) |
                             Fragment::AbsoluteOrFixedPositioned(_) |
-                            Fragment::IFrame(_) => {
+                            Fragment::IFrame(_) |
+                            Fragment::Embed(_) => {
                                 unreachable!(
                                     "Found unexpected fragment type in outside list marker!"
                                 );

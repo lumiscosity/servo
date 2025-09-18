@@ -156,6 +156,7 @@ use crate::dom::html::htmltextareaelement::{
     HTMLTextAreaElement, LayoutHTMLTextAreaElementHelpers,
 };
 use crate::dom::html::htmlvideoelement::{HTMLVideoElement, LayoutHTMLVideoElementHelpers};
+use crate::dom::htmlembedelement::HTMLEmbedElementLayoutMethods;
 use crate::dom::intersectionobserver::{IntersectionObserver, IntersectionObserverRegistration};
 use crate::dom::mutationobserver::{Mutation, MutationObserver};
 use crate::dom::namednodemap::NamedNodeMap;
@@ -171,6 +172,7 @@ use crate::dom::shadowroot::{IsUserAgentWidget, ShadowRoot};
 use crate::dom::text::Text;
 use crate::dom::trustedhtml::TrustedHTML;
 use crate::dom::trustedtypepolicyfactory::TrustedTypePolicyFactory;
+use crate::dom::types::HTMLEmbedElement;
 use crate::dom::validation::Validatable;
 use crate::dom::validitystate::ValidationFlags;
 use crate::dom::virtualmethods::{VirtualMethods, vtable_for};
@@ -1447,6 +1449,8 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
 
         let width = if let Some(this) = self.downcast::<HTMLIFrameElement>() {
             this.get_width()
+        } else if let Some(this) = self.downcast::<HTMLEmbedElement>() {
+                this.get_width()
         } else if let Some(this) = self.downcast::<HTMLImageElement>() {
             this.get_width()
         } else if let Some(this) = self.downcast::<HTMLVideoElement>() {
@@ -1484,6 +1488,8 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
         }
 
         let height = if let Some(this) = self.downcast::<HTMLIFrameElement>() {
+            this.get_height()
+        } else if let Some(this) = self.downcast::<HTMLEmbedElement>() {
             this.get_height()
         } else if let Some(this) = self.downcast::<HTMLImageElement>() {
             this.get_height()
