@@ -137,6 +137,7 @@ impl HTMLEmbedElement {
         history_handling: NavigationHistoryBehavior,
         can_gc: CanGc,
     ) {
+        println!("starting new pipeline");
         let sandboxed = constellation_traits::IFrameSandboxState::IFrameUnsandboxed;
 
         let browsing_context_id = match self.browsing_context_id() {
@@ -157,6 +158,7 @@ impl HTMLEmbedElement {
             // document; the new navigation will continue blocking it.
             LoadBlocker::terminate(load_blocker, can_gc);
         }
+        println!("checkpoint 1: passed loadblocker stuff");
 
         if load_data.url.scheme() == "javascript" {
             let window_proxy = self.browsing_context_id
@@ -187,6 +189,8 @@ impl HTMLEmbedElement {
             },
         };
 
+        println!("checkpoint 2: passed js eval stuff");
+
         let window = self.owner_window();
         let old_pipeline_id = self.pipeline_id();
         let new_pipeline_id = PipelineId::new();
@@ -201,6 +205,8 @@ impl HTMLEmbedElement {
             inherited_secure_context: load_data.inherited_secure_context,
             history_handling,
         };
+
+        println!("checkpoint 3: load_info constructed");
 
         let viewport_details = window
         .get_iframe_viewport_details_if_known(browsing_context_id)
@@ -259,6 +265,7 @@ impl HTMLEmbedElement {
                 .unwrap();
             },
         }
+        println!("done!");
     }
 
     pub(crate) fn update_pipeline_id(
@@ -342,7 +349,10 @@ impl HTMLEmbedElement {
         //       Blocked by the object element not having a concept of fallback content yet.
         // The element is being rendered, or was being rendered the last time the event loop reached step 1.
         // See https://html.spec.whatwg.org/multipage/#being-rendered.
-        let is_rendered = element.has_css_layout_box();
+        // TODO: This crashes because "Attempt to use script or layout while DOM is
+            // not in a stable state"
+        //let is_rendered = element.has_css_layout_box();
+        let is_rendered = true;
 
         if !in_a_document {
             println!("in_a_document failed");
@@ -616,6 +626,7 @@ impl FetchResponseListener for EmbedSetupFetchListener {
             if rooted.webview_id == None.into() {
                 rooted.create_child_navigable(CanGc::note());
             }
+            println!("begin navigation");
             // 2. Navigate element's content navigable to response's URL using
             // element's node document, with response set to response, and
             // historyHandling set to "replace".
@@ -625,6 +636,7 @@ impl FetchResponseListener for EmbedSetupFetchListener {
                 rooted.pipeline_id(), Referrer::NoReferrer, data.metadata().referrer_policy, None, None, true),
                                                         NavigationHistoryBehavior::Replace,
                                                         CanGc::note());
+            println!("navigation done");
             // TODO: 3. element now represents its content navigable.
         } else {
             // 1. Display no plugin for element.

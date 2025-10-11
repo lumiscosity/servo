@@ -63,6 +63,7 @@ use crate::dom::shadowroot::ShadowRoot;
 use crate::dom::svgelement::SVGElement;
 use crate::dom::svgimageelement::SVGImageElement;
 use crate::dom::svgsvgelement::SVGSVGElement;
+use crate::dom::types::HTMLEmbedElement;
 
 /// Trait to allow DOM nodes to opt-in to overriding (or adding to) common
 /// behaviours. Replicates the effect of C++ virtual methods.
@@ -194,6 +195,9 @@ pub(crate) fn vtable_for(node: &Node) -> &dyn VirtualMethods {
         },
         NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLDetailsElement)) => {
             node.downcast::<HTMLDetailsElement>().unwrap() as &dyn VirtualMethods
+        },
+        NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLEmbedElement)) => {
+            node.downcast::<HTMLEmbedElement>().unwrap() as &dyn VirtualMethods
         },
         NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLFieldSetElement)) => {
             node.downcast::<HTMLFieldSetElement>().unwrap() as &dyn VirtualMethods
