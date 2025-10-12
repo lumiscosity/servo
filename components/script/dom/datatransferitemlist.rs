@@ -23,7 +23,7 @@ use crate::script_runtime::{CanGc, JSContext};
 #[dom_struct]
 pub(crate) struct DataTransferItemList {
     reflector_: Reflector,
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     #[no_trace]
     data_store: Rc<RefCell<Option<DragDataStore>>>,
     #[ignore_malloc_size_of = "mozjs"]
@@ -166,7 +166,7 @@ impl DataTransferItemListMethods<crate::DomTypeHolder> for DataTransferItemList 
         let mut option = self.data_store.borrow_mut();
         let data_store = match option.as_mut() {
             Some(value) if value.mode() == Mode::ReadWrite => value,
-            _ => return Err(Error::InvalidState),
+            _ => return Err(Error::InvalidState(None)),
         };
 
         let index = index as usize;

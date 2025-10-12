@@ -204,7 +204,7 @@ impl RTCDataChannel {
             DataChannelMessage::Text(text) => {
                 text.safe_to_jsval(cx, message.handle_mut());
             },
-            DataChannelMessage::Binary(data) => match &**self.binary_type.borrow() {
+            DataChannelMessage::Binary(data) => match &*self.binary_type.borrow().str() {
                 "blob" => {
                     let blob = Blob::new(
                         &global,
@@ -259,7 +259,7 @@ impl RTCDataChannel {
 
     fn send(&self, source: &SendSource) -> Fallible<()> {
         if self.ready_state.get() != RTCDataChannelState::Open {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         let message = match source {

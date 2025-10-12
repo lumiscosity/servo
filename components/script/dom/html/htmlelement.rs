@@ -7,9 +7,9 @@ use std::default::Default;
 use std::rc::Rc;
 
 use dom_struct::dom_struct;
-use html5ever::{LocalName, Prefix, local_name, ns};
+use html5ever::{LocalName, Prefix, QualName, local_name, ns};
 use js::rust::HandleObject;
-use layout_api::{QueryMsg, ScrollContainerQueryType, ScrollContainerResponse};
+use layout_api::{QueryMsg, ScrollContainerQueryFlags, ScrollContainerResponse};
 use script_bindings::codegen::GenericBindings::DocumentBinding::DocumentMethods;
 use style::attr::AttrValue;
 use stylo_dom::ElementState;
@@ -36,12 +36,11 @@ use crate::dom::customelementregistry::{CallbackReaction, CustomElementState};
 use crate::dom::document::{Document, FocusInitiator};
 use crate::dom::documentfragment::DocumentFragment;
 use crate::dom::domstringmap::DOMStringMap;
-use crate::dom::element::{AttributeMutation, Element};
+use crate::dom::element::{AttributeMutation, CustomElementCreationMode, Element, ElementCreator};
 use crate::dom::elementinternals::ElementInternals;
 use crate::dom::event::Event;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::html::htmlbodyelement::HTMLBodyElement;
-use crate::dom::html::htmlbrelement::HTMLBRElement;
 use crate::dom::html::htmldetailselement::HTMLDetailsElement;
 use crate::dom::html::htmlformelement::{FormControl, HTMLFormElement};
 use crate::dom::html::htmlframesetelement::HTMLFrameSetElement;
@@ -378,6 +377,8 @@ impl HTMLElementMethods<crate::DomTypeHolder> for HTMLElement {
             return None;
         }
 
+        #[allow(clippy::mutable_key_type)]
+        // See `impl Hash for DOMString`.
         let mut item_attr_values = HashSet::new();
         for attr_value in &atoms {
             item_attr_values.insert(DOMString::from(String::from(attr_value.trim())));
@@ -396,6 +397,8 @@ impl HTMLElementMethods<crate::DomTypeHolder> for HTMLElement {
             return None;
         }
 
+        #[allow(clippy::mutable_key_type)]
+        // See `impl Hash for DOMString`.
         let mut item_attr_values = HashSet::new();
         for attr_value in &atoms {
             item_attr_values.insert(DOMString::from(String::from(attr_value.trim())));
@@ -451,10 +454,13 @@ impl HTMLElementMethods<crate::DomTypeHolder> for HTMLElement {
     #[allow(unsafe_code)]
     fn GetScrollParent(&self) -> Option<DomRoot<Element>> {
         self.owner_window()
-            .scroll_container_query(self.upcast(), ScrollContainerQueryType::ForScrollParent)
+            .scroll_container_query(
+                Some(self.upcast()),
+                ScrollContainerQueryFlags::ForScrollParent,
+            )
             .and_then(|response| match response {
-                ScrollContainerResponse::Viewport => self.owner_document().GetScrollingElement(),
-                ScrollContainerResponse::Element(parent_node_address) => {
+                ScrollContainerResponse::Viewport(_) => self.owner_document().GetScrollingElement(),
+                ScrollContainerResponse::Element(parent_node_address, _) => {
                     let node = unsafe { from_untrusted_node_address(parent_node_address) };
                     DomRoot::downcast(node)
                 },
@@ -463,7 +469,7 @@ impl HTMLElementMethods<crate::DomTypeHolder> for HTMLElement {
 
     /// <https://drafts.csswg.org/cssom-view/#dom-htmlelement-offsetparent>
     fn GetOffsetParent(&self) -> Option<DomRoot<Element>> {
-        if self.is_body_element() || self.is::<HTMLHtmlElement>() {
+        if self.is::<HTMLBodyElement>() || self.upcast::<Element>().is_root() {
             return None;
         }
 
@@ -714,7 +720,7 @@ static DATA_HYPHEN_SEPARATOR: char = '\x2d';
 fn to_snake_case(name: DOMString) -> DOMString {
     let mut attr_name = String::with_capacity(name.len() + DATA_PREFIX.len());
     attr_name.push_str(DATA_PREFIX);
-    for ch in name.chars() {
+    for ch in name.str().chars() {
         if ch.is_ascii_uppercase() {
             attr_name.push(DATA_HYPHEN_SEPARATOR);
             attr_name.push(ch.to_ascii_lowercase());
@@ -769,6 +775,7 @@ impl HTMLElement {
         can_gc: CanGc,
     ) -> ErrorResult {
         if name
+            .str()
             .chars()
             .skip_while(|&ch| ch != '\u{2d}')
             .nth(1)
@@ -930,7 +937,7 @@ impl HTMLElement {
     // returns Some if can infer direction by itself or from child nodes
     // returns None if requires to go up to parent
     pub(crate) fn directionality(&self) -> Option<String> {
-        let element_direction: &str = &self.Dir();
+        let element_direction = &self.Dir();
 
         if element_direction == "ltr" {
             return Some("ltr".to_owned());
@@ -1038,6 +1045,7 @@ impl HTMLElement {
 
         // Step 2: Let position be a position variable for input, initially pointing at the start
         // of input.
+        let input = input.str();
         let mut position = input.chars().peekable();
 
         // Step 3: Let text be the empty string.
@@ -1060,7 +1068,15 @@ impl HTMLElement {
                         text = String::new();
                     }
 
-                    let br = HTMLBRElement::new(local_name!("br"), None, &document, None, can_gc);
+                    let br = Element::create(
+                        QualName::new(None, ns!(html), local_name!("br")),
+                        None,
+                        &document,
+                        ElementCreator::ScriptCreated,
+                        CustomElementCreationMode::Asynchronous,
+                        None,
+                        can_gc,
+                    );
                     fragment
                         .upcast::<Node>()
                         .AppendChild(br.upcast(), can_gc)

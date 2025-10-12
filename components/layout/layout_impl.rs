@@ -12,7 +12,6 @@ use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 
 use app_units::Au;
-use base::Epoch;
 use base::generic_channel::GenericSender;
 use base::id::{PipelineId, WebViewId};
 use bitflags::bitflags;
@@ -29,7 +28,7 @@ use layout_api::{
     BoxAreaType, IFrameSizes, Layout, LayoutConfig, LayoutDamage, LayoutFactory,
     OffsetParentResponse, PropertyRegistration, QueryMsg, ReflowGoal, ReflowPhasesRun,
     ReflowRequest, ReflowRequestRestyle, ReflowResult, RegisterPropertyError,
-    ScrollContainerQueryType, ScrollContainerResponse, TrustedNodeAddress,
+    ScrollContainerQueryFlags, ScrollContainerResponse, TrustedNodeAddress,
 };
 use log::{debug, error, warn};
 use malloc_size_of::{MallocConditionalSizeOf, MallocSizeOf, MallocSizeOfOps};
@@ -175,9 +174,6 @@ pub struct LayoutThread {
     /// The [`StackingContextTree`] cached from previous layouts.
     stacking_context_tree: RefCell<Option<StackingContextTree>>,
 
-    /// A counter for epoch messages
-    epoch: Cell<Epoch>,
-
     // A cache that maps image resources specified in CSS (e.g as the `url()` value
     // for `background-image` or `content` properties) to either the final resolved
     // image data, or an error if the image cache failed to load/decode the image.
@@ -222,11 +218,7 @@ impl Layout for LayoutThread {
         self.stylist.device()
     }
 
-    fn current_epoch(&self) -> Epoch {
-        self.epoch.get()
-    }
-
-    fn load_web_fonts_from_stylesheet(&self, stylesheet: ServoArc<Stylesheet>) {
+    fn load_web_fonts_from_stylesheet(&self, stylesheet: &ServoArc<Stylesheet>) {
         let guard = stylesheet.shared_lock.read();
         self.load_all_web_fonts_from_stylesheet_with_guard(
             &DocumentStyleSheet(stylesheet.clone()),
@@ -322,17 +314,28 @@ impl Layout for LayoutThread {
     #[servo_tracing::instrument(skip_all)]
     fn query_offset_parent(&self, node: TrustedNodeAddress) -> OffsetParentResponse {
         let node = unsafe { ServoLayoutNode::new(&node) };
-        process_offset_parent_query(node).unwrap_or_default()
+        let stacking_context_tree = self.stacking_context_tree.borrow();
+        let stacking_context_tree = stacking_context_tree
+            .as_ref()
+            .expect("Should always have a StackingContextTree for offset parent queries");
+        process_offset_parent_query(&stacking_context_tree.compositor_info.scroll_tree, node)
+            .unwrap_or_default()
     }
 
     #[servo_tracing::instrument(skip_all)]
     fn query_scroll_container(
         &self,
-        node: TrustedNodeAddress,
-        query_type: ScrollContainerQueryType,
+        node: Option<TrustedNodeAddress>,
+        flags: ScrollContainerQueryFlags,
     ) -> Option<ScrollContainerResponse> {
-        let node = unsafe { ServoLayoutNode::new(&node) };
-        process_scroll_container_query(node, query_type)
+        let node = unsafe { node.as_ref().map(|node| ServoLayoutNode::new(node)) };
+        let viewport_overflow = self
+            .box_tree
+            .borrow()
+            .as_ref()
+            .expect("Should have a BoxTree for all scroll container queries.")
+            .viewport_overflow;
+        process_scroll_container_query(node, flags, viewport_overflow)
     }
 
     #[servo_tracing::instrument(skip_all)]
@@ -635,7 +638,7 @@ impl LayoutThread {
         // Let webrender know about this pipeline by sending an empty display list.
         config
             .compositor_api
-            .send_initial_transaction(config.id.into());
+            .send_initial_transaction(config.webview_id, config.id.into());
 
         let mut font = Font::initial_values();
         let default_font_size = pref!(fonts_default_size);
@@ -674,8 +677,6 @@ impl LayoutThread {
             box_tree: Default::default(),
             fragment_tree: Default::default(),
             stacking_context_tree: Default::default(),
-            // Epoch starts at 1 because of the initial display list for epoch 0 that we send to WR
-            epoch: Cell::new(Epoch(1)),
             compositor_api: config.compositor_api,
             stylist: Stylist::new(device, QuirksMode::NoQuirks),
             resolved_images_cache: Default::default(),
@@ -824,7 +825,7 @@ impl LayoutThread {
             pending_images: Mutex::default(),
             pending_rasterization_images: Mutex::default(),
             pending_svg_elements_for_serialization: Mutex::default(),
-            node_to_animating_image_map: reflow_request.node_to_animating_image_map.clone(),
+            animating_images: reflow_request.animating_images.clone(),
             animation_timeline_value: reflow_request.animation_timeline_value,
         });
 
@@ -986,6 +987,7 @@ impl LayoutThread {
             iframe_sizes: Mutex::default(),
             use_rayon: rayon_pool.is_some(),
             image_resolver: image_resolver.clone(),
+            rendering_group_id: self.webview_id.into(),
         };
 
         let restyle = reflow_request
@@ -1220,10 +1222,9 @@ impl LayoutThread {
             return false;
         }
 
-        let mut epoch = self.epoch.get();
-        epoch.next();
-        self.epoch.set(epoch);
-        stacking_context_tree.compositor_info.epoch = epoch.into();
+        // TODO: Eventually this should be set when `compositor_info` is created, but that requires
+        // ensuring that the Epoch is passed to any method that can creates `StackingContextTree`.
+        stacking_context_tree.compositor_info.epoch = reflow_request.epoch;
 
         let built_display_list = DisplayListBuilder::build(
             stacking_context_tree,
@@ -1360,7 +1361,7 @@ fn get_ua_stylesheets() -> Result<UserAgentStylesheets, &'static str> {
             None,
             None,
             Origin::UserAgent,
-            MediaList::empty(),
+            ServoArc::new(shared_lock.wrap(MediaList::empty())),
             shared_lock.clone(),
             None,
             None,
@@ -1390,7 +1391,7 @@ fn get_ua_stylesheets() -> Result<UserAgentStylesheets, &'static str> {
                 None,
                 None,
                 Origin::User,
-                MediaList::empty(),
+                ServoArc::new(shared_lock.wrap(MediaList::empty())),
                 shared_lock.clone(),
                 None,
                 Some(&RustLogReporter),
@@ -1422,7 +1423,7 @@ struct RegisteredPainterImpl {
     painter: Box<dyn Painter>,
     name: Atom,
     // FIXME: Should be a PrecomputedHashMap.
-    properties: fxhash::FxHashMap<Atom, PropertyId>,
+    properties: FxHashMap<Atom, PropertyId>,
 }
 
 impl SpeculativePainter for RegisteredPainterImpl {
@@ -1437,7 +1438,7 @@ impl SpeculativePainter for RegisteredPainterImpl {
 }
 
 impl RegisteredSpeculativePainter for RegisteredPainterImpl {
-    fn properties(&self) -> &fxhash::FxHashMap<Atom, PropertyId> {
+    fn properties(&self) -> &FxHashMap<Atom, PropertyId> {
         &self.properties
     }
     fn name(&self) -> Atom {
@@ -1502,7 +1503,7 @@ impl FontMetricsProvider for LayoutFontMetricsProvider {
             .or_else(|| {
                 font_group
                     .write()
-                    .find_by_codepoint(font_context, '0', None, None)?
+                    .find_by_codepoint(font_context, '0', None, None, None)?
                     .metrics
                     .zero_horizontal_advance
             })
@@ -1513,7 +1514,7 @@ impl FontMetricsProvider for LayoutFontMetricsProvider {
             .or_else(|| {
                 font_group
                     .write()
-                    .find_by_codepoint(font_context, '\u{6C34}', None, None)?
+                    .find_by_codepoint(font_context, '\u{6C34}', None, None, None)?
                     .metrics
                     .ic_horizontal_advance
             })
@@ -1608,26 +1609,26 @@ impl ReflowPhases {
     /// so [`ReflowPhases::empty()`] implies that.
     fn necessary(reflow_goal: &ReflowGoal) -> Self {
         match reflow_goal {
-            ReflowGoal::UpdateTheRendering | ReflowGoal::UpdateScrollNode(..) => {
-                Self::StackingContextTreeConstruction | Self::DisplayListConstruction
-            },
             ReflowGoal::LayoutQuery(query) => match query {
                 QueryMsg::NodesFromPointQuery => {
                     Self::StackingContextTreeConstruction | Self::DisplayListConstruction
                 },
                 QueryMsg::BoxArea |
                 QueryMsg::BoxAreas |
+                QueryMsg::ElementsFromPoint |
+                QueryMsg::OffsetParentQuery |
                 QueryMsg::ResolvedStyleQuery |
-                QueryMsg::ScrollingAreaOrOffsetQuery |
-                QueryMsg::ElementsFromPoint => Self::StackingContextTreeConstruction,
+                QueryMsg::ScrollingAreaOrOffsetQuery => Self::StackingContextTreeConstruction,
                 QueryMsg::ClientRectQuery |
                 QueryMsg::ElementInnerOuterTextQuery |
                 QueryMsg::InnerWindowDimensionsQuery |
-                QueryMsg::OffsetParentQuery |
-                QueryMsg::ScrollParentQuery |
                 QueryMsg::ResolvedFontStyleQuery |
-                QueryMsg::TextIndexQuery |
-                QueryMsg::StyleQuery => Self::empty(),
+                QueryMsg::ScrollParentQuery |
+                QueryMsg::StyleQuery |
+                QueryMsg::TextIndexQuery => Self::empty(),
+            },
+            ReflowGoal::UpdateScrollNode(..) | ReflowGoal::UpdateTheRendering => {
+                Self::StackingContextTreeConstruction | Self::DisplayListConstruction
             },
         }
     }

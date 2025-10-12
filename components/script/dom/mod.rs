@@ -214,8 +214,6 @@ pub(crate) mod abortcontroller;
 pub(crate) mod abortsignal;
 #[allow(dead_code)]
 pub(crate) mod abstractrange;
-pub(crate) mod abstractworker;
-pub(crate) mod abstractworkerglobalscope;
 pub(crate) mod activation;
 pub(crate) mod animationevent;
 pub(crate) mod attr;
@@ -279,13 +277,13 @@ pub(crate) mod datatransferitemlist;
 pub(crate) mod debuggeradddebuggeeevent;
 pub(crate) mod debuggergetpossiblebreakpointsevent;
 pub(crate) mod debuggerglobalscope;
-pub(crate) mod dedicatedworkerglobalscope;
 pub(crate) mod defaultteereadrequest;
 pub(crate) mod defaultteeunderlyingsource;
 pub(crate) mod dissimilaroriginlocation;
 pub(crate) mod dissimilaroriginwindow;
 #[allow(dead_code)]
 pub(crate) mod document;
+mod document_embedder_controls;
 pub(crate) mod document_event_handler;
 pub(crate) mod documentfragment;
 pub(crate) mod documentorshadowroot;
@@ -314,6 +312,7 @@ pub(crate) mod eventsource;
 pub(crate) mod eventtarget;
 pub(crate) mod extendableevent;
 pub(crate) mod extendablemessageevent;
+pub(crate) mod fetchlaterresult;
 pub(crate) mod file;
 pub(crate) mod filelist;
 pub(crate) mod filereader;
@@ -325,6 +324,8 @@ pub(crate) mod formdata;
 pub(crate) mod formdataevent;
 pub(crate) mod gamepad;
 pub(crate) use self::gamepad::*;
+pub(crate) mod geolocation;
+pub(crate) use self::geolocation::*;
 #[allow(dead_code)]
 pub(crate) mod globalscope;
 pub(crate) mod hashchangeevent;
@@ -347,7 +348,6 @@ pub(crate) mod inputevent;
 pub(crate) mod intersectionobserver;
 pub(crate) mod intersectionobserverentry;
 pub(crate) mod keyboardevent;
-pub(crate) mod linkprocessingoptions;
 pub(crate) mod location;
 pub(crate) mod mediadeviceinfo;
 pub(crate) mod mediadevices;
@@ -403,6 +403,7 @@ pub(crate) mod pluginarray;
 pub(crate) mod pointerevent;
 pub(crate) mod popstateevent;
 pub(crate) mod processinginstruction;
+pub(crate) mod processingoptions;
 pub(crate) mod progressevent;
 #[allow(dead_code)]
 pub(crate) mod promise;
@@ -428,14 +429,9 @@ pub(crate) mod resizeobserverentry;
 pub(crate) mod resizeobserversize;
 pub(crate) mod response;
 pub(crate) mod screen;
+mod scrolling_box;
 pub(crate) mod securitypolicyviolationevent;
 pub(crate) mod selection;
-#[allow(dead_code)]
-pub(crate) mod serviceworker;
-pub(crate) mod serviceworkercontainer;
-pub(crate) mod serviceworkerglobalscope;
-#[allow(dead_code)]
-pub(crate) mod serviceworkerregistration;
 pub(crate) mod servointernals;
 #[allow(dead_code)]
 pub(crate) mod servoparser;
@@ -454,29 +450,9 @@ pub(crate) mod svggraphicselement;
 pub(crate) mod svgimageelement;
 pub(crate) mod svgsvgelement;
 #[cfg(feature = "testbinding")]
-pub(crate) mod testbinding;
+mod testing;
 #[cfg(feature = "testbinding")]
-pub(crate) mod testbindingiterable;
-#[cfg(feature = "testbinding")]
-pub(crate) mod testbindingmaplikewithinterface;
-#[cfg(feature = "testbinding")]
-pub(crate) mod testbindingmaplikewithprimitive;
-#[cfg(feature = "testbinding")]
-pub(crate) mod testbindingpairiterable;
-#[cfg(feature = "testbinding")]
-pub(crate) mod testbindingproxy;
-#[cfg(feature = "testbinding")]
-pub(crate) mod testbindingsetlikewithinterface;
-#[cfg(feature = "testbinding")]
-pub(crate) mod testbindingsetlikewithprimitive;
-#[cfg(feature = "testbinding")]
-pub(crate) mod testns;
-#[cfg(feature = "testbinding")]
-pub(crate) mod testutils;
-#[cfg(feature = "testbinding")]
-pub(crate) mod testworklet;
-#[cfg(feature = "testbinding")]
-pub(crate) mod testworkletglobalscope;
+pub(crate) use self::testing::*;
 pub(crate) mod text;
 pub(crate) mod textcontrol;
 pub(crate) mod textdecoder;
@@ -540,11 +516,8 @@ pub(crate) mod wheelevent;
 pub(crate) mod window;
 #[allow(dead_code)]
 pub(crate) mod windowproxy;
-pub(crate) mod worker;
-#[allow(dead_code)]
-pub(crate) mod workerglobalscope;
-pub(crate) mod workerlocation;
-pub(crate) mod workernavigator;
+pub(crate) mod workers;
+pub(crate) use self::workers::*;
 pub(crate) mod worklet;
 pub(crate) mod workletglobalscope;
 pub(crate) mod writablestream;

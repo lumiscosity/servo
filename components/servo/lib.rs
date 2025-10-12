@@ -63,11 +63,12 @@ use constellation::{
     Constellation, FromEmbedderLogger, FromScriptLogger, InitialConstellationState,
     UnprivilegedContent,
 };
-use constellation_traits::{EmbedderToConstellationMessage, ScriptToConstellationChan};
+pub use constellation_traits::EmbedderToConstellationMessage;
+use constellation_traits::ScriptToConstellationChan;
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use embedder_traits::FormControl as EmbedderFormControl;
+use embedder_traits::FormControlRequest as EmbedderFormControl;
 use embedder_traits::user_content_manager::UserContentManager;
-pub use embedder_traits::*;
+pub use embedder_traits::{WebDriverSenders, *};
 use env_logger::Builder as EnvLoggerBuilder;
 use fonts::SystemFontService;
 #[cfg(all(
@@ -81,13 +82,14 @@ use fonts::SystemFontService;
 use gaol::sandbox::{ChildSandbox, ChildSandboxMethods};
 pub use gleam::gl;
 use gleam::gl::RENDERER;
+pub use image::RgbaImage;
 use ipc_channel::ipc::{self, IpcSender};
 use javascript_evaluator::JavaScriptEvaluator;
 pub use keyboard_types::{
     Code, CompositionEvent, CompositionState, Key, KeyState, Location, Modifiers, NamedKey,
 };
 use layout::LayoutFactoryImpl;
-use log::{Log, Metadata, Record, debug, error, warn};
+use log::{Log, Metadata, Record, debug, warn};
 use media::{GlApi, NativeDisplay, WindowGLContext};
 use net::protocols::ProtocolRegistry;
 use net::resource_thread::new_resource_threads;
@@ -108,6 +110,7 @@ use servo_geometry::{
 use servo_media::ServoMedia;
 use servo_media::player::context::GlContext;
 use servo_url::ServoUrl;
+use storage::new_storage_threads;
 use style::global_style_data::StyleThreadPool;
 use webgl::WebGLComm;
 #[cfg(feature = "webgpu")]
@@ -315,12 +318,6 @@ impl Servo {
         };
 
         let (mut webrender, webrender_api_sender) = {
-            let mut debug_flags = webrender::DebugFlags::empty();
-            debug_flags.set(
-                webrender::DebugFlags::PROFILER_DBG,
-                opts.debug.webrender_stats,
-            );
-
             rendering_context.prepare_for_rendering();
             let render_notifier = Box::new(RenderNotifier::new(compositor_proxy.clone()));
             let clear_color = servo_config::pref!(shell_background_color_rgba);
@@ -359,7 +356,7 @@ impl Servo {
                     // See: https://github.com/servo/servo/issues/31726
                     use_optimized_shaders: true,
                     resource_override_path: opts.shaders_dir.clone(),
-                    debug_flags,
+                    debug_flags: webrender::DebugFlags::empty(),
                     precache_flags: if pref!(gfx_precache_shaders) {
                         ShaderPrecacheFlags::FULL_COMPILE
                     } else {
@@ -469,25 +466,22 @@ impl Servo {
         // The compositor coordinates with the client window to create the final
         // rendered page and display it somewhere.
         let shutdown_state = Rc::new(Cell::new(ShutdownState::NotShuttingDown));
-        let compositor = IOCompositor::new(
-            InitialCompositorState {
-                sender: compositor_proxy,
-                receiver: compositor_receiver,
-                constellation_chan: constellation_chan.clone(),
-                time_profiler_chan,
-                mem_profiler_chan,
-                webrender,
-                webrender_document,
-                webrender_api,
-                rendering_context,
-                webrender_gl,
-                #[cfg(feature = "webxr")]
-                webxr_main_thread,
-                shutdown_state: shutdown_state.clone(),
-                event_loop_waker,
-            },
-            opts.debug.convert_mouse_to_touch,
-        );
+        let compositor = IOCompositor::new(InitialCompositorState {
+            sender: compositor_proxy,
+            receiver: compositor_receiver,
+            constellation_chan: constellation_chan.clone(),
+            time_profiler_chan,
+            mem_profiler_chan,
+            webrender,
+            webrender_document,
+            webrender_api,
+            rendering_context,
+            webrender_gl,
+            #[cfg(feature = "webxr")]
+            webxr_main_thread,
+            shutdown_state: shutdown_state.clone(),
+            event_loop_waker,
+        });
 
         let constellation_proxy = ConstellationProxy::new(constellation_chan);
         Self {
@@ -770,11 +764,11 @@ impl Servo {
                     .borrow_mut()
                     .finish_evaluation(evaluation_id, result);
             },
-            EmbedderMsg::Keyboard(webview_id, keyboard_event) => {
+            EmbedderMsg::InputEventHandled(webview_id, input_event_id, result) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview
                         .delegate()
-                        .notify_keyboard_event(webview, keyboard_event);
+                        .notify_input_event_handled(webview, input_event_id, result);
                 }
             },
             EmbedderMsg::ClearClipboard(webview_id) => {
@@ -990,26 +984,28 @@ impl Servo {
                     None => self.delegate().show_notification(notification),
                 }
             },
-            EmbedderMsg::ShowFormControl(webview_id, position, form_control) => {
-                if let Some(webview) = self.get_webview_handle(webview_id) {
+            EmbedderMsg::ShowEmbedderControl(control_id, position, form_control) => {
+                if let Some(webview) = self.get_webview_handle(control_id.webview_id) {
+                    let constellation_proxy = self.constellation_proxy.clone();
                     let form_control = match form_control {
-                        EmbedderFormControl::SelectElement(
-                            options,
-                            selected_option,
-                            ipc_sender,
-                        ) => FormControl::SelectElement(SelectElement::new(
-                            options,
-                            selected_option,
-                            position,
-                            ipc_sender,
-                        )),
-                        EmbedderFormControl::ColorPicker(current_color, ipc_sender) => {
-                            FormControl::ColorPicker(ColorPicker::new(
-                                current_color,
+                        EmbedderFormControl::SelectElement(options, selected_option) => {
+                            FormControl::SelectElement(SelectElement {
+                                id: control_id,
+                                options,
+                                selected_option,
                                 position,
-                                ipc_sender,
-                                self.servo_errors.sender(),
-                            ))
+                                constellation_proxy,
+                                response_sent: false,
+                            })
+                        },
+                        EmbedderFormControl::ColorPicker(current_color) => {
+                            FormControl::ColorPicker(ColorPicker {
+                                id: control_id,
+                                current_color: Some(current_color),
+                                position,
+                                constellation_proxy,
+                                response_sent: false,
+                            })
                         },
                     };
 
@@ -1066,23 +1062,8 @@ impl Servo {
     }
 
     pub fn execute_webdriver_command(&self, command: WebDriverCommandMsg) {
-        if let WebDriverCommandMsg::TakeScreenshot(webview_id, page_rect, response_sender) = command
-        {
-            let res = self
-                .compositor
-                .borrow_mut()
-                .render_to_shared_memory(webview_id, page_rect);
-            if let Err(ref e) = res {
-                error!("Error retrieving PNG: {:?}", e);
-            }
-            let img = res.unwrap_or(None);
-            if let Err(e) = response_sender.send(img) {
-                error!("Sending reply to create png failed ({:?}).", e);
-            }
-        } else {
-            self.constellation_proxy
-                .send(EmbedderToConstellationMessage::WebDriverCommand(command));
-        }
+        self.constellation_proxy
+            .send(EmbedderToConstellationMessage::WebDriverCommand(command));
     }
 
     pub fn set_preference(&self, name: &str, value: PrefValue) {
@@ -1162,11 +1143,14 @@ fn create_constellation(
         time_profiler_chan.clone(),
         mem_profiler_chan.clone(),
         embedder_proxy.clone(),
-        config_dir,
+        config_dir.clone(),
         opts.certificate_path.clone(),
         opts.ignore_certificate_errors,
         Arc::new(protocols),
     );
+
+    let (private_storage_threads, public_storage_threads) =
+        new_storage_threads(mem_profiler_chan.clone(), config_dir);
 
     let system_font_service = Arc::new(
         SystemFontService::spawn(
@@ -1185,6 +1169,8 @@ fn create_constellation(
         system_font_service,
         public_resource_threads,
         private_resource_threads,
+        public_storage_threads,
+        private_storage_threads,
         time_profiler_chan,
         mem_profiler_chan,
         webrender_document,

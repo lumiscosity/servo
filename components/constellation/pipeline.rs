@@ -11,8 +11,7 @@ use background_hang_monitor::HangMonitorRegister;
 use background_hang_monitor_api::{
     BackgroundHangMonitorControlMsg, BackgroundHangMonitorRegister, HangMonitorAlert,
 };
-use base::Epoch;
-use base::generic_channel::{GenericReceiver, GenericSender};
+use base::generic_channel::{self, GenericReceiver, GenericSender};
 use base::id::{
     BrowsingContextId, HistoryStateId, PipelineId, PipelineNamespace, PipelineNamespaceId,
     PipelineNamespaceRequest, WebViewId,
@@ -51,6 +50,7 @@ use serde::{Deserialize, Serialize};
 use servo_config::opts::{self, Opts};
 use servo_config::prefs::{self, Preferences};
 use servo_url::ServoUrl;
+use storage_traits::StorageThreads;
 
 use crate::event_loop::EventLoop;
 use crate::process_manager::Process;
@@ -103,10 +103,6 @@ pub struct Pipeline {
     /// The title of this pipeline's document.
     pub title: String,
 
-    /// The last compositor [`Epoch`] that was laid out in this pipeline if "exit after load" is
-    /// enabled.
-    pub layout_epoch: Epoch,
-
     pub focus_sequence: FocusSequenceNumber,
 }
 
@@ -144,7 +140,7 @@ pub struct InitialPipelineState {
     pub background_monitor_register: Option<Box<dyn BackgroundHangMonitorRegister>>,
 
     /// A channel for the background hang monitor to send messages to the constellation.
-    pub background_hang_monitor_to_constellation_chan: IpcSender<HangMonitorAlert>,
+    pub background_hang_monitor_to_constellation_chan: GenericSender<HangMonitorAlert>,
 
     /// A fatory for creating layouts to be used by the ScriptThread.
     pub layout_factory: Arc<dyn LayoutFactory>,
@@ -167,6 +163,9 @@ pub struct InitialPipelineState {
 
     /// Channels to the resource-related threads.
     pub resource_threads: ResourceThreads,
+
+    /// Channels to the storage-related threads.
+    pub storage_threads: StorageThreads,
 
     /// A channel to the time profiler thread.
     pub time_profiler_chan: time::ProfilerChan,
@@ -219,7 +218,7 @@ pub struct InitialPipelineState {
 
 pub struct NewPipeline {
     pub pipeline: Pipeline,
-    pub bhm_control_chan: Option<IpcSender<BackgroundHangMonitorControlMsg>>,
+    pub bhm_control_chan: Option<GenericSender<BackgroundHangMonitorControlMsg>>,
     pub lifeline: Option<(IpcReceiver<()>, Process)>,
     pub join_handle: Option<JoinHandle<()>>,
 }
@@ -297,6 +296,7 @@ impl Pipeline {
                     swmanager_thread: state.swmanager_thread,
                     system_font_service: state.system_font_service.to_sender(),
                     resource_threads: state.resource_threads,
+                    storage_threads: state.storage_threads,
                     time_profiler_chan: state.time_profiler_chan,
                     mem_profiler_chan: state.mem_profiler_chan,
                     viewport_details: state.viewport_details,
@@ -325,7 +325,7 @@ impl Pipeline {
                 // Yes, that's all there is to it!
                 let multiprocess_data = if opts::get().multiprocess {
                     let (bhm_control_chan, bhm_control_port) =
-                        ipc::channel().expect("Sampler chan");
+                        generic_channel::channel().expect("Sampler chan");
                     unprivileged_pipeline_content.bhm_control_port = Some(bhm_control_port);
                     let (sender, receiver) =
                         ipc::channel().expect("Failed to create lifeline channel");
@@ -395,7 +395,6 @@ impl Pipeline {
             history_states: HashSet::new(),
             completely_loaded: false,
             title: String::new(),
-            layout_epoch: Epoch(0),
             focus_sequence: FocusSequenceNumber::default(),
         };
 
@@ -487,14 +486,15 @@ pub struct UnprivilegedPipelineContent {
     namespace_request_sender: GenericSender<PipelineNamespaceRequest>,
     script_to_constellation_chan: ScriptToConstellationChan,
     script_to_embedder_chan: ScriptToEmbedderChan,
-    background_hang_monitor_to_constellation_chan: IpcSender<HangMonitorAlert>,
-    bhm_control_port: Option<IpcReceiver<BackgroundHangMonitorControlMsg>>,
+    background_hang_monitor_to_constellation_chan: GenericSender<HangMonitorAlert>,
+    bhm_control_port: Option<GenericReceiver<BackgroundHangMonitorControlMsg>>,
     devtools_ipc_sender: Option<IpcSender<ScriptToDevtoolsControlMsg>>,
     #[cfg(feature = "bluetooth")]
     bluetooth_thread: IpcSender<BluetoothRequest>,
     swmanager_thread: GenericSender<SWManagerMsg>,
     system_font_service: SystemFontServiceProxySender,
     resource_threads: ResourceThreads,
+    storage_threads: StorageThreads,
     time_profiler_chan: time::ProfilerChan,
     mem_profiler_chan: profile_mem::ProfilerChan,
     viewport_details: ViewportDetails,
@@ -551,6 +551,7 @@ impl UnprivilegedPipelineContent {
                 #[cfg(feature = "bluetooth")]
                 bluetooth_sender: self.bluetooth_thread,
                 resource_threads: self.resource_threads,
+                storage_threads: self.storage_threads,
                 image_cache,
                 time_profiler_sender: self.time_profiler_chan.clone(),
                 memory_profiler_sender: self.mem_profiler_chan.clone(),

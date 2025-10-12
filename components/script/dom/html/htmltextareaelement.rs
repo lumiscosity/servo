@@ -52,7 +52,7 @@ pub(crate) struct HTMLTextAreaElement {
     htmlelement: HTMLElement,
     #[no_trace]
     textinput: DomRefCell<TextInput<EmbedderClipboardProvider>>,
-    placeholder: DomRefCell<DOMString>,
+    placeholder: DomRefCell<String>,
     // https://html.spec.whatwg.org/multipage/#concept-textarea-dirty
     value_dirty: Cell<bool>,
     form_owner: MutNullableDom<HTMLFormElement>,
@@ -153,7 +153,7 @@ impl HTMLTextAreaElement {
                 prefix,
                 document,
             ),
-            placeholder: DomRefCell::new(DOMString::new()),
+            placeholder: DomRefCell::new(String::new()),
             textinput: DomRefCell::new(TextInput::new(
                 Lines::Multiple,
                 DOMString::new(),
@@ -530,7 +530,7 @@ impl VirtualMethods for HTMLTextAreaElement {
                     let mut placeholder = self.placeholder.borrow_mut();
                     placeholder.clear();
                     if let AttributeMutation::Set(_) = mutation {
-                        placeholder.push_str(&attr.value());
+                        placeholder.push_str(attr.value().as_ref());
                     }
                 }
                 self.update_placeholder_shown_state();

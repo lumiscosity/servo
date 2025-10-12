@@ -4,6 +4,7 @@
 
 use std::cell::Cell;
 use std::ptr;
+use std::rc::Rc;
 
 use base::generic_channel;
 use base::generic_channel::GenericSend;
@@ -12,6 +13,7 @@ use constellation_traits::{
     AuxiliaryWebViewCreationRequest, LoadData, LoadOrigin, NavigationHistoryBehavior,
     ScriptToConstellationMessage,
 };
+use content_security_policy::sandboxing_directive::SandboxingFlagSet;
 use dom_struct::dom_struct;
 use html5ever::local_name;
 use indexmap::map::IndexMap;
@@ -35,10 +37,10 @@ use js::rust::wrappers::{JS_TransplantObject, NewWindowProxy, SetWindowProxy};
 use js::rust::{Handle, MutableHandle, MutableHandleValue, get_object_class};
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
 use net_traits::request::Referrer;
-use net_traits::storage_thread::StorageThreadMsg;
 use script_traits::NewLayoutInfo;
 use serde::{Deserialize, Serialize};
 use servo_url::{ImmutableOrigin, ServoUrl};
+use storage_traits::webstorage_thread::WebStorageThreadMsg;
 use style::attr::parse_integer;
 
 use crate::dom::bindings::cell::DomRefCell;
@@ -59,6 +61,7 @@ use crate::dom::window::Window;
 use crate::realms::{AlreadyInRealm, InRealm, enter_realm};
 use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 use crate::script_thread::ScriptThread;
+use crate::script_window_proxies::ScriptWindowProxies;
 
 #[dom_struct]
 // NOTE: the browsing context for a window is managed in two places:
@@ -107,7 +110,9 @@ pub(crate) struct WindowProxy {
     /// <https://html.spec.whatwg.org/multipage/#is-closing>
     is_closing: Cell<bool>,
 
-    /// The containing iframe element, if this is a same-origin iframe
+    /// If the containing `<iframe>` of this [`WindowProxy`] is from a same-origin page,
+    /// this will be the [`Element`] of the `<iframe>` element in the realm of the
+    /// parent page. Otherwise, it is `None`.
     frame_element: Option<Dom<Element>>,
 
     /// The parent browsing context's window proxy, if this is a nested browsing context
@@ -127,6 +132,10 @@ pub(crate) struct WindowProxy {
     /// The creator browsing context's origin.
     #[no_trace]
     creator_origin: Option<ImmutableOrigin>,
+
+    /// The window proxies the script thread knows.
+    #[conditional_malloc_size_of]
+    script_window_proxies: Rc<ScriptWindowProxies>,
 }
 
 impl WindowProxy {
@@ -158,6 +167,7 @@ impl WindowProxy {
             creator_base_url: creator.base_url,
             creator_url: creator.url,
             creator_origin: creator.origin,
+            script_window_proxies: ScriptThread::window_proxies(),
         }
     }
 
@@ -312,6 +322,8 @@ impl WindowProxy {
             None, // Doesn't inherit secure context
             None,
             false,
+            // There are no sandboxing restrictions when creating auxiliary browsing contexts.
+            SandboxingFlagSet::empty(),
         );
         let load_info = AuxiliaryWebViewCreationRequest {
             load_data: load_data.clone(),
@@ -351,13 +363,13 @@ impl WindowProxy {
 
             let (sender, receiver) = generic_channel::channel().unwrap();
 
-            let msg = StorageThreadMsg::Clone {
+            let msg = WebStorageThreadMsg::Clone {
                 sender,
                 src: window.window_proxy().webview_id(),
                 dest: response.new_webview_id,
             };
 
-            GenericSend::send(document.global().resource_threads(), msg).unwrap();
+            GenericSend::send(document.global().storage_threads(), msg).unwrap();
             receiver.recv().unwrap();
         }
         Some(new_window_proxy)
@@ -442,7 +454,7 @@ impl WindowProxy {
             None => return retval.set(NullValue()),
         };
         let parent_browsing_context = self.parent.as_deref();
-        let opener_proxy = match ScriptThread::find_window_proxy(opener_id) {
+        let opener_proxy = match self.script_window_proxies.find_window_proxy(opener_id) {
             Some(window_proxy) => window_proxy,
             None => {
                 let sender_pipeline_id = self.currently_active().unwrap();
@@ -483,9 +495,10 @@ impl WindowProxy {
         can_gc: CanGc,
     ) -> Fallible<Option<DomRoot<WindowProxy>>> {
         // Step 5. If target is the empty string, then set target to "_blank".
-        let non_empty_target = match target.as_ref() {
-            "" => DOMString::from("_blank"),
-            _ => target,
+        let non_empty_target = if target.is_empty() {
+            DOMString::from("_blank")
+        } else {
+            target
         };
         // Step 6. Let tokenizedFeatures be the result of tokenizing features.
         let tokenized_features = tokenize_open_features(features);
@@ -558,6 +571,7 @@ impl WindowProxy {
                 Some(secure),
                 Some(target_document.insecure_requests_policy()),
                 has_trustworthy_ancestor_origin,
+                target_document.creation_sandboxing_flag_set_considering_parent_iframe(),
             );
             let history_handling = if new {
                 NavigationHistoryBehavior::Replace
@@ -630,6 +644,9 @@ impl WindowProxy {
         self.webview_id
     }
 
+    /// If the containing `<iframe>` of this [`WindowProxy`] is from a same-origin page,
+    /// this will return an [`Element`] of the `<iframe>` element in the realm of the parent
+    /// page.
     pub(crate) fn frame_element(&self) -> Option<&Element> {
         self.frame_element.as_deref()
     }
@@ -820,6 +837,7 @@ fn tokenize_open_features(features: DOMString) -> IndexMap<String, String> {
     // Step 1
     let mut tokenized_features = IndexMap::new();
     // Step 2
+    let features = features.str();
     let mut iter = features.chars();
     let mut cur = iter.next();
 
@@ -915,6 +933,7 @@ unsafe fn GetSubframeWindowProxy(
         let mut slot = UndefinedValue();
         GetProxyPrivate(*proxy, &mut slot);
         rooted!(in(cx) let target = slot.to_object());
+        let script_window_proxies = ScriptThread::window_proxies();
         if let Ok(win) = root_from_handleobject::<Window>(target.handle(), cx) {
             let browsing_context_id = win.window_proxy().browsing_context_id();
             let (result_sender, result_receiver) = ipc::channel().unwrap();
@@ -930,7 +949,7 @@ unsafe fn GetSubframeWindowProxy(
                 .recv()
                 .ok()
                 .and_then(|maybe_bcid| maybe_bcid)
-                .and_then(ScriptThread::find_window_proxy)
+                .and_then(|id| script_window_proxies.find_window_proxy(id))
                 .map(|proxy| (proxy, (JSPROP_ENUMERATE | JSPROP_READONLY) as u32));
         } else if let Ok(win) =
             root_from_handleobject::<DissimilarOriginWindow>(target.handle(), cx)
@@ -949,7 +968,7 @@ unsafe fn GetSubframeWindowProxy(
                 .recv()
                 .ok()
                 .and_then(|maybe_bcid| maybe_bcid)
-                .and_then(ScriptThread::find_window_proxy)
+                .and_then(|id| script_window_proxies.find_window_proxy(id))
                 .map(|proxy| (proxy, JSPROP_READONLY as u32));
         }
     }

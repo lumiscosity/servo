@@ -303,7 +303,7 @@ pub(crate) fn serialize_html_fragment<S: Serializer>(
             SerializationCommand::SerializeNonelement(n) => match n.type_id() {
                 NodeTypeId::DocumentType => {
                     let doctype = n.downcast::<DocumentType>().unwrap();
-                    serializer.write_doctype(doctype.name())?;
+                    serializer.write_doctype(&doctype.name().str())?;
                 },
 
                 NodeTypeId::CharacterData(CharacterDataTypeId::Text(_)) => {
@@ -319,7 +319,7 @@ pub(crate) fn serialize_html_fragment<S: Serializer>(
                 NodeTypeId::CharacterData(CharacterDataTypeId::ProcessingInstruction) => {
                     let pi = n.downcast::<ProcessingInstruction>().unwrap();
                     let data = pi.upcast::<CharacterData>().data();
-                    serializer.write_processing_instruction(pi.target(), &data)?;
+                    serializer.write_processing_instruction(&pi.target().str(), &data)?;
                 },
 
                 NodeTypeId::DocumentFragment(_) | NodeTypeId::Attr => {},

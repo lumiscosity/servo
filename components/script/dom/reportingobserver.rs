@@ -29,7 +29,7 @@ use crate::script_runtime::CanGc;
 pub(crate) struct ReportingObserver {
     reflector_: Reflector,
 
-    #[ignore_malloc_size_of = "Rc has unclear ownership"]
+    #[conditional_malloc_size_of]
     callback: Rc<ReportingObserverCallback>,
     buffered: RefCell<bool>,
     types: DomRefCell<Vec<DOMString>>,
@@ -67,7 +67,7 @@ impl ReportingObserver {
     }
 
     fn report_is_visible_to_reporting_observers(report: &Report) -> bool {
-        match report.type_.str() {
+        match &*report.type_.str() {
             // https://w3c.github.io/webappsec-csp/#reporting
             "csp-violation" => true,
             _ => false,

@@ -21,6 +21,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use base::Epoch;
 use base::generic_channel::{GenericCallback, GenericSender, SendResult};
 use base::id::{PipelineId, WebViewId};
 use crossbeam_channel::Sender;
@@ -34,7 +35,7 @@ use pixels::RasterImage;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use servo_geometry::{DeviceIndependentIntRect, DeviceIndependentIntSize};
 use servo_url::ServoUrl;
-use strum_macros::IntoStaticStr;
+use strum_macros::{EnumMessage, IntoStaticStr};
 use style::queries::values::PrefersColorScheme;
 use style_traits::CSSPixel;
 use url::Url;
@@ -441,8 +442,6 @@ pub enum EmbedderMsg {
     WebViewBlurred,
     /// Wether or not to unload a document
     AllowUnload(WebViewId, GenericSender<AllowOrDeny>),
-    /// Sends an unconsumed key event back to the embedder.
-    Keyboard(WebViewId, KeyboardEvent),
     /// Inform embedder to clear the clipboard
     ClearClipboard(WebViewId),
     /// Gets system clipboard contents
@@ -516,13 +515,16 @@ pub enum EmbedderMsg {
     /// Request to display a notification.
     ShowNotification(Option<WebViewId>, Notification),
     /// Request to display a form control to the embedder.
-    ShowFormControl(WebViewId, DeviceIntRect, FormControl),
+    ShowEmbedderControl(EmbedderControlId, DeviceIntRect, FormControlRequest),
     /// Inform the embedding layer that a JavaScript evaluation has
     /// finished with the given result.
     FinishJavaScriptEvaluation(
         JavaScriptEvaluationId,
         Result<JSValue, JavaScriptEvaluationError>,
     ),
+    /// Inform the embedding layer that a particular `InputEvent` was handled by Servo
+    /// and the embedder can continue processing it, if necessary.
+    InputEventHandled(WebViewId, InputEventId, InputEventResult),
 }
 
 impl Debug for EmbedderMsg {
@@ -532,16 +534,25 @@ impl Debug for EmbedderMsg {
     }
 }
 
-#[derive(Deserialize, Serialize)]
-pub enum FormControl {
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct EmbedderControlId {
+    pub webview_id: WebViewId,
+    pub pipeline_id: PipelineId,
+    pub index: Epoch,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub enum FormControlRequest {
     /// Indicates that the user has activated a `<select>` element.
-    SelectElement(
-        Vec<SelectElementOptionOrOptgroup>,
-        Option<usize>,
-        GenericSender<Option<usize>>,
-    ),
+    SelectElement(Vec<SelectElementOptionOrOptgroup>, Option<usize>),
     /// Indicates that the user has activated a `<input type=color>` element.
-    ColorPicker(RgbColor, GenericSender<Option<RgbColor>>),
+    ColorPicker(RgbColor),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub enum FormControlResponse {
+    SelectElement(Option<usize>),
+    ColorPicker(Option<RgbColor>),
 }
 
 /// Filter for file selection;
@@ -1047,11 +1058,42 @@ pub enum JSValue {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct JavaScriptErrorInfo {
+    pub message: String,
+    pub filename: String,
+    pub stack: Option<String>,
+    pub line_number: u64,
+    pub column: u64,
+}
+
+/// Indicates the reason that JavaScript evaluation failed due serializing issues the
+/// result of the evaluation.
+#[derive(Clone, Debug, Deserialize, EnumMessage, PartialEq, Serialize)]
+pub enum JavaScriptEvaluationResultSerializationError {
+    /// Serialization could not complete because a JavaScript value contained a detached
+    /// shadow root according to <https://w3c.github.io/webdriver/#dfn-internal-json-clone>.
+    DetachedShadowRoot,
+    /// Serialization could not complete because a JavaScript value contained a "stale"
+    /// element reference according to <https://w3c.github.io/webdriver/#dfn-get-a-known-element>.
+    StaleElementReference,
+    /// Serialization could not complete because a JavaScript value of an unknown type
+    /// was encountered.
+    UnknownType,
+    /// This is a catch all for other kinds of errors that can happen during JavaScript value
+    /// serialization. For instances where this can happen, see:
+    /// <https://w3c.github.io/webdriver/#dfn-clone-an-object>.
+    OtherJavaScriptError,
+}
+
+/// An error that happens when trying to evaluate JavaScript on a `WebView`.
+#[derive(Clone, Debug, Deserialize, EnumMessage, PartialEq, Serialize)]
 pub enum JavaScriptEvaluationError {
-    /// The script could not be compiled
+    /// The `Document` of frame that the script was going to execute in no longer exists.
+    DocumentNotFound,
+    /// The script could not be compiled.
     CompilationFailure,
-    /// The script could not be evaluated
-    EvaluationFailure,
+    /// The script could not be evaluated.
+    EvaluationFailure(Option<JavaScriptErrorInfo>),
     /// An internal Servo error prevented the JavaSript evaluation from completing properly.
     /// This indicates a bug in Servo.
     InternalError,
@@ -1060,7 +1102,16 @@ pub enum JavaScriptEvaluationError {
     WebViewNotReady,
     /// The script executed successfully, but Servo could not serialize the JavaScript return
     /// value into a [`JSValue`].
-    SerializationError,
+    SerializationError(JavaScriptEvaluationResultSerializationError),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub enum ScreenshotCaptureError {
+    /// The screenshot request failed to read the screenshot image from the `WebView`'s
+    /// `RenderingContext`.
+    CouldNotReadImage,
+    /// The WebView that this screenshot request was made for no longer exists.
+    WebViewDoesNotExist,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]

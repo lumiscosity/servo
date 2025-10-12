@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::RefCell;
-use std::collections::hash_map::{Entry, Keys};
+use std::collections::hash_map::Entry;
 use std::rc::Rc;
 
 use base::id::{PipelineId, WebViewId};
@@ -14,18 +14,18 @@ use compositing_traits::viewport_description::{
 use compositing_traits::{PipelineExitSource, SendableFrameTree, WebViewTrait};
 use constellation_traits::{EmbedderToConstellationMessage, WindowSizeType};
 use embedder_traits::{
-    AnimationState, CompositorHitTestResult, InputEvent, MouseButton, MouseButtonAction,
-    MouseButtonEvent, MouseMoveEvent, ScrollEvent as EmbedderScrollEvent, ShutdownState,
-    TouchEvent, TouchEventResult, TouchEventType, TouchId, ViewportDetails,
+    AnimationState, CompositorHitTestResult, InputEvent, InputEventAndId, MouseButton,
+    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, ScrollEvent as EmbedderScrollEvent,
+    ShutdownState, TouchEvent, TouchEventResult, TouchEventType, ViewportDetails,
 };
 use euclid::{Point2D, Scale, Vector2D};
 use log::{debug, warn};
 use malloc_size_of::MallocSizeOf;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use servo_geometry::DeviceIndependentPixel;
 use style_traits::{CSSPixel, PinchZoomFactor};
 use webrender_api::units::{DeviceIntPoint, DevicePixel, DevicePoint, DeviceRect, LayoutVector2D};
-use webrender_api::{ExternalScrollId, HitTestFlags, ScrollLocation};
+use webrender_api::{ExternalScrollId, ScrollLocation};
 
 use crate::compositor::{PipelineDetails, ServoRenderer};
 use crate::touch::{TouchHandler, TouchMoveAction, TouchMoveAllowed, TouchSequenceState};
@@ -132,10 +132,6 @@ impl WebViewRenderer {
             .any(PipelineDetails::animation_callbacks_running)
     }
 
-    pub(crate) fn pipeline_ids(&self) -> Keys<'_, PipelineId, PipelineDetails> {
-        self.pipelines.keys()
-    }
-
     pub(crate) fn animating(&self) -> bool {
         self.animating
     }
@@ -180,8 +176,6 @@ impl WebViewRenderer {
         }
 
         self.set_frame_tree_on_pipeline_details(frame_tree, None);
-        self.reset_scroll_tree_for_unattached_pipelines(frame_tree);
-        self.send_scroll_positions_to_layout_for_pipeline(pipeline_id);
     }
 
     pub(crate) fn send_scroll_positions_to_layout_for_pipeline(&self, pipeline_id: PipelineId) {
@@ -217,32 +211,6 @@ impl WebViewRenderer {
         for kid in &frame_tree.children {
             self.set_frame_tree_on_pipeline_details(kid, Some(pipeline_id));
         }
-    }
-
-    pub(crate) fn reset_scroll_tree_for_unattached_pipelines(
-        &mut self,
-        frame_tree: &SendableFrameTree,
-    ) {
-        // TODO(mrobinson): Eventually this can selectively preserve the scroll trees
-        // state for some unattached pipelines in order to preserve scroll position when
-        // navigating backward and forward.
-        fn collect_pipelines(
-            pipelines: &mut FxHashSet<PipelineId>,
-            frame_tree: &SendableFrameTree,
-        ) {
-            pipelines.insert(frame_tree.pipeline.id);
-            for kid in &frame_tree.children {
-                collect_pipelines(pipelines, kid);
-            }
-        }
-
-        let mut attached_pipelines: FxHashSet<PipelineId> = FxHashSet::default();
-        collect_pipelines(&mut attached_pipelines, frame_tree);
-
-        self.pipelines
-            .iter_mut()
-            .filter(|(id, _)| !attached_pipelines.contains(id))
-            .for_each(|(_, details)| details.scroll_tree.reset_all_scroll_offsets());
     }
 
     /// Sets or unsets the animations-running flag for the given pipeline. Returns
@@ -312,8 +280,8 @@ impl WebViewRenderer {
         }
     }
 
-    pub(crate) fn dispatch_input_event_with_hit_testing(&self, mut event: InputEvent) -> bool {
-        let event_point = event.point();
+    pub(crate) fn dispatch_input_event_with_hit_testing(&self, mut event: InputEventAndId) -> bool {
+        let event_point = event.event.point();
         let hit_test_result = match event_point {
             Some(point) => {
                 let hit_test_result = self
@@ -331,7 +299,7 @@ impl WebViewRenderer {
             None => None,
         };
 
-        match event {
+        match event.event {
             InputEvent::Touch(ref mut touch_event) => {
                 touch_event.init_sequence_id(self.touch_handler.current_sequence_id);
             },
@@ -355,77 +323,21 @@ impl WebViewRenderer {
         }
     }
 
-    pub(crate) fn notify_input_event(&mut self, event: InputEvent) {
+    pub(crate) fn notify_input_event(&mut self, event: InputEventAndId) {
         if self.global.borrow().shutdown_state() != ShutdownState::NotShuttingDown {
             return;
         }
 
-        if let InputEvent::Touch(event) = event {
+        if let InputEvent::Touch(event) = event.event {
             self.on_touch_event(event);
             return;
-        }
-
-        if self.global.borrow().convert_mouse_to_touch {
-            match event {
-                InputEvent::MouseButton(event) => {
-                    match (event.button, event.action) {
-                        (MouseButton::Left, MouseButtonAction::Down) => self.on_touch_down(
-                            TouchEvent::new(TouchEventType::Down, TouchId(0), event.point),
-                        ),
-                        (MouseButton::Left, MouseButtonAction::Up) => self.on_touch_up(
-                            TouchEvent::new(TouchEventType::Up, TouchId(0), event.point),
-                        ),
-                        _ => {},
-                    }
-                    return;
-                },
-                InputEvent::MouseMove(event) => {
-                    if let Some(state) = self.touch_handler.try_get_current_touch_sequence() {
-                        // We assume that the debug option `-Z convert-mouse-to-touch` will only
-                        // be used on devices without native touch input, so we can directly
-                        // reuse the touch handler for tracking the state of pressed buttons.
-                        match state.state {
-                            TouchSequenceState::Touching | TouchSequenceState::Panning { .. } => {
-                                self.on_touch_move(TouchEvent::new(
-                                    TouchEventType::Move,
-                                    TouchId(0),
-                                    event.point,
-                                ));
-                            },
-                            TouchSequenceState::MultiTouch => {
-                                // Multitouch simulation currently is not implemented.
-                                // Since we only get one mouse move event, we would need to
-                                // dispatch one mouse move event per currently pressed mouse button.
-                            },
-                            TouchSequenceState::Pinching => {
-                                // We only have one mouse button, so Pinching should be impossible.
-                                #[cfg(debug_assertions)]
-                                log::error!(
-                                    "Touch handler is in Pinching state, which should be unreachable with \
-                                -Z convert-mouse-to-touch debug option."
-                                );
-                            },
-                            TouchSequenceState::PendingFling { .. } |
-                            TouchSequenceState::Flinging { .. } |
-                            TouchSequenceState::PendingClick(_) |
-                            TouchSequenceState::Finished => {
-                                // Mouse movement without a button being pressed is not
-                                // translated to touch events.
-                            },
-                        }
-                    }
-                    // We don't want to (directly) dispatch mouse events when simulating touch input.
-                    return;
-                },
-                _ => {},
-            }
         }
 
         self.dispatch_input_event_with_hit_testing(event);
     }
 
     fn send_touch_event(&mut self, event: TouchEvent) -> bool {
-        self.dispatch_input_event_with_hit_testing(InputEvent::Touch(event))
+        self.dispatch_input_event_with_hit_testing(InputEvent::Touch(event).into())
     }
 
     pub(crate) fn on_touch_event(&mut self, event: TouchEvent) {
@@ -689,19 +601,21 @@ impl WebViewRenderer {
     /// <http://w3c.github.io/touch-events/#mouse-events>
     fn simulate_mouse_click(&mut self, point: DevicePoint) {
         let button = MouseButton::Left;
-        self.dispatch_input_event_with_hit_testing(InputEvent::MouseMove(MouseMoveEvent::new(
-            point,
-        )));
-        self.dispatch_input_event_with_hit_testing(InputEvent::MouseButton(MouseButtonEvent::new(
-            MouseButtonAction::Down,
-            button,
-            point,
-        )));
-        self.dispatch_input_event_with_hit_testing(InputEvent::MouseButton(MouseButtonEvent::new(
-            MouseButtonAction::Up,
-            button,
-            point,
-        )));
+        self.dispatch_input_event_with_hit_testing(
+            InputEvent::MouseMove(MouseMoveEvent::new(point)).into(),
+        );
+        self.dispatch_input_event_with_hit_testing(
+            InputEvent::MouseButton(MouseButtonEvent::new(
+                MouseButtonAction::Down,
+                button,
+                point,
+            ))
+            .into(),
+        );
+        self.dispatch_input_event_with_hit_testing(
+            InputEvent::MouseButton(MouseButtonEvent::new(MouseButtonAction::Up, button, point))
+                .into(),
+        );
     }
 
     pub(crate) fn notify_scroll_event(
@@ -836,10 +750,7 @@ impl WebViewRenderer {
             ScrollLocation::Start | ScrollLocation::End => scroll_location,
         };
 
-        let hit_test_results = self
-            .global
-            .borrow()
-            .hit_test_at_point_with_flags(cursor, HitTestFlags::FIND_ALL);
+        let hit_test_results = self.global.borrow().hit_test_at_point(cursor);
 
         // Iterate through all hit test results, processing only the first node of each pipeline.
         // This is needed to propagate the scroll events from a pipeline representing an iframe to
@@ -851,7 +762,7 @@ impl WebViewRenderer {
                 Some(&hit_test_result.pipeline_id)
             {
                 let scroll_result = pipeline_details.scroll_tree.scroll_node_or_ancestor(
-                    &hit_test_result.external_scroll_id,
+                    hit_test_result.external_scroll_id,
                     scroll_location,
                     ScrollType::InputEvents,
                 );
@@ -872,7 +783,7 @@ impl WebViewRenderer {
         external_id: ExternalScrollId,
         hit_test_result: CompositorHitTestResult,
     ) {
-        let event = InputEvent::Scroll(EmbedderScrollEvent { external_id });
+        let event = InputEvent::Scroll(EmbedderScrollEvent { external_id }).into();
         let msg = EmbedderToConstellationMessage::ForwardInputEvent(
             self.id,
             event,
@@ -894,10 +805,6 @@ impl WebViewRenderer {
 
         let old_zoom = std::mem::replace(&mut self.pinch_zoom, PinchZoomFactor::new(zoom));
         old_zoom != self.pinch_zoom
-    }
-
-    pub(crate) fn page_zoom(&mut self) -> Scale<f32, CSSPixel, DeviceIndependentPixel> {
-        self.page_zoom
     }
 
     pub(crate) fn set_page_zoom(

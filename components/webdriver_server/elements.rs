@@ -6,7 +6,7 @@ use embedder_traits::WebDriverScriptCommand;
 use ipc_channel::ipc;
 use serde_json::Value;
 use webdriver::command::JavascriptCommandParameters;
-use webdriver::error::{WebDriverError, WebDriverResult};
+use webdriver::error::{ErrorStatus, WebDriverError, WebDriverResult};
 
 use crate::{Handler, VerifyBrowsingContextIsOpen, wait_for_ipc_response};
 
@@ -92,10 +92,6 @@ impl Handler {
     /// <https://w3c.github.io/webdriver/#dfn-json-deserialize>
     fn json_deserialize(&self, v: &Value) -> WebDriverResult<String> {
         let res = match v {
-            Value::Null => "null".to_string(),
-            Value::String(s) => format!("\"{}\"", s),
-            Value::Bool(b) => b.to_string(),
-            Value::Number(n) => n.to_string(),
             Value::Array(list) => {
                 let elems = list
                     .iter()
@@ -104,29 +100,25 @@ impl Handler {
                 format!("[{}]", elems.join(", "))
             },
             Value::Object(map) => {
-                let key = map.keys().next().map(String::as_str);
-                match (key, map.values().next()) {
-                    (Some(ELEMENT_IDENTIFIER), Some(id)) => {
-                        return self.deserialize_web_element(id);
-                    },
-                    (Some(FRAME_IDENTIFIER), Some(id)) => {
-                        let frame_ref = match id {
-                            Value::String(s) => s.clone(),
-                            _ => id.to_string(),
-                        };
-                        return Ok(format!("window.webdriverFrame(\"{}\")", frame_ref));
-                    },
-                    (Some(WINDOW_IDENTIFIER), Some(id)) => {
-                        let window_ref = match id {
-                            Value::String(s) => s.clone(),
-                            _ => id.to_string(),
-                        };
-                        return Ok(format!("window.webdriverWindow(\"{}\")", window_ref));
-                    },
-                    (Some(SHADOW_ROOT_IDENTIFIER), Some(id)) => {
-                        return self.deserialize_shadow_root(id);
-                    },
-                    _ => {},
+                if let Some(id) = map.get(ELEMENT_IDENTIFIER) {
+                    return self.deserialize_web_element(id);
+                }
+                if let Some(id) = map.get(SHADOW_ROOT_IDENTIFIER) {
+                    return self.deserialize_shadow_root(id);
+                }
+                if let Some(id) = map.get(FRAME_IDENTIFIER) {
+                    let frame_ref = match id {
+                        Value::String(s) => s.clone(),
+                        _ => id.to_string(),
+                    };
+                    return Ok(format!("window.webdriverFrame(\"{frame_ref}\")"));
+                }
+                if let Some(id) = map.get(WINDOW_IDENTIFIER) {
+                    let window_ref = match id {
+                        Value::String(s) => s.clone(),
+                        _ => id.to_string(),
+                    };
+                    return Ok(format!("window.webdriverWindow(\"{window_ref}\")"));
                 }
                 let elems = map
                     .iter()
@@ -137,6 +129,12 @@ impl Handler {
                     .collect::<WebDriverResult<Vec<String>>>()?;
                 format!("{{{}}}", elems.join(", "))
             },
+            _ => serde_json::to_string(v).map_err(|_| {
+                WebDriverError::new(
+                    ErrorStatus::InvalidArgument,
+                    "Failed to serialize script argument",
+                )
+            })?,
         };
 
         Ok(res)

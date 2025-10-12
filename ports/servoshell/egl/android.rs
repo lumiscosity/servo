@@ -20,8 +20,8 @@ use raw_window_handle::{
     AndroidDisplayHandle, AndroidNdkWindowHandle, RawDisplayHandle, RawWindowHandle,
 };
 use servo::{
-    AlertResponse, EventLoopWaker, LoadStatus, MediaSessionActionType, PermissionRequest,
-    SimpleDialog, WebView,
+    AlertResponse, EventLoopWaker, LoadStatus, MediaSessionActionType, MouseButton,
+    PermissionRequest, SimpleDialog, WebView,
 };
 use simpleservo::{APP, DeviceIntRect, InitOptions, InputMethodType, MediaSessionPlaybackState};
 
@@ -349,7 +349,10 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_click(
     y: jfloat,
 ) {
     debug!("click");
-    call(&mut env, |s| s.click(x, y));
+    call(&mut env, |s| {
+        s.mouse_down(x, y, MouseButton::Left);
+        s.mouse_up(x, y, MouseButton::Left);
+    });
 }
 
 #[unsafe(no_mangle)]

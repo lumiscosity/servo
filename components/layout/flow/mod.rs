@@ -153,7 +153,7 @@ impl BlockLevelBox {
         }
     }
 
-    pub(crate) fn with_base_mut<T>(&mut self, callback: impl Fn(&mut LayoutBoxBase) -> T) -> T {
+    pub(crate) fn with_base_mut<T>(&mut self, callback: impl FnOnce(&mut LayoutBoxBase) -> T) -> T {
         match self {
             BlockLevelBox::Independent(independent_formatting_context) => {
                 callback(&mut independent_formatting_context.base)
@@ -1067,7 +1067,7 @@ fn layout_in_flow_non_replaced_block_level_same_formatting_context(
         CollapsibleWithParentStartMargin(start_margin_can_collapse_with_children),
         ignore_block_margins_for_stretch,
     );
-    let mut content_block_size: Au = flow_layout.content_block_size;
+    let mut content_block_size = flow_layout.content_block_size;
 
     // Update margins.
     let mut block_margins_collapsed_with_children = CollapsedBlockMargins::from_margin(&margin);
@@ -1092,15 +1092,9 @@ fn layout_in_flow_non_replaced_block_level_same_formatting_context(
         block_size_is_zero_or_intrinsic(style.min_block_size(), containing_block);
     block_margins_collapsed_with_children.collapsed_through = collapsed_through;
 
-    let end_margin_can_collapse_with_children = collapsed_through ||
-        (pbm.padding.block_end.is_zero() &&
-            pbm.border.block_end.is_zero() &&
-            !containing_block_for_children.size.block.is_definite());
-    if end_margin_can_collapse_with_children {
-        block_margins_collapsed_with_children
-            .end
-            .adjoin_assign(&collapsible_margins_in_children.end);
-    } else {
+    let end_margin_can_collapse_with_children =
+        pbm.padding.block_end.is_zero() && pbm.border.block_end.is_zero();
+    if !end_margin_can_collapse_with_children {
         content_block_size += collapsible_margins_in_children.end.solve();
     }
 
@@ -1112,6 +1106,29 @@ fn layout_in_flow_non_replaced_block_level_same_formatting_context(
         || content_block_size.into(),
         false, /* is_table */
     );
+
+    // If the final block size is different than the intrinsic size of the contents,
+    // then we can't actually collapse the end margins. This can happen due to min
+    // or max block sizes, or due to `calc-size()` once we implement it.
+    //
+    // We also require `block-size` to have an intrinsic value, by checking whether
+    // the containing block established for the contents has an indefinite block size.
+    // However, even if `block-size: 0px` is extrinsic (so it would normally prevent
+    // collapsing the end margin with children), it doesn't prevent the top and end
+    // margins from collapsing through. If that happens, allow collapsing end margins.
+    //
+    // This is being discussed in https://github.com/w3c/csswg-drafts/issues/12218.
+    // It would probably make more sense to check the definiteness of the containing
+    // block in the logic above (when we check if there is some block-end padding or
+    // border), or maybe drop the condition altogether. But for now, we match Blink.
+    let end_margin_can_collapse_with_children = end_margin_can_collapse_with_children &&
+        block_size == content_block_size &&
+        (collapsed_through || !containing_block_for_children.size.block.is_definite());
+    if end_margin_can_collapse_with_children {
+        block_margins_collapsed_with_children
+            .end
+            .adjoin_assign(&collapsible_margins_in_children.end);
+    }
 
     if let Some(ref mut sequential_layout_state) = sequential_layout_state {
         // Now that we're done laying out our children, we can restore the
@@ -1376,11 +1393,12 @@ impl IndependentFormattingContext {
         };
 
         let justify_self = resolve_justify_self(style, containing_block.style);
-        let is_replaced = self.is_replaced();
+        let automatic_inline_size =
+            automatic_inline_size(justify_self, is_table, self.is_replaced());
         let compute_inline_size = |stretch_size| {
             content_box_sizes.inline.resolve(
                 Direction::Inline,
-                automatic_inline_size(justify_self, is_table, is_replaced),
+                automatic_inline_size,
                 Au::zero,
                 Some(stretch_size),
                 get_inline_content_sizes,
@@ -2136,7 +2154,7 @@ impl<'container> PlacementState<'container> {
             Fragment::AbsoluteOrFixedPositioned(fragment) => {
                 // The alignment of absolutes in block flow layout is always "start", so the size of
                 // the static position rectangle does not matter.
-                fragment.borrow_mut().static_position_rect = LogicalRect {
+                fragment.borrow_mut().original_static_position_rect = LogicalRect {
                     start_corner: LogicalVec2 {
                         block: (self.current_margin.solve() +
                             self.current_block_direction_position),
@@ -2201,7 +2219,7 @@ fn block_size_is_zero_or_intrinsic(size: &StyleSize, containing_block: &Containi
         StyleSize::MaxContent |
         StyleSize::FitContent |
         StyleSize::FitContentFunction(_) => true,
-        StyleSize::Stretch => {
+        StyleSize::Stretch | StyleSize::WebkitFillAvailable => {
             // TODO: Should this return true when the containing block has a definite size of 0px?
             !containing_block.size.block.is_definite()
         },

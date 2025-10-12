@@ -34,13 +34,12 @@ mod from_constellation {
                 Self::CreateOrUpdateWebView(..) => target!("CreateOrUpdateWebView"),
                 Self::RemoveWebView(..) => target!("RemoveWebView"),
                 Self::TouchEventProcessed(..) => target!("TouchEventProcessed"),
-                Self::IsReadyToSaveImageReply(..) => target!("IsReadyToSaveImageReply"),
                 Self::SetThrottled(..) => target!("SetThrottled"),
                 Self::NewWebRenderFrameReady(..) => target!("NewWebRenderFrameReady"),
                 Self::PipelineExited(..) => target!("PipelineExited"),
-                Self::LoadComplete(..) => target!("LoadComplete"),
                 Self::SendInitialTransaction(..) => target!("SendInitialTransaction"),
                 Self::SendScrollNode(..) => target!("SendScrollNode"),
+                Self::UpdateEpoch { .. } => target!("UpdateEpoch"),
                 Self::SendDisplayList { .. } => target!("SendDisplayList"),
                 Self::GenerateFrame { .. } => target!("GenerateFrame"),
                 Self::GenerateImageKey(..) => target!("GenerateImageKey"),
@@ -54,6 +53,7 @@ mod from_constellation {
                 Self::Viewport(..) => target!("Viewport"),
                 Self::GenerateImageKeysForPipeline(..) => target!("GenerateImageKeysForPipeline"),
                 Self::DelayNewFrameForCanvas(..) => target!("DelayFramesForCanvas"),
+                Self::ScreenshotReadinessReponse(..) => target!("ScreenshotReadinessResponse"),
             }
         }
     }

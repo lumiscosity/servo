@@ -65,5 +65,7 @@ project-excludes = [
     "**/*_tests.py",
     "**/tests/**",
     "python/mach/**/*.py",
-    "python/servo/mutation/**/*.py",
 ]
+
+[tool.uv]
+native-tls = true

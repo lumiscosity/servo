@@ -4,11 +4,11 @@
 
 use std::cell::Cell;
 
+use base::IpcSend;
 use dom_struct::dom_struct;
 use ipc_channel::ipc::IpcSender;
-use net_traits::IpcSend;
-use net_traits::indexeddb_thread::{IndexedDBThreadMsg, KeyPath, SyncOperation};
 use profile_traits::ipc;
+use storage_traits::indexeddb_thread::{IndexedDBThreadMsg, KeyPath, SyncOperation};
 use stylo_atoms::Atom;
 
 use crate::dom::bindings::cell::DomRefCell;
@@ -77,7 +77,7 @@ impl IDBDatabase {
     }
 
     fn get_idb_thread(&self) -> IpcSender<IndexedDBThreadMsg> {
-        self.global().resource_threads().sender()
+        self.global().storage_threads().sender()
     }
 
     pub fn get_name(&self) -> DOMString {
@@ -163,7 +163,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
 
         // Step 2: if close flag is set, throw error
         if self.closing.get() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         // Step 3
@@ -198,7 +198,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
         // Step 2
         let upgrade_transaction = match self.upgrade_transaction.get() {
             Some(txn) => txn,
-            None => return Err(Error::InvalidState),
+            None => return Err(Error::InvalidState(None)),
         };
 
         // Step 3
@@ -217,12 +217,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
         }
 
         // Step 6
-        if self
-            .object_store_names
-            .borrow()
-            .iter()
-            .any(|store_name| store_name.to_string() == name.to_string())
-        {
+        if self.object_store_names.borrow().contains(&name) {
             return Err(Error::Constraint);
         }
 
@@ -281,7 +276,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
             .is_err()
         {
             warn!("Object store creation failed in idb thread");
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         };
 
         self.object_store_names.borrow_mut().push(name);
@@ -294,7 +289,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
         let transaction = self.upgrade_transaction.get();
         let transaction = match transaction {
             Some(transaction) => transaction,
-            None => return Err(Error::InvalidState),
+            None => return Err(Error::InvalidState(None)),
         };
 
         // Step 3
@@ -303,19 +298,14 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
         }
 
         // Step 4
-        if !self
-            .object_store_names
-            .borrow()
-            .iter()
-            .any(|store_name| store_name.to_string() == name.to_string())
-        {
-            return Err(Error::NotFound);
+        if !self.object_store_names.borrow().contains(&name) {
+            return Err(Error::NotFound(None));
         }
 
         // Step 5
         self.object_store_names
             .borrow_mut()
-            .retain(|store_name| store_name.to_string() != name.to_string());
+            .retain(|store_name| *store_name != name);
 
         // Step 6
         // FIXME:(arihant2math) Remove from index set ...
@@ -340,7 +330,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
             .is_err()
         {
             warn!("Object store deletion failed in idb thread");
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         };
         Ok(())
     }

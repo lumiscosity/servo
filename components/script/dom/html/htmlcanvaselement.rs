@@ -76,7 +76,7 @@ pub(crate) struct HTMLCanvasElement {
 
     // This id and hashmap are used to keep track of ongoing toBlob() calls.
     callback_id: Cell<u32>,
-    #[ignore_malloc_size_of = "not implemented for webidl callbacks"]
+    #[conditional_malloc_size_of]
     blob_callbacks: RefCell<FxHashMap<u32, Rc<BlobCallback>>>,
 }
 
@@ -209,8 +209,12 @@ impl HTMLCanvasElement {
         let window = self.owner_window();
         let size = self.get_size();
         let context = CanvasRenderingContext2D::new(window.as_global_scope(), self, size, can_gc)?;
-        *self.context_mode.borrow_mut() =
-            Some(RenderingContext::Context2d(Dom::from_ref(&*context)));
+
+        self.context_mode
+            .borrow_mut()
+            .replace(RenderingContext::Context2d(Dom::from_ref(&*context)));
+        self.upcast::<Node>().dirty(NodeDamage::ContentOrHeritage);
+
         Some(context)
     }
 
@@ -237,8 +241,10 @@ impl HTMLCanvasElement {
         let context = ImageBitmapRenderingContext::new(&self.owner_global(), &canvas, can_gc);
 
         // Step 2. Set this's context mode to bitmaprenderer.
-        *self.context_mode.borrow_mut() =
-            Some(RenderingContext::BitmapRenderer(Dom::from_ref(&*context)));
+        self.context_mode
+            .borrow_mut()
+            .replace(RenderingContext::BitmapRenderer(Dom::from_ref(&*context)));
+        self.upcast::<Node>().dirty(NodeDamage::ContentOrHeritage);
 
         // Step 3. Return context.
         Some(context)
@@ -269,7 +275,12 @@ impl HTMLCanvasElement {
             attrs,
             can_gc,
         )?;
-        *self.context_mode.borrow_mut() = Some(RenderingContext::WebGL(Dom::from_ref(&*context)));
+
+        self.context_mode
+            .borrow_mut()
+            .replace(RenderingContext::WebGL(Dom::from_ref(&*context)));
+        self.upcast::<Node>().dirty(NodeDamage::ContentOrHeritage);
+
         Some(context)
     }
 
@@ -295,7 +306,12 @@ impl HTMLCanvasElement {
         let size = self.get_size();
         let attrs = Self::get_gl_attributes(cx, options, can_gc)?;
         let context = WebGL2RenderingContext::new(&window, &canvas, size, attrs, can_gc)?;
-        *self.context_mode.borrow_mut() = Some(RenderingContext::WebGL2(Dom::from_ref(&*context)));
+
+        self.context_mode
+            .borrow_mut()
+            .replace(RenderingContext::WebGL2(Dom::from_ref(&*context)));
+        self.upcast::<Node>().dirty(NodeDamage::ContentOrHeritage);
+
         Some(context)
     }
 
@@ -322,8 +338,12 @@ impl HTMLCanvasElement {
             .expect("Failed to get WebGPU channel")
             .map(|channel| {
                 let context = GPUCanvasContext::new(&global_scope, self, channel, can_gc);
-                *self.context_mode.borrow_mut() =
-                    Some(RenderingContext::WebGPU(Dom::from_ref(&*context)));
+
+                self.context_mode
+                    .borrow_mut()
+                    .replace(RenderingContext::WebGPU(Dom::from_ref(&*context)));
+                self.upcast::<Node>().dirty(NodeDamage::ContentOrHeritage);
+
                 context
             })
     }
@@ -401,7 +421,7 @@ impl HTMLCanvasElementMethods<crate::DomTypeHolder> for HTMLCanvasElement {
         // > is set to placeholder, the user agent must throw an "InvalidStateError" DOMException and leave the
         // > attribute's value unchanged.
         if let Some(RenderingContext::Placeholder(_)) = *self.context_mode.borrow() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         let value = if value > UNSIGNED_LONG_MAX {
@@ -423,7 +443,7 @@ impl HTMLCanvasElementMethods<crate::DomTypeHolder> for HTMLCanvasElement {
         // > is set to placeholder, the user agent must throw an "InvalidStateError" DOMException and leave the
         // > attribute's value unchanged.
         if let Some(RenderingContext::Placeholder(_)) = *self.context_mode.borrow() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         let value = if value > UNSIGNED_LONG_MAX {
@@ -446,10 +466,10 @@ impl HTMLCanvasElementMethods<crate::DomTypeHolder> for HTMLCanvasElement {
     ) -> Fallible<Option<RootedRenderingContext>> {
         // Always throw an InvalidState exception when the canvas is in Placeholder mode (See table in the spec).
         if let Some(RenderingContext::Placeholder(_)) = *self.context_mode.borrow() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
-        Ok(match &*id {
+        Ok(match &*id.str() {
             "2d" => self
                 .get_or_init_2d_context(can_gc)
                 .map(RootedRenderingContext::CanvasRenderingContext2D),
@@ -599,7 +619,7 @@ impl HTMLCanvasElementMethods<crate::DomTypeHolder> for HTMLCanvasElement {
         if self.context_mode.borrow().is_some() {
             // Step 1.
             // If this canvas element's context mode is not set to none, throw an "InvalidStateError" DOMException.
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         };
 
         // Step 2.
@@ -659,6 +679,16 @@ impl VirtualMethods for HTMLCanvasElement {
             },
             _ => {},
         };
+    }
+
+    fn attribute_affects_presentational_hints(&self, attr: &Attr) -> bool {
+        match attr.local_name() {
+            &local_name!("width") | &local_name!("height") => true,
+            _ => self
+                .super_type()
+                .unwrap()
+                .attribute_affects_presentational_hints(attr),
+        }
     }
 
     fn parse_plain_attribute(&self, name: &LocalName, value: DOMString) -> AttrValue {

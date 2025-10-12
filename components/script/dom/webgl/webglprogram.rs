@@ -309,7 +309,7 @@ impl WebGLProgram {
         if !validate_glsl_name(&name)? {
             return Ok(());
         }
-        if name.starts_with("gl_") {
+        if name.starts_with_str("gl_") {
             return Err(WebGLError::InvalidOperation);
         }
 
@@ -375,7 +375,7 @@ impl WebGLProgram {
         if !validate_glsl_name(&name)? {
             return Ok(-1);
         }
-        if name.starts_with("gl_") {
+        if name.starts_with_str("gl_") {
             return Ok(-1);
         }
 
@@ -383,7 +383,7 @@ impl WebGLProgram {
             .active_attribs
             .borrow()
             .iter()
-            .find(|attrib| attrib.name == *name)
+            .find(|attrib| *attrib.name == name)
             .and_then(|attrib| attrib.location.map(|l| l as i32))
             .unwrap_or(-1);
         Ok(location)
@@ -398,7 +398,7 @@ impl WebGLProgram {
         if !validate_glsl_name(&name)? {
             return Ok(-1);
         }
-        if name.starts_with("gl_") {
+        if name.starts_with_str("gl_") {
             return Ok(-1);
         }
 
@@ -426,7 +426,7 @@ impl WebGLProgram {
         if !validate_glsl_name(&name)? {
             return Ok(None);
         }
-        if name.starts_with("gl_") {
+        if name.starts_with_str("gl_") {
             return Ok(None);
         }
 
@@ -439,7 +439,7 @@ impl WebGLProgram {
             let uniforms = self.active_uniforms.borrow();
             match uniforms
                 .iter()
-                .find(|attrib| &*attrib.base_name == base_name)
+                .find(|attrib| *attrib.base_name == base_name)
             {
                 Some(uniform) if array_index.is_none() || array_index < uniform.size => (
                     uniform
@@ -499,10 +499,7 @@ impl WebGLProgram {
             return Err(WebGLError::InvalidOperation);
         }
 
-        let validation_errors = names
-            .iter()
-            .map(|name| validate_glsl_name(name))
-            .collect::<Vec<_>>();
+        let validation_errors = names.iter().map(validate_glsl_name).collect::<Vec<_>>();
         let first_validation_error = validation_errors.iter().find(|result| result.is_err());
         if let Some(error) = first_validation_error {
             return Err(error.unwrap_err());
@@ -679,17 +676,17 @@ impl Drop for WebGLProgram {
     }
 }
 
-fn validate_glsl_name(name: &str) -> WebGLResult<bool> {
+fn validate_glsl_name(name: &DOMString) -> WebGLResult<bool> {
     if name.is_empty() {
         return Ok(false);
     }
     if name.len() > MAX_UNIFORM_AND_ATTRIBUTE_LEN {
         return Err(WebGLError::InvalidValue);
     }
-    for c in name.chars() {
+    for c in name.str().chars() {
         validate_glsl_char(c)?;
     }
-    if name.starts_with("webgl_") || name.starts_with("_webgl_") {
+    if name.starts_with_str("webgl_") || name.starts_with_str("_webgl_") {
         return Err(WebGLError::InvalidOperation);
     }
     Ok(true)
@@ -735,15 +732,16 @@ fn validate_glsl_char(c: char) -> WebGLResult<()> {
     }
 }
 
-fn parse_uniform_name(name: &str) -> Option<(&str, Option<i32>)> {
+fn parse_uniform_name(name: &DOMString) -> Option<(String, Option<i32>)> {
+    let name = name.str();
     if !name.ends_with(']') {
-        return Some((name, None));
+        return Some((String::from(name), None));
     }
     let bracket_pos = name[..name.len() - 1].rfind('[')?;
     let index = name[(bracket_pos + 1)..(name.len() - 1)]
         .parse::<i32>()
         .ok()?;
-    Some((&name[..bracket_pos], Some(index)))
+    Some((String::from(&name[..bracket_pos]), Some(index)))
 }
 
 pub(crate) const MAX_UNIFORM_AND_ATTRIBUTE_LEN: usize = 256;

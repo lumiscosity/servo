@@ -96,7 +96,7 @@ pub(crate) struct XRSession {
     current_raf_callback_list: DomRefCell<Vec<(i32, Option<Rc<XRFrameRequestCallback>>)>>,
     input_sources: Dom<XRInputSourceArray>,
     // Any promises from calling end()
-    #[ignore_malloc_size_of = "promises are hard"]
+    #[conditional_malloc_size_of]
     end_promises: DomRefCell<Vec<Rc<Promise>>>,
     /// <https://immersive-web.github.io/webxr/#ended>
     ended: Cell<bool>,
@@ -113,7 +113,7 @@ pub(crate) struct XRSession {
     #[no_trace]
     input_frames: DomRefCell<HashMap<InputId, InputFrame>>,
     framerate: Cell<f32>,
-    #[ignore_malloc_size_of = "promises are hard"]
+    #[conditional_malloc_size_of]
     update_framerate_promise: DomRefCell<Option<Rc<Promise>>>,
     reference_spaces: DomRefCell<Vec<Dom<XRReferenceSpace>>>,
 }
@@ -671,18 +671,18 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
     fn UpdateRenderState(&self, init: &XRRenderStateInit, _: InRealm) -> ErrorResult {
         // Step 2
         if self.ended.get() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
         // Step 3:
         if let Some(Some(ref layer)) = init.baseLayer {
             if Dom::from_ref(layer.session()) != Dom::from_ref(self) {
-                return Err(Error::InvalidState);
+                return Err(Error::InvalidState(None));
             }
         }
 
         // Step 4:
         if init.inlineVerticalFieldOfView.is_some() && self.is_immersive() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         // https://immersive-web.github.io/layers/#updaterenderstatechanges
@@ -1045,7 +1045,7 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
                 supported_frame_rates.is_empty() ||
                 self.ended.get()
             {
-                promise.reject_error(Error::InvalidState, can_gc);
+                promise.reject_error(Error::InvalidState(None), can_gc);
                 return promise;
             }
 

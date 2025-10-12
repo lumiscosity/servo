@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use app_units::Au;
 use base::Epoch;
+use base::generic_channel::GenericSender;
 use canvas_traits::canvas::{
     Canvas2dMsg, CanvasFont, CanvasId, CanvasMsg, CompositionOptions, CompositionOrBlending,
     FillOrStrokeStyle, FillRule, GlyphAndPosition, LineCapStyle, LineJoinStyle, LineOptions,
@@ -23,7 +24,7 @@ use fonts::{
     ByteIndex, FontBaseline, FontContext, FontGroup, FontIdentifier, FontMetrics, FontRef,
     LAST_RESORT_GLYPH_ADVANCE, ShapingFlags, ShapingOptions,
 };
-use ipc_channel::ipc::{self, IpcSender};
+use ipc_channel::ipc;
 use net_traits::image_cache::{ImageCache, ImageResponse};
 use net_traits::request::CorsSettings;
 use pixels::{PixelFormat, Snapshot, SnapshotAlphaMode, SnapshotPixelFormat};
@@ -193,9 +194,8 @@ impl CanvasContextState {
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 #[derive(JSTraceable, MallocSizeOf)]
 pub(super) struct CanvasState {
-    #[ignore_malloc_size_of = "Defined in ipc-channel"]
     #[no_trace]
-    ipc_renderer: IpcSender<CanvasMsg>,
+    ipc_renderer: GenericSender<CanvasMsg>,
     #[no_trace]
     canvas_id: CanvasId,
     #[no_trace]
@@ -204,7 +204,7 @@ pub(super) struct CanvasState {
     size: Cell<Size2D<u64>>,
     state: DomRefCell<CanvasContextState>,
     origin_clean: Cell<bool>,
-    #[ignore_malloc_size_of = "Arc"]
+    #[ignore_malloc_size_of = "ImageCache"]
     #[no_trace]
     image_cache: Arc<dyn ImageCache>,
     /// The base URL for resolving CSS image URL values.
@@ -507,7 +507,7 @@ impl CanvasState {
             CanvasImageSource::HTMLCanvasElement(ref canvas) => {
                 // <https://html.spec.whatwg.org/multipage/#check-the-usability-of-the-image-argument>
                 if canvas.get_size().is_empty() {
-                    return Err(Error::InvalidState);
+                    return Err(Error::InvalidState(None));
                 }
 
                 self.draw_html_canvas_element(canvas, htmlcanvas, sx, sy, sw, sh, dx, dy, dw, dh)
@@ -515,7 +515,7 @@ impl CanvasState {
             CanvasImageSource::ImageBitmap(ref bitmap) => {
                 // <https://html.spec.whatwg.org/multipage/#check-the-usability-of-the-image-argument>
                 if bitmap.is_detached() {
-                    return Err(Error::InvalidState);
+                    return Err(Error::InvalidState(None));
                 }
 
                 self.draw_image_bitmap(bitmap, htmlcanvas, sx, sy, sw, sh, dx, dy, dw, dh);
@@ -524,7 +524,7 @@ impl CanvasState {
             CanvasImageSource::OffscreenCanvas(ref canvas) => {
                 // <https://html.spec.whatwg.org/multipage/#check-the-usability-of-the-image-argument>
                 if canvas.get_size().is_empty() {
-                    return Err(Error::InvalidState);
+                    return Err(Error::InvalidState(None));
                 }
 
                 self.draw_offscreen_canvas(canvas, htmlcanvas, sx, sy, sw, sh, dx, dy, dw, dh)
@@ -532,7 +532,7 @@ impl CanvasState {
             CanvasImageSource::CSSStyleValue(ref value) => {
                 let url = value
                     .get_url(self.base_url.clone())
-                    .ok_or(Error::InvalidState)?;
+                    .ok_or(Error::InvalidState(None))?;
                 self.fetch_and_draw_image_data(
                     htmlcanvas, url, None, sx, sy, sw, sh, dx, dy, dw, dh,
                 )
@@ -705,7 +705,7 @@ impl CanvasState {
                         self.state.borrow().transform,
                     ));
                 },
-                OffscreenRenderingContext::Detached => return Err(Error::InvalidState),
+                OffscreenRenderingContext::Detached => return Err(Error::InvalidState(None)),
             }
         } else {
             self.send_canvas_2d_msg(Canvas2dMsg::DrawEmptyImage(
@@ -786,7 +786,7 @@ impl CanvasState {
                 },
                 RenderingContext::Placeholder(ref context) => {
                     let Some(context) = context.context() else {
-                        return Err(Error::InvalidState);
+                        return Err(Error::InvalidState(None));
                     };
                     match *context {
                         OffscreenRenderingContext::Context2d(ref context) => context
@@ -814,10 +814,12 @@ impl CanvasState {
                                 self.state.borrow().transform,
                             ));
                         },
-                        OffscreenRenderingContext::Detached => return Err(Error::InvalidState),
+                        OffscreenRenderingContext::Detached => {
+                            return Err(Error::InvalidState(None));
+                        },
                     }
                 },
-                _ => return Err(Error::InvalidState),
+                _ => return Err(Error::InvalidState(None)),
             }
         } else {
             self.send_canvas_2d_msg(Canvas2dMsg::DrawEmptyImage(
@@ -852,7 +854,7 @@ impl CanvasState {
         debug!("Fetching image {}.", url);
         let snapshot = self
             .fetch_image_data(url, cors_setting)
-            .ok_or(Error::InvalidState)?;
+            .ok_or(Error::InvalidState(None))?;
         let image_size = snapshot.size();
 
         let dw = dw.unwrap_or(image_size.width as f64);
@@ -1254,7 +1256,9 @@ impl CanvasState {
                     return Ok(None);
                 }
 
-                image.get_raster_image_data().ok_or(Error::InvalidState)?
+                image
+                    .get_raster_image_data()
+                    .ok_or(Error::InvalidState(None))?
             },
             CanvasImageSource::HTMLVideoElement(ref video) => {
                 // <https://html.spec.whatwg.org/multipage/#check-the-usability-of-the-image-argument>
@@ -1262,43 +1266,48 @@ impl CanvasState {
                     return Ok(None);
                 }
 
-                video.get_current_frame_data().ok_or(Error::InvalidState)?
+                video
+                    .get_current_frame_data()
+                    .ok_or(Error::InvalidState(None))?
             },
             CanvasImageSource::HTMLCanvasElement(ref canvas) => {
                 // <https://html.spec.whatwg.org/multipage/#check-the-usability-of-the-image-argument>
                 if canvas.get_size().is_empty() {
-                    return Err(Error::InvalidState);
+                    return Err(Error::InvalidState(None));
                 }
 
-                canvas.get_image_data().ok_or(Error::InvalidState)?
+                canvas.get_image_data().ok_or(Error::InvalidState(None))?
             },
             CanvasImageSource::ImageBitmap(ref bitmap) => {
                 // <https://html.spec.whatwg.org/multipage/#check-the-usability-of-the-image-argument>
                 if bitmap.is_detached() {
-                    return Err(Error::InvalidState);
+                    return Err(Error::InvalidState(None));
                 }
 
-                bitmap.bitmap_data().clone().ok_or(Error::InvalidState)?
+                bitmap
+                    .bitmap_data()
+                    .clone()
+                    .ok_or(Error::InvalidState(None))?
             },
             CanvasImageSource::OffscreenCanvas(ref canvas) => {
                 // <https://html.spec.whatwg.org/multipage/#check-the-usability-of-the-image-argument>
                 if canvas.get_size().is_empty() {
-                    return Err(Error::InvalidState);
+                    return Err(Error::InvalidState(None));
                 }
 
-                canvas.get_image_data().ok_or(Error::InvalidState)?
+                canvas.get_image_data().ok_or(Error::InvalidState(None))?
             },
             CanvasImageSource::CSSStyleValue(ref value) => value
                 .get_url(self.base_url.clone())
                 .and_then(|url| self.fetch_image_data(url, None))
-                .ok_or(Error::InvalidState)?,
+                .ok_or(Error::InvalidState(None))?,
         };
 
         if repetition.is_empty() {
             repetition.push_str("repeat");
         }
 
-        if let Ok(rep) = RepetitionStyle::from_str(&repetition) {
+        if let Ok(rep) = RepetitionStyle::from_str(&repetition.str()) {
             let size = snapshot.size();
             Ok(Some(CanvasPattern::new(
                 global,
@@ -1357,7 +1366,7 @@ impl CanvasState {
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-globalcompositeoperation
     pub(super) fn set_global_composite_operation(&self, op_str: DOMString) {
-        if let Ok(op) = CompositionOrBlending::from_str(&op_str) {
+        if let Ok(op) = CompositionOrBlending::from_str(&op_str.str()) {
             self.state.borrow_mut().global_composition = op;
         }
     }
@@ -1399,7 +1408,7 @@ impl CanvasState {
 
         let Some((bounds, text_run)) = self.text_with_size(
             global_scope,
-            text.str(),
+            &text.str(),
             Point2D::new(x, y),
             size,
             max_width,
@@ -1443,7 +1452,7 @@ impl CanvasState {
 
         let Some((bounds, text_run)) = self.text_with_size(
             global_scope,
-            text.str(),
+            &text.str(),
             Point2D::new(x, y),
             size,
             max_width,
@@ -1475,7 +1484,7 @@ impl CanvasState {
         // Max width is not provided for `measureText()`.
 
         // > Step 2: Replace all ASCII whitespace in text with U+0020 SPACE characters.
-        let text = replace_ascii_whitespace(text.str());
+        let text = replace_ascii_whitespace(&text.str());
 
         // > Step 3: Let font be the current font of target, as given by that object's font
         // > attribute.
@@ -2347,7 +2356,7 @@ impl CanvasState {
             // TODO: This should ultimately handle emoji variation selectors, but raqote does not yet
             // have support for color glyphs.
             let script = Script::from(character);
-            let font = font_group.find_by_codepoint(font_context, character, None, None);
+            let font = font_group.find_by_codepoint(font_context, character, None, None, None);
 
             if !current_text_run.script_and_font_compatible(script, &font) {
                 let previous_text_run = std::mem::replace(
@@ -2506,9 +2515,10 @@ impl UnshapedTextRun<'_> {
 
 pub(super) fn parse_color(
     canvas: Option<&HTMLCanvasElement>,
-    string: &str,
+    string: &DOMString,
 ) -> Result<AbsoluteColor, ()> {
-    let mut input = ParserInput::new(string);
+    let string = string.str();
+    let mut input = ParserInput::new(&string);
     let mut parser = Parser::new(&mut input);
     let url = Url::parse("about:blank").unwrap().into();
     let context = ParserContext::new(

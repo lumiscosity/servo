@@ -252,7 +252,7 @@ impl Range {
             .unwrap();
         if start_node_root != node_root {
             // Step 1.
-            return Err(Error::WrongDocument);
+            return Err(Error::WrongDocument(None));
         }
         if node.is_doctype() {
             // Step 2.
@@ -505,7 +505,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
             .unwrap();
         if this_root != other_root {
             // Step 2.
-            return Err(Error::WrongDocument);
+            return Err(Error::WrongDocument(None));
         }
         // Step 3.
         let (this_point, other_point) = match how {
@@ -543,7 +543,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
             Ok(Ordering::Less) => Ok(false),
             Ok(Ordering::Equal) => Ok(true),
             Ok(Ordering::Greater) => Ok(false),
-            Err(Error::WrongDocument) => {
+            Err(Error::WrongDocument(None)) => {
                 // Step 2.
                 Ok(false)
             },
@@ -1028,7 +1028,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
             end.inclusive_ancestors(ShadowIncluding::No)
                 .any(|n| !n.is_inclusive_ancestor_of(&start) && !n.is::<Text>())
         {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         // Step 2.
@@ -1082,7 +1082,8 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
                         self.start_offset(),
                         char_data.Length() - self.start_offset(),
                     )
-                    .unwrap(),
+                    .unwrap()
+                    .str(),
             );
         }
 
@@ -1094,14 +1095,14 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
 
         for child in iter {
             if self.contains(child.upcast()) {
-                s.push_str(&child.upcast::<CharacterData>().Data());
+                s.push_str(&child.upcast::<CharacterData>().Data().str());
             }
         }
 
         // Step 5.
         if let Some(text_node) = end_node.downcast::<Text>() {
             let char_data = text_node.upcast::<CharacterData>();
-            s.push_str(&char_data.SubstringData(0, self.end_offset()).unwrap());
+            s.push_str(&char_data.SubstringData(0, self.end_offset()).unwrap().str());
         }
 
         // Step 6.

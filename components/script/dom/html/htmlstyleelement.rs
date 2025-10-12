@@ -34,7 +34,7 @@ use crate::dom::stylesheet::StyleSheet as DOMStyleSheet;
 use crate::dom::stylesheetcontentscache::{StylesheetContentsCache, StylesheetContentsCacheKey};
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::script_runtime::CanGc;
-use crate::stylesheet_loader::{StylesheetLoader, StylesheetOwner};
+use crate::stylesheet_loader::{ElementStylesheetLoader, StylesheetOwner};
 
 #[dom_struct]
 pub(crate) struct HTMLStyleElement {
@@ -97,7 +97,10 @@ impl HTMLStyleElement {
 
     pub(crate) fn parse_own_css(&self) {
         let node = self.upcast::<Node>();
-        assert!(node.is_connected());
+        assert!(
+            node.is_in_a_document_tree() || node.is_in_a_shadow_tree(),
+            "This stylesheet does not have an owner, so there's no reason to parse its contents"
+        );
 
         // Step 4. of <https://html.spec.whatwg.org/multipage/#the-style-element%3Aupdate-a-style-block>
         let mut type_attribute = self.Type();
@@ -118,7 +121,7 @@ impl HTMLStyleElement {
                 global,
                 self.upcast(),
                 InlineCheckType::Style,
-                &node.child_text_content(),
+                &node.child_text_content().str(),
             )
         {
             return;
@@ -129,14 +132,14 @@ impl HTMLStyleElement {
             .GetTextContent()
             .expect("Element.textContent must be a string");
         let shared_lock = node.owner_doc().style_shared_lock().clone();
-        let mq = Arc::new(shared_lock.wrap(self.create_media_list(&self.Media())));
-        let loader = StylesheetLoader::for_element(self.upcast());
+        let mq = Arc::new(shared_lock.wrap(self.create_media_list(&self.Media().str())));
+        let loader = ElementStylesheetLoader::new(self.upcast());
 
         let stylesheetcontents_create_callback = || {
             #[cfg(feature = "tracing")]
             let _span = tracing::trace_span!("ParseStylesheet", servo_profiling = true).entered();
             StylesheetContents::from_str(
-                &data,
+                &data.str(),
                 UrlExtraData(window.get_url().get_arc()),
                 Origin::Author,
                 &shared_lock,
@@ -153,7 +156,7 @@ impl HTMLStyleElement {
         // stylo's `CascadeDataCache` can now be significantly improved. When shared `StylesheetContents`
         // is modified, copy-on-write will occur, see `CSSStyleSheet::will_modify`.
         let (cache_key, contents) = StylesheetContentsCache::get_or_insert_with(
-            &data,
+            &data.str(),
             &shared_lock,
             UrlExtraData(window.get_url().get_arc()),
             doc.quirks_mode(),

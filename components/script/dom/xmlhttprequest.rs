@@ -339,7 +339,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
         // Step 1
         if let Some(window) = DomRoot::downcast::<Window>(self.global()) {
             if !window.Document().is_fully_active() {
-                return Err(Error::InvalidState);
+                return Err(Error::InvalidState(None));
             }
         }
 
@@ -433,7 +433,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
         // Step 1: If this’s state is not opened, then throw an "InvalidStateError" DOMException.
         // Step 2: If this’s send() flag is set, then throw an "InvalidStateError" DOMException.
         if self.ready_state.get() != XMLHttpRequestState::Opened || self.send_flag.get() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         // Step 3: Normalize value.
@@ -521,9 +521,9 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
             // Step 1
             XMLHttpRequestState::HeadersReceived |
             XMLHttpRequestState::Loading |
-            XMLHttpRequestState::Done => Err(Error::InvalidState),
+            XMLHttpRequestState::Done => Err(Error::InvalidState(None)),
             // Step 2
-            _ if self.send_flag.get() => Err(Error::InvalidState),
+            _ if self.send_flag.get() => Err(Error::InvalidState(None)),
             // Step 3
             _ => {
                 self.with_credentials.set(with_credentials);
@@ -541,7 +541,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
     fn Send(&self, data: Option<DocumentOrXMLHttpRequestBodyInit>, can_gc: CanGc) -> ErrorResult {
         // Step 1, 2
         if self.ready_state.get() != XMLHttpRequestState::Opened || self.send_flag.get() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         // Step 3
@@ -552,7 +552,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
         // Step 4 (first half)
         let mut extracted_or_serialized = match data {
             Some(DocumentOrXMLHttpRequestBodyInit::Document(ref doc)) => {
-                let bytes = Vec::from(serialize_document(doc)?.as_ref());
+                let bytes = Vec::from(&*serialize_document(doc)?.as_bytes());
                 let content_type = if doc.is_html_document() {
                     "text/html;charset=UTF-8"
                 } else {
@@ -720,7 +720,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
             if !request.headers.contains_key(header::CONTENT_TYPE) {
                 request.headers.insert(
                     header::CONTENT_TYPE,
-                    HeaderValue::from_str(&content_type).unwrap(),
+                    HeaderValue::from_str(&content_type.str()).unwrap(),
                 );
                 content_type_set = true;
             }
@@ -873,7 +873,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
         //   DOMException.
         match self.ready_state.get() {
             XMLHttpRequestState::Loading | XMLHttpRequestState::Done => {
-                return Err(Error::InvalidState);
+                return Err(Error::InvalidState(None));
             },
             _ => {},
         }
@@ -907,7 +907,9 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
         }
         match self.ready_state.get() {
             // Step 2
-            XMLHttpRequestState::Loading | XMLHttpRequestState::Done => Err(Error::InvalidState),
+            XMLHttpRequestState::Loading | XMLHttpRequestState::Done => {
+                Err(Error::InvalidState(None))
+            },
             _ => {
                 if self.sync_in_window() {
                     // Step 3
@@ -969,7 +971,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
                 }))
             },
             // Step 1
-            _ => Err(Error::InvalidState),
+            _ => Err(Error::InvalidState(None)),
         }
     }
 
@@ -986,7 +988,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
                 }
             },
             // Step 1
-            _ => Err(Error::InvalidState),
+            _ => Err(Error::InvalidState(None)),
         }
     }
 }
@@ -1536,6 +1538,7 @@ impl XMLHttpRequest {
             Some(doc.insecure_requests_policy()),
             doc.has_trustworthy_ancestor_origin(),
             doc.custom_element_reaction_stack(),
+            doc.creation_sandboxing_flag_set(),
             can_gc,
         )
     }
@@ -1672,7 +1675,7 @@ fn serialize_document(doc: &Document) -> Fallible<DOMString> {
     let mut writer = vec![];
     match serialize(&mut writer, &doc.upcast::<Node>(), SerializeOpts::default()) {
         Ok(_) => Ok(DOMString::from(String::from_utf8(writer).unwrap())),
-        Err(_) => Err(Error::InvalidState),
+        Err(_) => Err(Error::InvalidState(None)),
     }
 }
 

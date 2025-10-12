@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use app_units::Au;
-use base::id::WebViewId;
+use base::id::{RenderingGroupId, WebViewId};
 use compositing_traits::CrossProcessCompositorApi;
 use fonts_traits::{
     CSSFontFaceDescriptors, FontDescriptor, FontIdentifier, FontTemplate, FontTemplateRef,
@@ -45,7 +45,13 @@ use crate::{FontData, LowercaseFontFamilyName, PlatformFontMethods, SystemFontSe
 
 static SMALL_CAPS_SCALE_FACTOR: f32 = 0.8; // Matches FireFox (see gfxFont.h)
 
-pub(crate) type FontParameters = (FontKey, Au, Vec<FontVariation>);
+#[derive(Eq, Hash, MallocSizeOf, PartialEq)]
+pub(crate) struct FontParameters {
+    pub(crate) font_key: FontKey,
+    pub(crate) pt_size: Au,
+    pub(crate) variations: Vec<FontVariation>,
+    pub(crate) flags: FontInstanceFlags,
+}
 
 #[derive(MallocSizeOf)]
 struct FontGroupRef(#[conditional_malloc_size_of] Arc<RwLock<FontGroup>>);
@@ -277,19 +283,25 @@ impl FontContext {
         )?)))
     }
 
-    pub(crate) fn create_font_instance_key(&self, font: &Font) -> FontInstanceKey {
+    pub(crate) fn create_font_instance_key(
+        &self,
+        font: &Font,
+        rendering_group_id: RenderingGroupId,
+    ) -> FontInstanceKey {
         match font.template.identifier() {
             FontIdentifier::Local(_) => self.system_font_service_proxy.get_system_font_instance(
                 font.template.identifier(),
                 font.descriptor.pt_size,
                 font.webrender_font_instance_flags(),
                 font.variations().to_owned(),
+                rendering_group_id,
             ),
             FontIdentifier::Web(_) => self.create_web_font_instance(
                 font.template.clone(),
                 font.descriptor.pt_size,
                 font.webrender_font_instance_flags(),
                 font.variations().to_owned(),
+                rendering_group_id,
             ),
         }
     }
@@ -300,6 +312,7 @@ impl FontContext {
         pt_size: Au,
         flags: FontInstanceFlags,
         variations: Vec<FontVariation>,
+        rendering_group_id: RenderingGroupId,
     ) -> FontInstanceKey {
         let identifier = font_template.identifier().clone();
         let font_data = self
@@ -310,7 +323,9 @@ impl FontContext {
             .write()
             .entry(identifier.clone())
             .or_insert_with(|| {
-                let font_key = self.system_font_service_proxy.generate_font_key();
+                let font_key = self
+                    .system_font_service_proxy
+                    .generate_font_key(rendering_group_id);
                 self.compositor_api.lock().add_font(
                     font_key,
                     font_data.as_ipc_shared_memory(),
@@ -319,12 +334,20 @@ impl FontContext {
                 font_key
             });
 
+        let entry_key = FontParameters {
+            font_key,
+            pt_size,
+            variations: variations.clone(),
+            flags,
+        };
         *self
             .webrender_font_instance_keys
             .write()
-            .entry((font_key, pt_size, variations.clone()))
+            .entry(entry_key)
             .or_insert_with(|| {
-                let font_instance_key = self.system_font_service_proxy.generate_font_instance_key();
+                let font_instance_key = self
+                    .system_font_service_proxy
+                    .generate_font_instance_key(rendering_group_id);
                 self.compositor_api.lock().add_font_instance(
                     font_instance_key,
                     font_key,
@@ -622,8 +645,8 @@ impl FontContextWebFontMethods for Arc<FontContext> {
         });
 
         let mut removed_instance_keys: HashSet<FontInstanceKey> = HashSet::new();
-        webrender_font_instance_keys.retain(|(font_key, _, _), instance_key| {
-            if removed_keys.contains(font_key) {
+        webrender_font_instance_keys.retain(|font_param, instance_key| {
+            if removed_keys.contains(&font_param.font_key) {
                 removed_instance_keys.insert(*instance_key);
                 false
             } else {
@@ -867,7 +890,8 @@ impl RemoteWebFontDownloader {
 
         let url: ServoUrl = self.url.clone().into();
         let identifier = FontIdentifier::Web(url.clone());
-        let Ok(handle) = PlatformFont::new_from_data(identifier, &font_data, None, &[]) else {
+        let Ok(handle) = PlatformFont::new_from_data(identifier, &font_data, None, &[], false)
+        else {
             return false;
         };
         let state = self.take_state();

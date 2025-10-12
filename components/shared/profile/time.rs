@@ -7,7 +7,6 @@ use ipc_channel::ipc::IpcSender;
 use log::warn;
 use malloc_size_of_derive::MallocSizeOf;
 use serde::{Deserialize, Serialize};
-use servo_config::opts;
 use time::Duration;
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -106,12 +105,13 @@ pub enum ProfilerCategory {
     ScriptEnterFullscreen = 0x79,
     ScriptExitFullscreen = 0x7a,
     ScriptWorkletEvent = 0x7b,
-    ScriptPerformanceEvent = 0x7c,
-    ScriptHistoryEvent = 0x7d,
-    ScriptPortMessage = 0x7e,
-    ScriptWebGPUMsg = 0x7f,
+    ScriptGeolocationEvent = 0x7c,
+    ScriptPerformanceEvent = 0x7d,
+    ScriptHistoryEvent = 0x7e,
+    ScriptPortMessage = 0x7f,
+    ScriptWebGPUMsg = 0x80,
 
-    ScriptDatabaseAccessEvent = 0x80,
+    ScriptDatabaseAccessEvent = 0x81,
 
     /// Web performance metrics.
     TimeToFirstPaint = 0x90,
@@ -137,6 +137,7 @@ impl ProfilerCategory {
             ProfilerCategory::ScriptEvent => "ScriptEvent",
             ProfilerCategory::ScriptFileRead => "ScriptFileRead",
             ProfilerCategory::ScriptFontLoading => "ScriptFontLoading",
+            ProfilerCategory::ScriptGeolocationEvent => "ScriptGeolocationEvent",
             ProfilerCategory::ScriptImageCacheMsg => "ScriptImageCacheMsg",
             ProfilerCategory::ScriptInputEvent => "ScriptInputEvent",
             ProfilerCategory::ScriptNetworkEvent => "ScriptNetworkEvent",
@@ -197,9 +198,6 @@ pub fn profile<T, F>(
 where
     F: FnOnce() -> T,
 {
-    if opts::get().debug.signpost {
-        signpost::start(category as u32, &[0, 0, 0, (category as usize) >> 4]);
-    }
     let start_time = CrossProcessInstant::now();
     let val = {
         #[cfg(feature = "tracing")]
@@ -207,10 +205,6 @@ where
         callback()
     };
     let end_time = CrossProcessInstant::now();
-
-    if opts::get().debug.signpost {
-        signpost::end(category as u32, &[0, 0, 0, (category as usize) >> 4]);
-    }
 
     send_profile_data(category, meta, &profiler_chan, start_time, end_time);
     val

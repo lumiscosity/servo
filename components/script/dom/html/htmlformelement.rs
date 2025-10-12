@@ -337,12 +337,12 @@ impl HTMLFormElementMethods<crate::DomTypeHolder> for HTMLFormElement {
                 let owner = match submitters_owner {
                     Some(owner) => owner,
                     None => {
-                        return Err(Error::NotFound);
+                        return Err(Error::NotFound(None));
                     },
                 };
 
                 if *owner != *self {
-                    return Err(Error::NotFound);
+                    return Err(Error::NotFound(None));
                 }
 
                 submit_button
@@ -685,6 +685,7 @@ impl HTMLFormElement {
                 .get_string_attribute(&local_name!("accept-charset"));
 
             // Substep 2, 3, 4
+            let input = input.str();
             let mut candidate_encodings =
                 split_html_space_chars(&input).filter_map(|c| Encoding::for_label(c.as_bytes()));
 
@@ -829,7 +830,7 @@ impl HTMLFormElement {
             action = DOMString::from(base.as_str());
         }
         // Step 12-13
-        let action_components = match base.join(&action) {
+        let action_components = match base.join(&action.str()) {
             Ok(url) => url,
             Err(_) => return,
         };
@@ -879,6 +880,7 @@ impl HTMLFormElement {
             Some(target_window.as_global_scope().is_secure_context()),
             Some(target_document.insecure_requests_policy()),
             target_document.has_trustworthy_ancestor_origin(),
+            target_document.creation_sandboxing_flag_set_considering_parent_iframe(),
         );
 
         // Step 22
@@ -940,7 +942,7 @@ impl HTMLFormElement {
             &mut load_data.url,
             form_data
                 .iter()
-                .map(|field| (&*field.name, field.replace_value(charset))),
+                .map(|field| (field.name.str(), field.replace_value(charset))),
         );
 
         self.plan_to_navigate(load_data, target);
@@ -969,7 +971,7 @@ impl HTMLFormElement {
                     &mut url,
                     form_data
                         .iter()
-                        .map(|field| (&*field.name, field.replace_value(charset))),
+                        .map(|field| (field.name.str(), field.replace_value(charset))),
                 );
 
                 url.query().unwrap_or("").to_string().into_bytes()
@@ -1001,11 +1003,13 @@ impl HTMLFormElement {
         self.plan_to_navigate(load_data, target);
     }
 
-    fn set_url_query_pairs<'a>(
+    fn set_url_query_pairs<T>(
         &self,
         url: &mut servo_url::ServoUrl,
-        pairs: impl Iterator<Item = (&'a str, String)>,
-    ) {
+        pairs: impl Iterator<Item = (T, String)>,
+    ) where
+        T: AsRef<str>,
+    {
         let encoding = self.pick_encoding();
         url.as_mut_url()
             .query_pairs_mut()
@@ -1099,13 +1103,17 @@ impl HTMLFormElement {
     /// Interactively validate the constraints of form elements
     /// <https://html.spec.whatwg.org/multipage/#interactively-validate-the-constraints>
     fn interactive_validation(&self, can_gc: CanGc) -> Result<(), ()> {
-        // Step 1-2
+        // Step 1 - 2: Statically validate the constraints of form,
+        // and let `unhandled invalid controls` be the list of elements
+        // returned if the result was negative.
+        // If the result was positive, then return that result.
         let unhandled_invalid_controls = match self.static_validation(can_gc) {
             Ok(()) => return Ok(()),
             Err(err) => err,
         };
 
-        // Step 3
+        // Step 3: Report the problems with the constraints of at least one of the elements
+        // given in unhandled invalid controls to the user.
         let mut first = true;
 
         for elem in unhandled_invalid_controls {
@@ -1114,8 +1122,12 @@ impl HTMLFormElement {
             }
             if first {
                 if let Some(html_elem) = elem.downcast::<HTMLElement>() {
-                    // TODO: "Focusing steps" has a different meaning from the focus() method.
-                    // The actual focusing steps should be implemented
+                    // Step 3.1: User agents may focus one of those elements in the process,
+                    // by running the focusing steps for that element,
+                    // and may change the scrolling position of the document, or perform
+                    // some other action that brings the element to the user's attention.
+
+                    // Here we run focusing steps and scroll element into view.
                     html_elem.Focus(&FocusOptions::default(), can_gc);
                     first = false;
                 }
@@ -1148,7 +1160,7 @@ impl HTMLFormElement {
                 }
             })
             .collect::<Vec<DomRoot<Element>>>();
-        // Step 4
+        // Step 4: If invalid controls is empty, then return a positive result.
         if invalid_controls.is_empty() {
             return Ok(());
         }
@@ -1156,10 +1168,13 @@ impl HTMLFormElement {
         let unhandled_invalid_controls = invalid_controls
             .into_iter()
             .filter_map(|field| {
-                let event = field
+                // Step 6.1: Let notCanceled be the result of firing an event named invalid at
+                // field, with the cancelable attribute initialized to true.
+                let not_canceled = field
                     .upcast::<EventTarget>()
                     .fire_cancelable_event(atom!("invalid"), can_gc);
-                if !event.DefaultPrevented() {
+                // Step 6.2: If notCanceled is true, then add field to unhandled invalid controls.
+                if not_canceled {
                     return Some(field);
                 }
                 None
@@ -1302,6 +1317,7 @@ impl HTMLFormElement {
         Some(form_data.datums())
     }
 
+    /// <https://html.spec.whatwg.org/multipage/#dom-form-reset>
     pub(crate) fn reset(&self, _reset_method_flag: ResetFrom, can_gc: CanGc) {
         // https://html.spec.whatwg.org/multipage/#locked-for-reset
         if self.marked_for_reset.get() {
@@ -1310,10 +1326,13 @@ impl HTMLFormElement {
             self.marked_for_reset.set(true);
         }
 
-        let event = self
+        // https://html.spec.whatwg.org/multipage/#concept-form-reset
+        // Let reset be the result of firing an event named reset at form,
+        // with the bubbles and cancelable attributes initialized to true.
+        let reset = self
             .upcast::<EventTarget>()
             .fire_bubbling_cancelable_event(atom!("reset"), can_gc);
-        if event.DefaultPrevented() {
+        if !reset {
             return;
         }
 
@@ -1476,7 +1495,7 @@ impl FormSubmitterElement<'_> {
                 |f| f.Enctype(),
             ),
         };
-        match &*attr {
+        match &*attr.str() {
             "multipart/form-data" => FormEncType::MultipartFormData,
             "text/plain" => FormEncType::TextPlain,
             // https://html.spec.whatwg.org/multipage/#attr-fs-enctype
@@ -1499,7 +1518,7 @@ impl FormSubmitterElement<'_> {
                 |f| f.Method(),
             ),
         };
-        match &*attr {
+        match &*attr.str() {
             "dialog" => FormMethod::Dialog,
             "post" => FormMethod::Post,
             _ => FormMethod::Get,
@@ -1881,10 +1900,10 @@ pub(crate) fn encode_multipart_form_data(
     let mut result = vec![];
 
     // Newline replacement routine as described in Step 1
-    fn clean_crlf(s: &str) -> DOMString {
+    fn clean_crlf(s: &DOMString) -> DOMString {
         let mut buf = "".to_owned();
         let mut prev = ' ';
-        for ch in s.chars() {
+        for ch in s.str().chars() {
             match ch {
                 '\n' if prev != '\r' => {
                     buf.push('\r');
@@ -1941,15 +1960,12 @@ pub(crate) fn encode_multipart_form_data(
             FormDatumValue::File(ref f) => {
                 let charset = encoding.name();
                 let extra = if charset.to_lowercase() == "utf-8" {
-                    format!(
-                        "filename=\"{}\"",
-                        String::from_utf8(f.name().as_bytes().into()).unwrap()
-                    )
+                    format!("filename=\"{}\"", String::from(f.name().str()))
                 } else {
                     format!(
                         "filename*=\"{}\"''{}",
                         charset,
-                        http_percent_encode(f.name().as_bytes())
+                        http_percent_encode(&f.name().as_bytes())
                     )
                 };
 

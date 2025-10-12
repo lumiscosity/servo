@@ -238,10 +238,13 @@ impl MimeClassifier {
     }
 
     /// <https://mimesniff.spec.whatwg.org/#xml-mime-type>
+    /// SVG is worth distinguishing from other XML MIME types:
+    /// <https://mimesniff.spec.whatwg.org/#mime-type-miscellaneous>
     fn is_xml(mt: &Mime) -> bool {
-        mt.suffix() == Some(mime::XML) ||
-            mt.essence_str() == "text/xml" ||
-            mt.essence_str() == "application/xml"
+        !Self::is_image(mt) &&
+            (mt.suffix() == Some(mime::XML) ||
+                mt.essence_str() == "text/xml" ||
+                mt.essence_str() == "application/xml")
     }
 
     /// <https://mimesniff.spec.whatwg.org/#html-mime-type>
@@ -268,7 +271,7 @@ impl MimeClassifier {
     }
 
     /// <https://mimesniff.spec.whatwg.org/#javascript-mime-type>
-    fn is_javascript(mt: &Mime) -> bool {
+    pub fn is_javascript(mt: &Mime) -> bool {
         (mt.type_() == mime::APPLICATION &&
             (["ecmascript", "javascript", "x-ecmascript", "x-javascript"]
                 .contains(&mt.subtype().as_str()))) ||
@@ -291,7 +294,7 @@ impl MimeClassifier {
     }
 
     /// <https://mimesniff.spec.whatwg.org/#json-mime-type>
-    fn is_json(mt: &Mime) -> bool {
+    pub fn is_json(mt: &Mime) -> bool {
         mt.suffix() == Some(mime::JSON) ||
             (mt.subtype() == mime::JSON &&
                 (mt.type_() == mime::APPLICATION || mt.type_() == mime::TEXT))

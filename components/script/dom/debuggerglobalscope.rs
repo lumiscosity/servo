@@ -22,6 +22,7 @@ use script_bindings::codegen::GenericBindings::DebuggerGlobalScopeBinding::{
 use script_bindings::realms::InRealm;
 use script_bindings::reflector::DomObject;
 use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
+use storage_traits::StorageThreads;
 
 use crate::dom::bindings::codegen::Bindings::DebuggerGlobalScopeBinding;
 use crate::dom::bindings::error::report_pending_exception;
@@ -68,6 +69,7 @@ impl DebuggerGlobalScope {
         script_to_constellation_chan: ScriptToConstellationChan,
         script_to_embedder_chan: ScriptToEmbedderChan,
         resource_threads: ResourceThreads,
+        storage_threads: StorageThreads,
         #[cfg(feature = "webgpu")] gpu_id_hub: std::sync::Arc<IdentityHub>,
         can_gc: CanGc,
     ) -> DomRoot<Self> {
@@ -80,6 +82,7 @@ impl DebuggerGlobalScope {
                 script_to_constellation_chan,
                 script_to_embedder_chan,
                 resource_threads,
+                storage_threads,
                 MutableOrigin::new(ImmutableOrigin::new_opaque()),
                 ServoUrl::parse_with_base(None, "about:internal/debugger")
                     .expect("Guaranteed by argument"),
@@ -213,7 +216,7 @@ impl DebuggerGlobalScopeMethods<crate::DomTypeHolder> for DebuggerGlobalScope {
             // (currently impossible to do robustly due to <https://bugzilla.mozilla.org/show_bug.cgi?id=1982001>)
             let url_original = args.url.str();
             // FIXME: use page/worker url as base here
-            let url_original = ServoUrl::parse(url_original).ok();
+            let url_original = ServoUrl::parse(&url_original).ok();
 
             // If the source has a `urlOverride` (aka `displayURL` aka `//# sourceURL`), it should be a valid url,
             // possibly relative to the page/worker url, and we should treat the source as coming from that url for
@@ -224,7 +227,7 @@ impl DebuggerGlobalScopeMethods<crate::DomTypeHolder> for DebuggerGlobalScope {
                 .as_ref()
                 .map(|url| url.str())
                 // FIXME: use page/worker url as base here, not `url_original`
-                .and_then(|url| ServoUrl::parse_with_base(url_original.as_ref(), url).ok());
+                .and_then(|url| ServoUrl::parse_with_base(url_original.as_ref(), &url).ok());
 
             // If the `introductionType` is “eval or eval-like”, the `url` won’t be meaningful, so ignore these
             // sources unless we have a `urlOverride` (aka `displayURL` aka `//# sourceURL`).
@@ -238,7 +241,7 @@ impl DebuggerGlobalScopeMethods<crate::DomTypeHolder> for DebuggerGlobalScope {
                 IntroductionType::EVENT_HANDLER_STR,
                 IntroductionType::DOM_TIMER_STR,
             ]
-            .contains(&introduction_type.str()) &&
+            .contains(&&*introduction_type.str()) &&
                 url_override.is_none()
             {
                 debug!(

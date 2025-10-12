@@ -16,6 +16,7 @@ use crate::dom::globalscope::GlobalScope;
 use crate::script_runtime::CanGc;
 
 /// <https://html.spec.whatwg.org/multipage/#the-drag-data-item-kind>
+#[derive(MallocSizeOf)]
 pub(crate) enum Kind {
     Text {
         data: DOMString,
@@ -58,7 +59,7 @@ impl Kind {
         }
     }
 
-    fn text_type_matches(&self, text_type: &str) -> bool {
+    fn text_type_matches(&self, text_type: &DOMString) -> bool {
         matches!(self, Kind::Text { type_, .. } if type_.eq(text_type))
     }
 
@@ -68,15 +69,16 @@ impl Kind {
 }
 
 /// <https://html.spec.whatwg.org/multipage/#drag-data-store-bitmap>
-#[allow(dead_code)] // TODO this used by DragEvent.
+#[derive(MallocSizeOf)]
 struct Bitmap {
+    #[ignore_malloc_size_of = "RasterImage"]
     image: Option<Arc<RasterImage>>,
     x: i32,
     y: i32,
 }
 
 /// Control the behaviour of the drag data store
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, MallocSizeOf, PartialEq)]
 pub(crate) enum Mode {
     /// <https://html.spec.whatwg.org/multipage/#concept-dnd-rw>
     ReadWrite,
@@ -86,7 +88,7 @@ pub(crate) enum Mode {
     Protected,
 }
 
-#[allow(dead_code)] // TODO some fields are used by DragEvent.
+#[derive(MallocSizeOf)]
 pub(crate) struct DragDataStore {
     /// <https://html.spec.whatwg.org/multipage/#drag-data-store-item-list>
     item_list: IndexMap<u16, Kind>,
@@ -153,7 +155,7 @@ impl DragDataStore {
         types
     }
 
-    pub(crate) fn find_matching_text(&self, type_: &str) -> Option<DOMString> {
+    pub(crate) fn find_matching_text(&self, type_: &DOMString) -> Option<DOMString> {
         self.item_list
             .values()
             .find(|item| item.text_type_matches(type_))
@@ -277,7 +279,7 @@ fn normalize_mime(mut format: DOMString) -> DOMString {
     // Convert format to ASCII lowercase.
     format.make_ascii_lowercase();
 
-    match format.as_ref() {
+    match &*format.str() {
         // If format equals "text", change it to "text/plain".
         "text" => DOMString::from("text/plain"),
         // If format equals "url", change it to "text/uri-list".

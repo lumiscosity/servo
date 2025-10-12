@@ -7,29 +7,25 @@
 use std::borrow::ToOwned;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::prelude::*;
-use std::io::{self, BufReader, BufWriter};
+use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::thread;
-use std::time::Duration;
 
-use base::generic_channel::GenericSender;
 use base::id::CookieStoreId;
+use base::threadpool::ThreadPool;
 use cookie::Cookie;
 use crossbeam_channel::Sender;
 use devtools_traits::DevtoolsControlMsg;
 use embedder_traits::EmbedderProxy;
 use hyper_serde::Serde;
 use ipc_channel::ipc::{self, IpcReceiver, IpcReceiverSet, IpcSender};
-use log::{debug, trace, warn};
+use log::{debug, warn};
 use net_traits::blob_url_store::parse_blob_url;
 use net_traits::filemanager_thread::FileTokenCheck;
-use net_traits::indexeddb_thread::IndexedDBThreadMsg;
 use net_traits::pub_domains::public_suffix_list_size_of;
 use net_traits::request::{Destination, RequestBuilder, RequestId};
 use net_traits::response::{Response, ResponseInit};
-use net_traits::storage_thread::StorageThreadMsg;
 use net_traits::{
     AsyncRuntime, CookieAsyncResponse, CookieData, CookieSource, CoreResourceMsg,
     CoreResourceThread, CustomResponseMediator, DiscardFetch, FetchChannels, FetchTaskTarget,
@@ -61,10 +57,8 @@ use crate::filemanager_thread::FileManager;
 use crate::hsts::{self, HstsList};
 use crate::http_cache::HttpCache;
 use crate::http_loader::{HttpState, http_redirect_fetch};
-use crate::indexeddb::idb_thread::IndexedDBThreadFactory;
 use crate::protocols::ProtocolRegistry;
 use crate::request_interceptor::RequestInterceptor;
-use crate::storage_thread::StorageThreadFactory;
 use crate::websocket_loader;
 
 /// Load a file with CA certificate and produce a RootCertStore with the results.
@@ -113,12 +107,9 @@ pub fn new_resource_threads(
         ignore_certificate_errors,
         protocols,
     );
-    let idb: IpcSender<IndexedDBThreadMsg> = IndexedDBThreadFactory::new(config_dir.clone());
-    let storage: GenericSender<StorageThreadMsg> =
-        StorageThreadFactory::new(config_dir, mem_profiler_chan);
     (
-        ResourceThreads::new(public_core, storage.clone(), idb.clone()),
-        ResourceThreads::new(private_core, storage, idb),
+        ResourceThreads::new(public_core),
+        ResourceThreads::new(private_core),
         async_runtime,
     )
 }
@@ -198,9 +189,9 @@ fn create_http_states(
     let http_cache = HttpCache::default();
     let mut cookie_jar = CookieStorage::new(150);
     if let Some(config_dir) = config_dir {
-        read_json_from_file(&mut auth_cache, config_dir, "auth_cache.json");
-        read_json_from_file(&mut hsts_list, config_dir, "hsts_list.json");
-        read_json_from_file(&mut cookie_jar, config_dir, "cookie_jar.json");
+        base::read_json_from_file(&mut auth_cache, config_dir, "auth_cache.json");
+        base::read_json_from_file(&mut hsts_list, config_dir, "hsts_list.json");
+        base::read_json_from_file(&mut cookie_jar, config_dir, "cookie_jar.json");
     }
 
     let override_manager = CertificateErrorOverrideManager::new();
@@ -532,16 +523,16 @@ impl ResourceChannelManager {
                 if let Some(ref config_dir) = self.config_dir {
                     match http_state.auth_cache.read() {
                         Ok(auth_cache) => {
-                            write_json_to_file(&*auth_cache, config_dir, "auth_cache.json")
+                            base::write_json_to_file(&*auth_cache, config_dir, "auth_cache.json")
                         },
                         Err(_) => warn!("Error writing auth cache to disk"),
                     }
                     match http_state.cookie_jar.read() {
-                        Ok(jar) => write_json_to_file(&*jar, config_dir, "cookie_jar.json"),
+                        Ok(jar) => base::write_json_to_file(&*jar, config_dir, "cookie_jar.json"),
                         Err(_) => warn!("Error writing cookie jar to disk"),
                     }
                     match http_state.hsts_list.read() {
-                        Ok(hsts) => write_json_to_file(&*hsts, config_dir, "hsts_list.json"),
+                        Ok(hsts) => base::write_json_to_file(&*hsts, config_dir, "hsts_list.json"),
                         Err(_) => warn!("Error writing hsts list to disk"),
                     }
                 }
@@ -552,49 +543,6 @@ impl ResourceChannelManager {
         }
         true
     }
-}
-
-pub fn read_json_from_file<T>(data: &mut T, config_dir: &Path, filename: &str)
-where
-    T: for<'de> Deserialize<'de>,
-{
-    let path = config_dir.join(filename);
-    let display = path.display();
-
-    let mut file = match File::open(&path) {
-        Err(why) => {
-            warn!("couldn't open {}: {}", display, why);
-            return;
-        },
-        Ok(file) => file,
-    };
-
-    let mut string_buffer: String = String::new();
-    match file.read_to_string(&mut string_buffer) {
-        Err(why) => panic!("couldn't read from {}: {}", display, why),
-        Ok(_) => trace!("successfully read from {}", display),
-    }
-
-    match serde_json::from_str(&string_buffer) {
-        Ok(decoded_buffer) => *data = decoded_buffer,
-        Err(why) => warn!("Could not decode buffer{}", why),
-    }
-}
-
-pub fn write_json_to_file<T>(data: &T, config_dir: &Path, filename: &str)
-where
-    T: Serialize,
-{
-    let path = config_dir.join(filename);
-    let display = path.display();
-
-    let mut file = match File::create(&path) {
-        Err(why) => panic!("couldn't create {}: {}", display, why),
-        Ok(file) => file,
-    };
-    let mut writer = BufWriter::new(&mut file);
-    serde_json::to_writer_pretty(&mut writer, data).expect("Could not serialize to file");
-    trace!("successfully wrote to {display}");
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -623,139 +571,9 @@ pub struct CoreResourceManager {
     sw_managers: HashMap<ImmutableOrigin, IpcSender<CustomResponseMediator>>,
     filemanager: FileManager,
     request_interceptor: RequestInterceptor,
-    thread_pool: Arc<CoreResourceThreadPool>,
+    thread_pool: Arc<ThreadPool>,
     ca_certificates: CACertificates,
     ignore_certificate_errors: bool,
-}
-
-/// The state of the thread-pool used by CoreResource.
-struct ThreadPoolState {
-    /// The number of active workers.
-    active_workers: u32,
-    /// Whether the pool can spawn additional work.
-    active: bool,
-}
-
-impl ThreadPoolState {
-    pub fn new() -> ThreadPoolState {
-        ThreadPoolState {
-            active_workers: 0,
-            active: true,
-        }
-    }
-
-    /// Is the pool still able to spawn new work?
-    pub fn is_active(&self) -> bool {
-        self.active
-    }
-
-    /// How many workers are currently active?
-    pub fn active_workers(&self) -> u32 {
-        self.active_workers
-    }
-
-    /// Prevent additional work from being spawned.
-    pub fn switch_to_inactive(&mut self) {
-        self.active = false;
-    }
-
-    /// Add to the count of active workers.
-    pub fn increment_active(&mut self) {
-        self.active_workers += 1;
-    }
-
-    /// Substract from the count of active workers.
-    pub fn decrement_active(&mut self) {
-        self.active_workers -= 1;
-    }
-}
-
-/// Threadpool used by Fetch and file operations.
-pub struct CoreResourceThreadPool {
-    pool: rayon::ThreadPool,
-    state: Arc<Mutex<ThreadPoolState>>,
-}
-
-impl CoreResourceThreadPool {
-    pub fn new(num_threads: usize, pool_name: String) -> CoreResourceThreadPool {
-        debug!("Creating new CoreResourceThreadPool with {num_threads} threads!");
-        let pool = rayon::ThreadPoolBuilder::new()
-            .thread_name(move |i| format!("{pool_name}#{i}"))
-            .num_threads(num_threads)
-            .build()
-            .unwrap();
-        let state = Arc::new(Mutex::new(ThreadPoolState::new()));
-        CoreResourceThreadPool { pool, state }
-    }
-
-    /// Spawn work on the thread-pool, if still active.
-    ///
-    /// There is no need to give feedback to the caller,
-    /// because if we do not perform work,
-    /// it is because the system as a whole is exiting.
-    pub fn spawn<OP>(&self, work: OP)
-    where
-        OP: FnOnce() + Send + 'static,
-    {
-        {
-            let mut state = self.state.lock().unwrap();
-            if state.is_active() {
-                state.increment_active();
-            } else {
-                // Don't spawn any work.
-                return;
-            }
-        }
-
-        let state = self.state.clone();
-
-        self.pool.spawn(move || {
-            {
-                let mut state = state.lock().unwrap();
-                if !state.is_active() {
-                    // Decrement number of active workers and return,
-                    // without doing any work.
-                    return state.decrement_active();
-                }
-            }
-            // Perform work.
-            work();
-            {
-                // Decrement number of active workers.
-                let mut state = state.lock().unwrap();
-                state.decrement_active();
-            }
-        });
-    }
-
-    /// Prevent further work from being spawned,
-    /// and wait until all workers are done,
-    /// or a timeout of roughly one second has been reached.
-    pub fn exit(&self) {
-        {
-            let mut state = self.state.lock().unwrap();
-            state.switch_to_inactive();
-        }
-        let mut rounds = 0;
-        loop {
-            rounds += 1;
-            {
-                let state = self.state.lock().unwrap();
-                let still_active = state.active_workers();
-
-                if still_active == 0 || rounds == 10 {
-                    if still_active > 0 {
-                        debug!(
-                            "Exiting CoreResourceThreadPool with {:?} still working(should be zero)",
-                            still_active
-                        );
-                    }
-                    break;
-                }
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-    }
 }
 
 impl CoreResourceManager {
@@ -770,7 +588,7 @@ impl CoreResourceManager {
             .map(|i| i.get())
             .unwrap_or(servo_config::pref!(threadpools_fallback_worker_num) as usize)
             .min(servo_config::pref!(threadpools_resource_workers_max).max(1) as usize);
-        let pool = CoreResourceThreadPool::new(num_threads, "CoreResourceThreadPool".to_string());
+        let pool = ThreadPool::new(num_threads, "CoreResourceThreadPool".to_string());
         let pool_handle = Arc::new(pool);
         CoreResourceManager {
             devtools_sender,

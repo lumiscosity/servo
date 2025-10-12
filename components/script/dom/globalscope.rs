@@ -14,6 +14,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{mem, ptr};
 
+use base::IpcSend;
 use base::id::{
     BlobId, BroadcastChannelRouterId, MessagePortId, MessagePortRouterId, PipelineId,
     ServiceWorkerId, ServiceWorkerRegistrationId, WebViewId,
@@ -52,13 +53,14 @@ use net_traits::policy_container::PolicyContainer;
 use net_traits::request::{InsecureRequestsPolicy, Referrer, RequestBuilder};
 use net_traits::response::HttpsState;
 use net_traits::{
-    CoreResourceMsg, CoreResourceThread, FetchResponseListener, IpcSend, ReferrerPolicy,
-    ResourceThreads, fetch_async,
+    CoreResourceMsg, CoreResourceThread, FetchResponseListener, ReferrerPolicy, ResourceThreads,
+    fetch_async,
 };
 use profile_traits::{ipc as profile_ipc, mem as profile_mem, time as profile_time};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use script_bindings::interfaces::GlobalScopeHelpers;
 use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
+use storage_traits::StorageThreads;
 use timers::{TimerEventRequest, TimerId};
 use uuid::Uuid;
 #[cfg(feature = "webgpu")]
@@ -84,7 +86,9 @@ use crate::dom::bindings::codegen::Bindings::VoidFunctionBinding::VoidFunction;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::codegen::Bindings::WorkerGlobalScopeBinding::WorkerGlobalScopeMethods;
 use crate::dom::bindings::conversions::{root_from_object, root_from_object_static};
-use crate::dom::bindings::error::{Error, ErrorInfo, report_pending_exception};
+use crate::dom::bindings::error::{
+    Error, ErrorInfo, report_pending_exception, take_and_report_pending_exception_for_api,
+};
 use crate::dom::bindings::frozenarray::CachedFrozenArray;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::{Trusted, TrustedPromise};
@@ -144,17 +148,20 @@ use crate::timers::{
 };
 use crate::unminify::unminified_path;
 
-#[derive(JSTraceable)]
+#[derive(JSTraceable, MallocSizeOf)]
 pub(crate) struct AutoCloseWorker {
     /// <https://html.spec.whatwg.org/multipage/#dom-workerglobalscope-closing>
+    #[conditional_malloc_size_of]
     closing: Arc<AtomicBool>,
     /// A handle to join on the worker thread.
+    #[ignore_malloc_size_of = "JoinHandle"]
     join_handle: Option<JoinHandle<()>>,
     /// A sender of control messages,
     /// currently only used to signal shutdown.
     #[no_trace]
     control_sender: Sender<DedicatedWorkerControlMsg>,
     /// The context to request an interrupt on the worker thread.
+    #[ignore_malloc_size_of = "mozjs"]
     #[no_trace]
     context: ThreadSafeJSContext,
 }
@@ -268,9 +275,14 @@ pub(crate) struct GlobalScope {
     in_error_reporting_mode: Cell<bool>,
 
     /// Associated resource threads for use by DOM objects like XMLHttpRequest,
-    /// including resource_thread, filemanager_thread and storage_thread
+    /// including resource_thread and filemanager_thread
     #[no_trace]
     resource_threads: ResourceThreads,
+
+    /// Associated resource threads for use by DOM objects like XMLHttpRequest,
+    /// including indexeddb_thread and storage_thread
+    #[no_trace]
+    storage_threads: StorageThreads,
 
     /// The mechanism by which time-outs and intervals are scheduled.
     /// <https://html.spec.whatwg.org/multipage/#timers>
@@ -297,11 +309,10 @@ pub(crate) struct GlobalScope {
     /// same microtask queue.
     ///
     /// <https://html.spec.whatwg.org/multipage/#microtask-queue>
-    #[ignore_malloc_size_of = "Rc<T> is hard"]
+    #[conditional_malloc_size_of]
     microtask_queue: Rc<MicrotaskQueue>,
 
     /// Vector storing closing references of all workers
-    #[ignore_malloc_size_of = "Arc"]
     list_auto_close_worker: DomRefCell<Vec<AutoCloseWorker>>,
 
     /// Vector storing references of all eventsources.
@@ -372,17 +383,17 @@ pub(crate) struct GlobalScope {
     /// `size` getter of `ByteLengthQueuingStrategy` is called.
     ///
     /// <https://streams.spec.whatwg.org/#byte-length-queuing-strategy-size-function>
-    #[ignore_malloc_size_of = "Rc<T> is hard"]
+    #[ignore_malloc_size_of = "callbacks are hard"]
     byte_length_queuing_strategy_size_function: OnceCell<Rc<Function>>,
 
     /// The count queuing strategy size function that will be initialized once
     /// `size` getter of `CountQueuingStrategy` is called.
     ///
     /// <https://streams.spec.whatwg.org/#count-queuing-strategy-size-function>
-    #[ignore_malloc_size_of = "Rc<T> is hard"]
+    #[ignore_malloc_size_of = "callbacks are hard"]
     count_queuing_strategy_size_function: OnceCell<Rc<Function>>,
 
-    #[ignore_malloc_size_of = "Rc<T> is hard"]
+    #[ignore_malloc_size_of = "callbacks are hard"]
     notification_permission_request_callback_map:
         DomRefCell<HashMap<String, Rc<NotificationPermissionCallback>>>,
 
@@ -753,6 +764,7 @@ impl GlobalScope {
         script_to_constellation_chan: ScriptToConstellationChan,
         script_to_embedder_chan: ScriptToEmbedderChan,
         resource_threads: ResourceThreads,
+        storage_threads: StorageThreads,
         origin: MutableOrigin,
         creation_url: ServoUrl,
         top_level_creation_url: Option<ServoUrl>,
@@ -784,6 +796,7 @@ impl GlobalScope {
             script_to_embedder_chan,
             in_error_reporting_mode: Default::default(),
             resource_threads,
+            storage_threads,
             timers: OnceCell::default(),
             origin,
             creation_url,
@@ -2422,7 +2435,7 @@ impl GlobalScope {
     /// Computes the delta time since a label has been created
     ///
     /// Returns an error if the label does not exist.
-    pub(crate) fn time_log(&self, label: &str) -> Result<u64, ()> {
+    pub(crate) fn time_log(&self, label: &DOMString) -> Result<u64, ()> {
         self.console_timers
             .borrow()
             .get(label)
@@ -2434,7 +2447,7 @@ impl GlobalScope {
     /// tracking the label.
     ///
     /// Returns an error if the label does not exist.
-    pub(crate) fn time_end(&self, label: &str) -> Result<u64, ()> {
+    pub(crate) fn time_end(&self, label: &DOMString) -> Result<u64, ()> {
         self.console_timers
             .borrow_mut()
             .remove(label)
@@ -2760,6 +2773,11 @@ impl GlobalScope {
         self.resource_threads().sender()
     }
 
+    /// Get a reference to the [`StorageThreads`] for this [`GlobalScope`].
+    pub(crate) fn storage_threads(&self) -> &StorageThreads {
+        &self.storage_threads
+    }
+
     /// A sender to the event loop of this global scope. This either sends to the Worker event loop
     /// or the ScriptThread event loop in the case of a `Window`. This can be `None` for dedicated
     /// workers that are not currently handling a message.
@@ -2848,7 +2866,7 @@ impl GlobalScope {
                     compiled_script.set(Compile1(
                         *cx,
                         options.ptr,
-                        &mut transform_str_to_source_text(text_code),
+                        &mut transform_str_to_source_text(&text_code.str()),
                     ));
 
                     if compiled_script.is_null() {
@@ -2903,8 +2921,9 @@ impl GlobalScope {
 
             if !result {
                 debug!("error evaluating Dom string");
-                report_pending_exception(cx, true, InRealm::Entered(&ar), can_gc);
-                return Err(JavaScriptEvaluationError::EvaluationFailure);
+                let error_info =
+                    take_and_report_pending_exception_for_api(cx, InRealm::Entered(&ar), can_gc);
+                return Err(JavaScriptEvaluationError::EvaluationFailure(error_info));
             }
 
             maybe_resume_unwind();

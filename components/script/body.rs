@@ -234,6 +234,7 @@ impl TransmitBodyConnectHandler {
             task!(setup_native_body_promise_handler: move || {
                 let rooted_stream = stream.root();
                 let global = rooted_stream.global();
+                let cx = GlobalScope::get_cx();
 
                 // Step 4, the result of reading a chunk from body’s stream with reader.
                 let promise = rooted_stream.read_a_chunk(CanGc::note());
@@ -241,20 +242,20 @@ impl TransmitBodyConnectHandler {
                 // Step 5, the parallel steps waiting for and handling the result of the read promise,
                 // are a combination of the promise native handler here,
                 // and the corresponding IPC route in `component::net::http_loader`.
-                let promise_handler = Box::new(TransmitBodyPromiseHandler {
+                rooted!(in(*cx) let mut promise_handler = Some(TransmitBodyPromiseHandler {
                     bytes_sender: bytes_sender.clone(),
                     stream: Dom::from_ref(&rooted_stream.clone()),
                     control_sender: control_sender.clone(),
-                });
+                }));
 
-                let rejection_handler = Box::new(TransmitBodyPromiseRejectionHandler {
+                rooted!(in(*cx) let mut rejection_handler = Some(TransmitBodyPromiseRejectionHandler {
                     bytes_sender,
                     stream: Dom::from_ref(&rooted_stream.clone()),
                     control_sender,
-                });
+                }));
 
                 let handler =
-                    PromiseNativeHandler::new(&global, Some(promise_handler), Some(rejection_handler), CanGc::note());
+                    PromiseNativeHandler::new(&global, promise_handler.take().map(|h| Box::new(h) as Box<_>), rejection_handler.take().map(|h| Box::new(h) as Box<_>), CanGc::note());
 
                 let realm = enter_realm(&*global);
                 let comp = InRealm::Entered(&realm);
@@ -277,6 +278,8 @@ struct TransmitBodyPromiseHandler {
     #[no_trace]
     control_sender: IpcSender<BodyChunkRequest>,
 }
+
+impl js::gc::Rootable for TransmitBodyPromiseHandler {}
 
 impl Callback for TransmitBodyPromiseHandler {
     /// Step 5 of <https://fetch.spec.whatwg.org/#concept-request-transmit-body>
@@ -332,6 +335,8 @@ struct TransmitBodyPromiseRejectionHandler {
     control_sender: IpcSender<BodyChunkRequest>,
 }
 
+impl js::gc::Rootable for TransmitBodyPromiseRejectionHandler {}
+
 impl Callback for TransmitBodyPromiseRejectionHandler {
     /// <https://fetch.spec.whatwg.org/#concept-request-transmit-body>
     fn callback(&self, _cx: JSContext, _v: HandleValue, _realm: InRealm, can_gc: CanGc) {
@@ -341,11 +346,15 @@ impl Callback for TransmitBodyPromiseRejectionHandler {
     }
 }
 
-/// The result of <https://fetch.spec.whatwg.org/#concept-bodyinit-extract>
+/// <https://fetch.spec.whatwg.org/#body-with-type>
 pub(crate) struct ExtractedBody {
+    /// <https://fetch.spec.whatwg.org/#concept-body-stream>
     pub(crate) stream: DomRoot<ReadableStream>,
+    /// <https://fetch.spec.whatwg.org/#concept-body-source>
     pub(crate) source: BodySource,
+    /// <https://fetch.spec.whatwg.org/#concept-body-total-bytes>
     pub(crate) total_bytes: Option<usize>,
+    /// <https://fetch.spec.whatwg.org/#body-with-type-type>
     pub(crate) content_type: Option<DOMString>,
 }
 
@@ -507,7 +516,7 @@ impl Extractable for Vec<u8> {
 impl Extractable for Blob {
     fn extract(&self, _global: &GlobalScope, can_gc: CanGc) -> Fallible<ExtractedBody> {
         let blob_type = self.Type();
-        let content_type = if blob_type.as_ref().is_empty() {
+        let content_type = if blob_type.is_empty() {
             None
         } else {
             Some(blob_type)
@@ -617,7 +626,7 @@ pub(crate) fn consume_body<T: BodyMixin + DomObject>(
     let promise = Promise::new_in_current_realm(comp, can_gc);
 
     // If object is unusable, then return a promise rejected with a TypeError.
-    if object.is_disturbed() || object.is_locked() {
+    if object.is_unusable() {
         promise.reject_error(
             Error::Type("The body's stream is disturbed or locked".to_string()),
             can_gc,
@@ -874,12 +883,12 @@ pub(crate) fn decode_to_utf16_with_bom_removal(
 
 /// <https://fetch.spec.whatwg.org/#body>
 pub(crate) trait BodyMixin {
-    /// <https://fetch.spec.whatwg.org/#concept-body-disturbed>
-    fn is_disturbed(&self) -> bool;
+    /// <https://fetch.spec.whatwg.org/#dom-body-bodyused>
+    fn is_body_used(&self) -> bool;
+    /// <https://fetch.spec.whatwg.org/#body-unusable>
+    fn is_unusable(&self) -> bool;
     /// <https://fetch.spec.whatwg.org/#dom-body-body>
     fn body(&self) -> Option<DomRoot<ReadableStream>>;
-    /// <https://fetch.spec.whatwg.org/#concept-body-locked>
-    fn is_locked(&self) -> bool;
     /// <https://fetch.spec.whatwg.org/#concept-body-mime-type>
     fn get_mime_type(&self, can_gc: CanGc) -> Vec<u8>;
 }

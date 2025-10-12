@@ -26,7 +26,6 @@ pub(crate) struct NodeIterator {
     reference_node: MutDom<Node>,
     pointer_before_reference_node: Cell<bool>,
     what_to_show: u32,
-    #[ignore_malloc_size_of = "Rc<NodeFilter> has shared ownership, so its size cannot be measured accurately"]
     filter: Filter,
     active: Cell<bool>,
 }
@@ -201,7 +200,7 @@ impl NodeIterator {
     fn accept_node(&self, node: &Node, can_gc: CanGc) -> Fallible<u16> {
         // Step 1.
         if self.active.get() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
         // Step 2.
         let n = node.NodeType() - 1;
@@ -227,8 +226,8 @@ impl NodeIterator {
     }
 }
 
-#[derive(JSTraceable)]
+#[derive(JSTraceable, MallocSizeOf)]
 pub(crate) enum Filter {
     None,
-    Callback(Rc<NodeFilter>),
+    Callback(#[ignore_malloc_size_of = "callbacks are hard"] Rc<NodeFilter>),
 }

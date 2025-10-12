@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 #[cfg(any(target_os = "android", target_env = "ohos"))]
 use std::sync::OnceLock;
-use std::{env, process};
+use std::{env, fmt, process};
 
 use bpaf::*;
 use euclid::Size2D;
@@ -71,6 +71,8 @@ pub(crate) struct ServoShellPreferences {
     /// An override for the screen resolution. This is useful for testing behavior on different screen sizes,
     /// such as the screen of a mobile device.
     pub screen_size_override: Option<Size2D<u32, DeviceIndependentPixel>>,
+    /// Whether or not to simulate touch events using mouse events.
+    pub simulate_touch_events: bool,
     /// If not-None, the path to a file to output the default WebView's rendered output
     /// after waiting for a stable image, this implies `Self::exit_after_load`.
     pub output_image_path: Option<String>,
@@ -82,15 +84,12 @@ pub(crate) struct ServoShellPreferences {
     /// `None` to disable WebDriver or `Some` with a port number to start a server to listen to
     /// remote WebDriver commands.
     pub webdriver_port: Option<u16>,
-
     /// Whether the CLI option to enable experimental prefs was present at startup.
     pub experimental_prefs_enabled: bool,
-
     /// Log filter given in the `log_filter` spec as a String, if any.
     /// If a filter is passed, the logger should adjust accordingly.
     #[cfg(target_env = "ohos")]
     pub log_filter: Option<String>,
-
     /// Log also to a file
     #[cfg(target_env = "ohos")]
     pub log_to_file: bool,
@@ -106,6 +105,7 @@ impl Default for ServoShellPreferences {
             initial_window_size: Size2D::new(1024, 740),
             no_native_titlebar: true,
             screen_size_override: None,
+            simulate_touch_events: false,
             searchpage: "https://duckduckgo.com/html/?q=%s".into(),
             tracing_filter: None,
             url: None,
@@ -221,18 +221,48 @@ pub(crate) enum ArgumentParsingResult {
     ErrorParsing,
 }
 
+enum ParseResolutionError {
+    InvalidFormat,
+    ZeroDimension,
+    ParseError(std::num::ParseIntError),
+}
+
+impl fmt::Display for ParseResolutionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseResolutionError::InvalidFormat => write!(f, "invalid resolution format"),
+            ParseResolutionError::ZeroDimension => {
+                write!(f, "width and height must be greater than 0")
+            },
+            ParseResolutionError::ParseError(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 /// Parse a resolution string into a Size2D.
 fn parse_resolution_string(
     string: String,
-) -> Result<Option<Size2D<u32, DeviceIndependentPixel>>, std::num::ParseIntError> {
+) -> Result<Option<Size2D<u32, DeviceIndependentPixel>>, ParseResolutionError> {
     if string.is_empty() {
         Ok(None)
     } else {
-        let components = string
-            .split('x')
-            .map(|component| component.parse::<u32>())
-            .collect::<Result<Vec<_>, std::num::ParseIntError>>()?;
-        Ok(Some(Size2D::new(components[0], components[1])))
+        let (width, height) = string
+            .split_once(['x', 'X'])
+            .ok_or(ParseResolutionError::InvalidFormat)?;
+
+        let width = width.trim();
+        let height = height.trim();
+        if width.is_empty() || height.is_empty() {
+            return Err(ParseResolutionError::InvalidFormat);
+        }
+
+        let width = width.parse().map_err(ParseResolutionError::ParseError)?;
+        let height = height.parse().map_err(ParseResolutionError::ParseError)?;
+        if width == 0 || height == 0 {
+            return Err(ParseResolutionError::ZeroDimension);
+        }
+
+        Ok(Some(Size2D::new(width, height)))
     }
 }
 
@@ -269,7 +299,7 @@ fn flag_with_default_parser<S, T>(
 ) -> impl Parser<Option<T>>
 where
     S: FromStr + 'static,
-    <S as FromStr>::Err: std::fmt::Display,
+    <S as FromStr>::Err: fmt::Display,
     T: Clone + 'static,
 {
     let just_flag = if let Some(c) = short_cmd {
@@ -475,6 +505,11 @@ struct CmdArgs {
         parse(parse_resolution_string), fallback(None))]
     screen_size_override: Option<Size2D<u32, DeviceIndependentPixel>>,
 
+    /// Use mouse events to simulate touch events. Left button presses will be converted to touch
+    /// and mouse movements while the left button is pressed will be converted to touch movements.
+    #[bpaf(long("simulate-touch-events"))]
+    simulate_touch_events: bool,
+
     /// Define a custom filter for traces. Overrides `SERVO_TRACING` if set.
     #[bpaf(long("tracing-filter"), argument("FILTER"))]
     tracing_filter: Option<String>,
@@ -610,12 +645,6 @@ pub(crate) fn parse_command_line_arguments(args: Vec<String>) -> ArgumentParsing
         preferences.js_ion_enabled = false;
     }
 
-    let device_pixel_ratio_override = if cmd_args.output.is_some() {
-        Some(1.0)
-    } else {
-        cmd_args.device_pixel_ratio
-    };
-
     // Make sure the default window size is not larger than any provided screen size.
     let default_window_size = Size2D::new(1024, 740);
     let default_window_size = cmd_args
@@ -627,23 +656,22 @@ pub(crate) fn parse_command_line_arguments(args: Vec<String>) -> ArgumentParsing
     let servoshell_preferences = ServoShellPreferences {
         url: Some(cmd_args.url),
         no_native_titlebar: cmd_args.no_native_titlebar,
-        device_pixel_ratio_override,
+        device_pixel_ratio_override: cmd_args.device_pixel_ratio,
         clean_shutdown: cmd_args.clean_shutdown,
         headless: cmd_args.headless,
         tracing_filter: cmd_args.tracing_filter,
         initial_window_size: cmd_args.window_size.unwrap_or(default_window_size),
         screen_size_override: cmd_args.screen_size_override,
+        simulate_touch_events: cmd_args.simulate_touch_events,
         webdriver_port: cmd_args.webdriver_port,
         output_image_path: cmd_args.output.map(|p| p.to_string_lossy().into_owned()),
         exit_after_stable_image: cmd_args.exit,
         userscripts_directory: cmd_args.userscripts,
         experimental_prefs_enabled: cmd_args.enable_experimental_web_platform_features,
         #[cfg(target_env = "ohos")]
-        log_filter: Some(
-            cmd_args
-                .log_filter
-                .unwrap_or(preferences.log_filter.clone()),
-        ),
+        log_filter: cmd_args.log_filter.or_else(|| {
+            (!preferences.log_filter.is_empty()).then(|| preferences.log_filter.clone())
+        }),
         #[cfg(target_env = "ohos")]
         log_to_file: cmd_args.log_to_file,
         ..Default::default()
@@ -660,7 +688,6 @@ pub(crate) fn parse_command_line_arguments(args: Vec<String>) -> ArgumentParsing
 
     let opts = Opts {
         debug: debug_options,
-        wait_for_stable_image: cmd_args.exit,
         time_profiling: cmd_args.profile,
         time_profiler_trace_path: cmd_args
             .profiler_trace_path
@@ -700,15 +727,6 @@ fn print_debug_options_usage(app: &str) {
         "Usage: {} debug option,[options,...]\n\twhere options include\n\nOptions:",
         app
     );
-
-    print_option(
-        "bubble-inline-sizes-separately",
-        "Bubble intrinsic widths separately like other engines.",
-    );
-    print_option(
-        "convert-mouse-to-touch",
-        "Send touch events instead of mouse events",
-    );
     print_option(
         "disable-share-style-cache",
         "Disable the style sharing cache.",
@@ -720,10 +738,6 @@ fn print_debug_options_usage(app: &str) {
     print_option(
         "dump-display-list",
         "Print the display list after each layout.",
-    );
-    print_option(
-        "dump-display-list-json",
-        "Print the display list in JSON form.",
     );
     print_option(
         "dump-flow-tree",
@@ -738,11 +752,8 @@ fn print_debug_options_usage(app: &str) {
         "Print the DOM with computed styles after each restyle.",
     );
     print_option("dump-style-stats", "Print style statistics each restyle.");
+    print_option("dump-scroll-tree", "Print scroll tree after each layout.");
     print_option("gc-profile", "Log GC passes and their durations.");
-    print_option(
-        "parallel-display-list-building",
-        "Build display lists in parallel.",
-    );
     print_option(
         "profile-script-events",
         "Enable profiling of script-related events.",
@@ -751,23 +762,6 @@ fn print_debug_options_usage(app: &str) {
         "relayout-event",
         "Print notifications when there is a relayout.",
     );
-    print_option(
-        "show-fragment-borders",
-        "Paint borders along fragment boundaries.",
-    );
-    print_option(
-        "show-parallel-layout",
-        "Mark which thread laid each flow out with colors.",
-    );
-    print_option(
-        "signpost",
-        "Emit native OS signposts for profile events (currently macOS only)",
-    );
-    print_option(
-        "trace-layout",
-        "Write layout trace to an external file for debugging.",
-    );
-    print_option("wr-stats", "Show WebRender profiler on screen.");
 
     println!();
 
@@ -881,11 +875,6 @@ fn test_profiling_args() {
 
 #[test]
 fn test_servoshell_cmd() {
-    assert_eq!(
-        test_parse("-o foo.png").2.device_pixel_ratio_override,
-        Some(1.0)
-    );
-
     assert_eq!(
         test_parse("--screen-size=1000x1000")
             .2

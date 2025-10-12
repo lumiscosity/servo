@@ -6,11 +6,9 @@ use std::cell::RefCell;
 use std::mem;
 use std::rc::Rc;
 
-use constellation_traits::EmbedderToConstellationMessage;
 use crossbeam_channel::unbounded;
 use dpi::PhysicalSize;
 use raw_window_handle::{DisplayHandle, RawDisplayHandle, RawWindowHandle, WindowHandle};
-use servo::ipc_channel::ipc;
 pub use servo::webrender_api::units::DeviceIntRect;
 use servo::{self, EventLoopWaker, ServoBuilder, resources};
 pub use servo::{InputMethodType, MediaSessionPlaybackState, WindowRenderingContext};
@@ -105,19 +103,8 @@ pub fn init(
     // Initialize WebDriver server if port is specified
     let webdriver_receiver = servoshell_preferences.webdriver_port.map(|port| {
         let (embedder_sender, embedder_receiver) = unbounded();
-        let (webdriver_response_sender, webdriver_response_receiver) = ipc::channel().unwrap();
-
-        // Set the WebDriver response sender to constellation
-        servo
-            .constellation_sender()
-            .send(EmbedderToConstellationMessage::SetWebDriverResponseSender(
-                webdriver_response_sender,
-            ))
-            .expect("Failed to set WebDriver response sender in constellation");
-
-        webdriver_server::start_server(port, embedder_sender, waker, webdriver_response_receiver);
-
-        log::info!("WebDriver server started on port {}", port);
+        webdriver_server::start_server(port, embedder_sender, waker);
+        log::info!("WebDriver server started on port {port}");
         embedder_receiver
     });
 

@@ -21,15 +21,16 @@ use bluetooth_traits::BluetoothRequest;
 use canvas_traits::webgl::WebGLPipeline;
 use compositing_traits::CrossProcessCompositorApi;
 use constellation_traits::{
-    LoadData, NavigationHistoryBehavior, ScriptToConstellationChan, StructuredSerializedData,
-    WindowSizeType,
+    KeyboardScroll, LoadData, NavigationHistoryBehavior, ScriptToConstellationChan,
+    StructuredSerializedData, WindowSizeType,
 };
 use crossbeam_channel::{RecvTimeoutError, Sender};
 use devtools_traits::ScriptToDevtoolsControlMsg;
 use embedder_traits::user_content_manager::UserContentManager;
 use embedder_traits::{
-    CompositorHitTestResult, FocusSequenceNumber, InputEvent, JavaScriptEvaluationId,
-    MediaSessionActionType, ScriptToEmbedderChan, Theme, ViewportDetails, WebDriverScriptCommand,
+    CompositorHitTestResult, EmbedderControlId, FocusSequenceNumber, FormControlResponse,
+    InputEventAndId, JavaScriptEvaluationId, MediaSessionActionType, ScriptToEmbedderChan, Theme,
+    ViewportDetails, WebDriverScriptCommand,
 };
 use euclid::{Rect, Scale, Size2D, UnknownUnit};
 use ipc_channel::ipc::{IpcReceiver, IpcSender};
@@ -38,13 +39,14 @@ use malloc_size_of_derive::MallocSizeOf;
 use media::WindowGLContext;
 use net_traits::ResourceThreads;
 use net_traits::image_cache::ImageCache;
-use net_traits::storage_thread::StorageType;
 use pixels::PixelFormat;
 use profile_traits::mem;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use servo_config::prefs::PrefValue;
 use servo_url::{ImmutableOrigin, ServoUrl};
+use storage_traits::StorageThreads;
+use storage_traits::webstorage_thread::StorageType;
 use strum_macros::IntoStaticStr;
 use style_traits::{CSSPixel, SpeculativePainter};
 use stylo_atoms::Atom;
@@ -265,6 +267,14 @@ pub enum ScriptThreadMessage {
     /// asynchronous image uploads for the given `Pipeline`. These are mainly used
     /// by canvas to perform uploads while the display list is being built.
     NoLongerWaitingOnAsychronousImageUpdates(PipelineId),
+    /// Forward a keyboard scroll operation from an `<iframe>` to a parent pipeline.
+    ForwardKeyboardScroll(PipelineId, KeyboardScroll),
+    /// Request readiness for a screenshot from the given pipeline. The pipeline will
+    /// respond when it is ready to take the screenshot or will not be able to take it
+    /// in the future.
+    RequestScreenshotReadiness(PipelineId),
+    /// A response to a request to show an embedder user interface control.
+    EmbedderControlResponse(EmbedderControlId, FormControlResponse),
 }
 
 impl fmt::Debug for ScriptThreadMessage {
@@ -293,8 +303,8 @@ pub struct ConstellationInputEvent {
     pub pressed_mouse_buttons: u16,
     /// The currently active keyboard modifiers.
     pub active_keyboard_modifiers: Modifiers,
-    /// The [`InputEvent`] itself.
-    pub event: InputEvent,
+    /// The [`InputEventAndId`] itself.
+    pub event: InputEventAndId,
 }
 
 /// Data needed to construct a script thread.
@@ -328,6 +338,8 @@ pub struct InitialScriptState {
     pub background_hang_monitor_register: Box<dyn BackgroundHangMonitorRegister>,
     /// A channel to the resource manager thread.
     pub resource_threads: ResourceThreads,
+    /// A channel to the storage manager thread.
+    pub storage_threads: StorageThreads,
     /// A channel to the bluetooth thread.
     #[cfg(feature = "bluetooth")]
     pub bluetooth_sender: IpcSender<BluetoothRequest>,

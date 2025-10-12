@@ -39,7 +39,7 @@ impl FormData {
         let data = match form_datums {
             Some(data) => data
                 .iter()
-                .map(|datum| (NoTrace(LocalName::from(datum.name.as_ref())), datum.clone()))
+                .map(|datum| (NoTrace(LocalName::from(&datum.name)), datum.clone()))
                 .collect::<Vec<(NoTrace<LocalName>, FormDatum)>>(),
             None => Vec::new(),
         };
@@ -107,7 +107,7 @@ impl FormDataMethods<crate::DomTypeHolder> for FormData {
             // Step 1.1.2. If submitter’s form owner is not form, then throw a "NotFoundError"
             // DOMException.
             if !matches!(submit_button.form_owner(), Some(owner) if *owner == *form) {
-                return Err(Error::NotFound);
+                return Err(Error::NotFound(None));
             }
 
             Ok(submit_button)
@@ -129,7 +129,7 @@ impl FormDataMethods<crate::DomTypeHolder> for FormData {
                     can_gc,
                 )),
                 // Step 1.3. If list is null, then throw an "InvalidStateError" DOMException.
-                None => Err(Error::InvalidState),
+                None => Err(Error::InvalidState(None)),
             };
         }
 

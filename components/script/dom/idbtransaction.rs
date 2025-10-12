@@ -5,12 +5,12 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 
+use base::IpcSend;
 use dom_struct::dom_struct;
 use ipc_channel::ipc::IpcSender;
-use net_traits::IpcSend;
-use net_traits::indexeddb_thread::{IndexedDBThreadMsg, KeyPath, SyncOperation};
 use profile_traits::ipc;
 use script_bindings::codegen::GenericUnionTypes::StringOrStringSequence;
+use storage_traits::indexeddb_thread::{IndexedDBThreadMsg, KeyPath, SyncOperation};
 use stylo_atoms::Atom;
 
 use crate::dom::bindings::cell::DomRefCell;
@@ -106,7 +106,7 @@ impl IDBTransaction {
         let (sender, receiver) = ipc::channel(global.time_profiler_chan().clone()).unwrap();
 
         global
-            .resource_threads()
+            .storage_threads()
             .send(IndexedDBThreadMsg::Sync(SyncOperation::RegisterNewTxn(
                 sender,
                 global.origin().immutable().clone(),
@@ -203,7 +203,7 @@ impl IDBTransaction {
     }
 
     fn get_idb_thread(&self) -> IpcSender<IndexedDBThreadMsg> {
-        self.global().resource_threads().sender()
+        self.global().storage_threads().sender()
     }
 
     fn object_store_parameters(
@@ -211,7 +211,7 @@ impl IDBTransaction {
         object_store_name: &DOMString,
     ) -> Option<IDBObjectStoreParameters> {
         let global = self.global();
-        let idb_sender = global.resource_threads().sender();
+        let idb_sender = global.storage_threads().sender();
         let (sender, receiver) =
             ipc::channel(global.time_profiler_chan().clone()).expect("failed to create channel");
 
@@ -263,12 +263,12 @@ impl IDBTransactionMethods<crate::DomTypeHolder> for IDBTransaction {
     fn ObjectStore(&self, name: DOMString) -> Fallible<DomRoot<IDBObjectStore>> {
         // Step 1: If transaction has finished, throw an "InvalidStateError" DOMException.
         if self.finished.get() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         // Step 2: Check that the object store exists
         if !self.object_store_names.Contains(name.clone()) {
-            return Err(Error::NotFound);
+            return Err(Error::NotFound(None));
         }
 
         // Step 3: Each call to this method on the same
@@ -332,7 +332,7 @@ impl IDBTransactionMethods<crate::DomTypeHolder> for IDBTransaction {
         // This only sets the flags, and does not abort the transaction
         // see https://www.w3.org/TR/IndexedDB-2/#abort-a-transaction
         if self.finished.get() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         self.active.set(false);

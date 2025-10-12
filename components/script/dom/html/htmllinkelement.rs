@@ -7,7 +7,6 @@ use std::cell::Cell;
 use std::default::Default;
 
 use dom_struct::dom_struct;
-use embedder_traits::EmbedderMsg;
 use html5ever::{LocalName, Prefix, local_name, ns};
 use ipc_channel::ipc::IpcSender;
 use js::rust::HandleObject;
@@ -24,7 +23,6 @@ use pixels::PixelFormat;
 use script_bindings::root::Dom;
 use servo_arc::Arc;
 use servo_url::ServoUrl;
-use strum_macros::IntoStaticStr;
 use style::attr::AttrValue;
 use style::stylesheets::Stylesheet;
 use stylo_atoms::Atom;
@@ -50,17 +48,19 @@ use crate::dom::element::{
     set_cross_origin_attribute,
 };
 use crate::dom::html::htmlelement::HTMLElement;
-use crate::dom::linkprocessingoptions::LinkProcessingOptions;
 use crate::dom::medialist::MediaList;
 use crate::dom::node::{BindContext, Node, NodeTraits, UnbindContext};
 use crate::dom::performanceresourcetiming::InitiatorType;
+use crate::dom::processingoptions::{
+    LinkFetchContext, LinkFetchContextType, LinkProcessingOptions,
+};
 use crate::dom::stylesheet::StyleSheet as DOMStyleSheet;
 use crate::dom::types::{EventTarget, GlobalScope};
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::links::LinkRelations;
 use crate::network_listener::{PreInvoke, ResourceTimingListener, submit_timing};
 use crate::script_runtime::CanGc;
-use crate::stylesheet_loader::{StylesheetContextSource, StylesheetLoader, StylesheetOwner};
+use crate::stylesheet_loader::{ElementStylesheetLoader, StylesheetContextSource, StylesheetOwner};
 
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf, PartialEq)]
 pub(crate) struct RequestGenerationId(u32);
@@ -206,6 +206,10 @@ impl HTMLLinkElement {
             cssom_stylesheet.set_owner_node(None);
         }
         self.cssom_stylesheet.set(None);
+    }
+
+    pub(crate) fn line_number(&self) -> u32 {
+        self.line_number as u32
     }
 }
 
@@ -403,12 +407,13 @@ impl VirtualMethods for HTMLLinkElement {
 }
 
 impl HTMLLinkElement {
-    fn compute_destination_for_attribute(&self) -> Destination {
+    fn compute_destination_for_attribute(&self) -> Option<Destination> {
+        // Let destination be the result of translating the keyword
+        // representing the state of el's as attribute.
         let element = self.upcast::<Element>();
         element
             .get_attribute(&ns!(), &local_name!("as"))
-            .map(|attr| translate_a_preload_destination(&attr.value()))
-            .unwrap_or(Destination::None)
+            .and_then(|attr| LinkProcessingOptions::translate_a_preload_destination(&attr.value()))
     }
 
     /// <https://html.spec.whatwg.org/multipage/#create-link-options-from-element>
@@ -419,11 +424,9 @@ impl HTMLLinkElement {
         let document = self.upcast::<Node>().owner_doc();
 
         // Step 2. Let options be a new link processing options
-        let destination = self.compute_destination_for_attribute();
-
         let mut options = LinkProcessingOptions {
             href: String::new(),
-            destination: Some(destination),
+            destination: Destination::None,
             integrity: String::new(),
             link_type: String::new(),
             cryptographic_nonce_metadata: self.upcast::<Element>().nonce_value(),
@@ -514,7 +517,7 @@ impl HTMLLinkElement {
         let mut options = self.processing_options();
 
         // Step 3. Set options's destination to the empty string.
-        options.destination = Some(Destination::None);
+        options.destination = Destination::None;
 
         // Step 4. Let request be the result of creating a link request given options.
         let Some(request) = options.create_link_request(self.owner_window().webview_id()) else {
@@ -532,7 +535,8 @@ impl HTMLLinkElement {
         let document = self.upcast::<Node>().owner_doc();
         let fetch_context = LinkFetchContext {
             url,
-            link: Trusted::new(self),
+            link: Some(Trusted::new(self)),
+            global: Trusted::new(&document.global()),
             resource_timing: ResourceFetchTiming::new(ResourceTimingType::Resource),
             type_: LinkFetchContextType::Prefetch,
         };
@@ -578,6 +582,7 @@ impl HTMLLinkElement {
         }
 
         let media = MediaList::parse_media_list(mq_str, document.window());
+        let media = Arc::new(document.style_shared_lock().wrap(media));
 
         let im_attribute = element.get_attribute(&ns!(), &local_name!("integrity"));
         let integrity_val = im_attribute.as_ref().map(|a| a.value());
@@ -589,9 +594,9 @@ impl HTMLLinkElement {
         self.request_generation_id
             .set(self.request_generation_id.get().increment());
 
-        let loader = StylesheetLoader::for_element(self.upcast());
+        let loader = ElementStylesheetLoader::new(self.upcast());
         loader.load(
-            StylesheetContextSource::LinkElement { media: Some(media) },
+            StylesheetContextSource::LinkElement { media },
             link_url,
             cors_setting,
             integrity_metadata.to_owned(),
@@ -720,6 +725,7 @@ impl HTMLLinkElement {
     fn process_favicon_response(&self, image: Image) {
         // TODO: Include the size attribute here
         let window = self.owner_window();
+        let document = self.owner_document();
 
         let send_rasterized_favicon_to_embedder = |raster_image: &pixels::RasterImage| {
             // Let's not worry about animated favicons...
@@ -740,7 +746,7 @@ impl HTMLLinkElement {
                 raster_image.frames[0].byte_range.clone(),
                 format,
             );
-            window.send_to_embedder(EmbedderMsg::NewFavicon(window.webview_id(), embedder_image));
+            document.set_favicon(embedder_image);
         };
 
         match image {
@@ -775,7 +781,15 @@ impl HTMLLinkElement {
         // Step 1. Update the source set for el.
         // TODO
         // Step 2. Let options be the result of creating link options from el.
-        let options = self.processing_options();
+        let mut options = self.processing_options();
+        // Step 3. Let destination be the result of translating the keyword
+        // representing the state of el's as attribute.
+        let Some(destination) = self.compute_destination_for_attribute() else {
+            // Step 4. If destination is null, then return.
+            return;
+        };
+        // Step 5. Set options's destination to destination.
+        options.destination = destination;
         // Steps for https://html.spec.whatwg.org/multipage/#preload
         {
             // Step 1. If options's type doesn't match options's destination, then return.
@@ -785,24 +799,27 @@ impl HTMLLinkElement {
                 return;
             }
         }
-        // Step 3. Preload options, with the following steps given a response response:
+        // Step 6. Preload options, with the following steps given a response response:
         let Some(request) = options.preload(self.owner_window().webview_id()) else {
             return;
         };
         let url = request.url.clone();
+        let document = self.upcast::<Node>().owner_doc();
         let fetch_context = LinkFetchContext {
             url,
-            link: Trusted::new(self),
+            link: Some(Trusted::new(self)),
+            global: Trusted::new(&document.global()),
             resource_timing: ResourceFetchTiming::new(ResourceTimingType::Resource),
             type_: LinkFetchContextType::Preload,
         };
-        self.upcast::<Node>()
-            .owner_doc()
-            .fetch_background(request, fetch_context);
+        document.fetch_background(request, fetch_context);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#link-type-preload:fetch-and-process-the-linked-resource-2>
-    fn fire_event_after_response(&self, response: Result<ResourceFetchTiming, NetworkError>) {
+    pub(crate) fn fire_event_after_response(
+        &self,
+        response: Result<ResourceFetchTiming, NetworkError>,
+    ) {
         // Step 3.1 If response is a network error, fire an event named error at el.
         // Otherwise, fire an event named load at el.
         if response.is_err() {
@@ -986,18 +1003,6 @@ impl HTMLLinkElementMethods<crate::DomTypeHolder> for HTMLLinkElement {
     }
 }
 
-/// <https://html.spec.whatwg.org/multipage/#translate-a-preload-destination>
-fn translate_a_preload_destination(potential_destination: &str) -> Destination {
-    match potential_destination {
-        "fetch" => Destination::None,
-        "font" => Destination::Font,
-        "image" => Destination::Image,
-        "script" => Destination::Script,
-        "track" => Destination::Track,
-        _ => Destination::None,
-    }
-}
-
 struct FaviconFetchContext {
     /// The `<link>` element that caused this fetch operation
     link: Trusted<HTMLLinkElement>,
@@ -1081,99 +1086,6 @@ impl ResourceTimingListener for FaviconFetchContext {
 
 impl PreInvoke for FaviconFetchContext {
     fn should_invoke(&self) -> bool {
-        true
-    }
-}
-
-#[derive(Clone, IntoStaticStr)]
-#[strum(serialize_all = "lowercase")]
-enum LinkFetchContextType {
-    Prefetch,
-    Preload,
-}
-
-impl From<LinkFetchContextType> for InitiatorType {
-    fn from(other: LinkFetchContextType) -> Self {
-        let name: &'static str = other.into();
-        InitiatorType::LocalName(name.to_owned())
-    }
-}
-
-struct LinkFetchContext {
-    /// The `<link>` element that caused this prefetch operation
-    link: Trusted<HTMLLinkElement>,
-
-    resource_timing: ResourceFetchTiming,
-
-    /// The url being prefetched
-    url: ServoUrl,
-
-    /// The type of fetching we perform, used when report timings.
-    type_: LinkFetchContextType,
-}
-
-impl FetchResponseListener for LinkFetchContext {
-    fn process_request_body(&mut self, _: RequestId) {}
-
-    fn process_request_eof(&mut self, _: RequestId) {}
-
-    fn process_response(
-        &mut self,
-        _: RequestId,
-        fetch_metadata: Result<FetchMetadata, NetworkError>,
-    ) {
-        _ = fetch_metadata;
-    }
-
-    fn process_response_chunk(&mut self, _: RequestId, chunk: Vec<u8>) {
-        _ = chunk;
-    }
-
-    /// Step 7 of <https://html.spec.whatwg.org/multipage/#link-type-prefetch:fetch-and-process-the-linked-resource-2>
-    /// and step 3.1 of <https://html.spec.whatwg.org/multipage/#link-type-preload:fetch-and-process-the-linked-resource-2>
-    fn process_response_eof(
-        &mut self,
-        _: RequestId,
-        response: Result<ResourceFetchTiming, NetworkError>,
-    ) {
-        self.link.root().fire_event_after_response(response);
-    }
-
-    fn resource_timing_mut(&mut self) -> &mut ResourceFetchTiming {
-        &mut self.resource_timing
-    }
-
-    fn resource_timing(&self) -> &ResourceFetchTiming {
-        &self.resource_timing
-    }
-
-    fn submit_resource_timing(&mut self) {
-        submit_timing(self, CanGc::note())
-    }
-
-    fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<Violation>) {
-        let global = &self.resource_timing_global();
-        let link = self.link.root();
-        let source_position = link
-            .upcast::<Element>()
-            .compute_source_position(link.line_number as u32);
-        global.report_csp_violations(violations, None, Some(source_position));
-    }
-}
-
-impl ResourceTimingListener for LinkFetchContext {
-    fn resource_timing_information(&self) -> (InitiatorType, ServoUrl) {
-        (self.type_.clone().into(), self.url.clone())
-    }
-
-    fn resource_timing_global(&self) -> DomRoot<GlobalScope> {
-        self.link.root().upcast::<Node>().owner_doc().global()
-    }
-}
-
-impl PreInvoke for LinkFetchContext {
-    fn should_invoke(&self) -> bool {
-        // Prefetch and preload requests are never aborted.
         true
     }
 }

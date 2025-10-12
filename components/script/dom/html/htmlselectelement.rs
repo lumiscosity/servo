@@ -6,16 +6,16 @@ use std::default::Default;
 use std::iter;
 
 use dom_struct::dom_struct;
-use embedder_traits::{EmbedderMsg, FormControl as EmbedderFormControl};
+use embedder_traits::{FormControlRequest as EmbedderFormControl};
 use embedder_traits::{SelectElementOption, SelectElementOptionOrOptgroup};
 use euclid::{Point2D, Rect, Size2D};
-use html5ever::{LocalName, Prefix, local_name};
+use html5ever::{LocalName, Prefix, QualName, local_name, ns};
 use js::rust::HandleObject;
 use style::attr::AttrValue;
 use stylo_dom::ElementState;
 use webrender_api::units::DeviceIntRect;
-use base::generic_channel;
 use crate::dom::bindings::refcounted::Trusted;
+use crate::dom::document_embedder_controls::ControlElement;
 use crate::dom::event::{EventBubbles, EventCancelable, EventComposed};
 use crate::dom::bindings::codegen::GenericBindings::HTMLOptGroupElementBinding::HTMLOptGroupElement_Binding::HTMLOptGroupElementMethods;
 use crate::dom::activation::Activatable;
@@ -37,11 +37,10 @@ use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::characterdata::CharacterData;
 use crate::dom::document::Document;
-use crate::dom::element::{AttributeMutation, Element};
+use crate::dom::element::{AttributeMutation, CustomElementCreationMode, Element, ElementCreator};
 use crate::dom::event::Event;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::html::htmlcollection::CollectionFilter;
-use crate::dom::html::htmldivelement::HTMLDivElement;
 use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::html::htmlfieldsetelement::HTMLFieldSetElement;
 use crate::dom::html::htmlformelement::{FormControl, FormDatum, FormDatumValue, HTMLFormElement};
@@ -257,15 +256,27 @@ impl HTMLSelectElement {
         let document = self.owner_document();
         let root = self.upcast::<Element>().attach_ua_shadow_root(true, can_gc);
 
-        let select_box = HTMLDivElement::new(local_name!("div"), None, &document, None, can_gc);
-        select_box.upcast::<Element>().set_string_attribute(
-            &local_name!("style"),
-            SELECT_BOX_STYLE.into(),
+        let select_box = Element::create(
+            QualName::new(None, ns!(html), local_name!("div")),
+            None,
+            &document,
+            ElementCreator::ScriptCreated,
+            CustomElementCreationMode::Asynchronous,
+            None,
             can_gc,
         );
+        select_box.set_string_attribute(&local_name!("style"), SELECT_BOX_STYLE.into(), can_gc);
 
-        let text_container = HTMLDivElement::new(local_name!("div"), None, &document, None, can_gc);
-        text_container.upcast::<Element>().set_string_attribute(
+        let text_container = Element::create(
+            QualName::new(None, ns!(html), local_name!("div")),
+            None,
+            &document,
+            ElementCreator::ScriptCreated,
+            CustomElementCreationMode::Asynchronous,
+            None,
+            can_gc,
+        );
+        text_container.set_string_attribute(
             &local_name!("style"),
             TEXT_CONTAINER_STYLE.into(),
             can_gc,
@@ -284,9 +295,16 @@ impl HTMLSelectElement {
             .AppendChild(text.upcast::<Node>(), can_gc)
             .unwrap();
 
-        let chevron_container =
-            HTMLDivElement::new(local_name!("div"), None, &document, None, can_gc);
-        chevron_container.upcast::<Element>().set_string_attribute(
+        let chevron_container = Element::create(
+            QualName::new(None, ns!(html), local_name!("div")),
+            None,
+            &document,
+            ElementCreator::ScriptCreated,
+            CustomElementCreationMode::Asynchronous,
+            None,
+            can_gc,
+        );
+        chevron_container.set_string_attribute(
             &local_name!("style"),
             CHEVRON_CONTAINER_STYLE.into(),
             can_gc,
@@ -324,7 +342,7 @@ impl HTMLSelectElement {
             .unwrap_or_default();
 
         // Replace newlines with whitespace, then collapse and trim whitespace
-        let displayed_text = itertools::join(selected_option_text.split_whitespace(), " ");
+        let displayed_text = itertools::join(selected_option_text.str().split_whitespace(), " ");
 
         shadow_tree
             .selected_option
@@ -338,10 +356,7 @@ impl HTMLSelectElement {
             .or_else(|| self.list_of_options().next())
     }
 
-    pub(crate) fn show_menu(&self) -> Option<usize> {
-        let (ipc_sender, ipc_receiver) =
-            generic_channel::channel().expect("Failed to create IPC channel!");
-
+    pub(crate) fn show_menu(&self) {
         // Collect list of optgroups and options
         let mut index = 0;
         let mut embedder_option_from_option = |option: &HTMLOptionElement| {
@@ -385,19 +400,20 @@ impl HTMLSelectElement {
 
         let selected_index = self.list_of_options().position(|option| option.Selected());
 
-        let document = self.owner_document();
-        document.send_to_embedder(EmbedderMsg::ShowFormControl(
-            document.webview_id(),
+        self.owner_document().embedder_controls().show_form_control(
+            ControlElement::Select(DomRoot::from_ref(self)),
             DeviceIntRect::from_untyped(&rect.to_box2d()),
-            EmbedderFormControl::SelectElement(options, selected_index, ipc_sender),
-        ));
+            EmbedderFormControl::SelectElement(options, selected_index),
+        );
+    }
 
-        let Ok(response) = ipc_receiver.recv() else {
-            log::error!("Failed to receive response");
-            return None;
+    pub(crate) fn handle_menu_response(&self, response: Option<usize>, can_gc: CanGc) {
+        let Some(selected_value) = response else {
+            return;
         };
 
-        response
+        self.SetSelectedIndex(selected_value as i32, can_gc);
+        self.send_update_notifications();
     }
 
     /// <https://html.spec.whatwg.org/multipage/#send-select-update-notifications>
@@ -781,14 +797,8 @@ impl Activatable for HTMLSelectElement {
         true
     }
 
-    fn activation_behavior(&self, _event: &Event, _target: &EventTarget, can_gc: CanGc) {
-        let Some(selected_value) = self.show_menu() else {
-            // The user did not select a value
-            return;
-        };
-
-        self.SetSelectedIndex(selected_value as i32, can_gc);
-        self.send_update_notifications();
+    fn activation_behavior(&self, _event: &Event, _target: &EventTarget, _can_gc: CanGc) {
+        self.show_menu();
     }
 }
 

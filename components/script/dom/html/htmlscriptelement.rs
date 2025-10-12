@@ -23,6 +23,7 @@ use net_traits::{
     FetchMetadata, FetchResponseListener, Metadata, NetworkError, ResourceFetchTiming,
     ResourceTimingType,
 };
+use script_bindings::domstring::BytesView;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use style::attr::AttrValue;
 use style::str::{HTML_SPACE_CHARACTERS, StaticStringVec};
@@ -77,7 +78,7 @@ impl ScriptSource for ScriptOrigin {
         self.unminified_dir.clone()
     }
 
-    fn extract_bytes(&self) -> &[u8] {
+    fn extract_bytes(&self) -> BytesView<'_> {
         match &self.code {
             SourceCode::Text(text) => text.as_bytes(),
             SourceCode::Compiled(compiled_source_code) => {
@@ -275,7 +276,7 @@ impl ScriptOrigin {
             fetch_options,
             type_,
             unminified_dir,
-            import_map: Err(Error::NotFound),
+            import_map: Err(Error::NotFound(None)),
         }
     }
 
@@ -707,7 +708,7 @@ impl HTMLScriptElement {
                     global,
                     element,
                     InlineCheckType::Script,
-                    &text,
+                    &text.str(),
                 )
         {
             warn!("Blocking inline script due to CSP");
@@ -753,7 +754,7 @@ impl HTMLScriptElement {
             ScriptType::Module | ScriptType::ImportMap => reflect_cross_origin_attribute(element)
                 .map_or(
                     CredentialsMode::CredentialsSameOrigin,
-                    |attr| match &*attr {
+                    |attr| match &*attr.str() {
                         "use-credentials" => CredentialsMode::Include,
                         "anonymous" => CredentialsMode::CredentialsSameOrigin,
                         _ => CredentialsMode::CredentialsSameOrigin,
@@ -911,7 +912,7 @@ impl HTMLScriptElement {
                         options,
                         script_type,
                         self.global().unminified_js_dir(),
-                        Err(Error::NotFound),
+                        Err(Error::NotFound(None)),
                     ));
 
                     if was_parser_inserted &&
@@ -944,6 +945,7 @@ impl HTMLScriptElement {
                         base_url.clone(),
                         self.id,
                         options,
+                        self.line_number,
                         can_gc,
                     );
                 },
@@ -1385,7 +1387,7 @@ impl HTMLScriptElementMethods<crate::DomTypeHolder> for HTMLScriptElement {
         )?;
         element.set_attribute(
             local_name,
-            AttrValue::String(value.as_ref().to_owned()),
+            AttrValue::String(value.str().to_owned()),
             can_gc,
         );
         Ok(())
@@ -1532,7 +1534,7 @@ impl HTMLScriptElementMethods<crate::DomTypeHolder> for HTMLScriptElement {
     fn Supports(_window: &Window, type_: DOMString) -> bool {
         // The type argument has to exactly match these values,
         // we do not perform an ASCII case-insensitive match.
-        matches!(type_.str(), "classic" | "module" | "importmap")
+        matches!(&*type_.str(), "classic" | "module" | "importmap")
     }
 }
 

@@ -122,6 +122,7 @@ use crate::dom::shadowroot::{IsUserAgentWidget, LayoutShadowRootHelpers, ShadowR
 use crate::dom::stylesheetlist::StyleSheetListOwner;
 use crate::dom::svgsvgelement::{LayoutSVGSVGElementHelpers, SVGSVGElement};
 use crate::dom::text::Text;
+use crate::dom::types::KeyboardEvent;
 use crate::dom::virtualmethods::{VirtualMethods, vtable_for};
 use crate::dom::window::Window;
 use crate::script_runtime::CanGc;
@@ -301,6 +302,8 @@ impl Node {
         let parent_is_connected = self.is_connected();
         let parent_is_in_ua_widget = self.is_in_ua_widget();
 
+        let context = BindContext::new(self);
+
         for node in new_child.traverse_preorder(ShadowIncluding::No) {
             if parent_in_shadow_tree {
                 if let Some(shadow_root) = self.containing_shadow_root() {
@@ -318,14 +321,7 @@ impl Node {
 
             // Out-of-document elements never have the descendants flag set.
             debug_assert!(!node.get_flag(NodeFlags::HAS_DIRTY_DESCENDANTS));
-            vtable_for(&node).bind_to_tree(
-                &BindContext {
-                    tree_connected: parent_is_connected,
-                    tree_is_in_a_document_tree: parent_is_in_a_document_tree,
-                    tree_is_in_a_shadow_tree: parent_in_shadow_tree,
-                },
-                can_gc,
-            );
+            vtable_for(&node).bind_to_tree(&context, can_gc);
         }
     }
 
@@ -390,7 +386,7 @@ impl Node {
 
         // Step 12.
         let is_parent_connected = context.parent.is_connected();
-
+        let custom_element_reaction_stack = ScriptThread::custom_element_reaction_stack();
         for node in root.traverse_preorder(ShadowIncluding::Yes) {
             node.clean_up_style_and_layout_data();
 
@@ -403,7 +399,7 @@ impl Node {
             // Step 12 & 14.2. Enqueue disconnected custom element reactions.
             if is_parent_connected {
                 if let Some(element) = node.as_custom_element() {
-                    ScriptThread::enqueue_callback_reaction(
+                    custom_element_reaction_stack.enqueue_callback_reaction(
                         &element,
                         CallbackReaction::Disconnected,
                         None,
@@ -957,6 +953,11 @@ impl Node {
             .box_area_query(self, BoxAreaType::Border)
     }
 
+    pub(crate) fn padding_box(&self) -> Option<Rect<Au>> {
+        self.owner_window()
+            .box_area_query(self, BoxAreaType::Padding)
+    }
+
     pub(crate) fn border_boxes(&self) -> Vec<Rect<Au>> {
         self.owner_window()
             .box_areas_query(self, BoxAreaType::Border)
@@ -1128,7 +1129,7 @@ impl Node {
         // Step 1.
         let doc = self.owner_doc();
         match SelectorParser::parse_author_origin_no_namespace(
-            &selectors,
+            &selectors.str(),
             &UrlExtraData(doc.url().get_arc()),
         ) {
             // Step 2.
@@ -1165,7 +1166,7 @@ impl Node {
         // Step 1.
         let url = self.owner_doc().url();
         match SelectorParser::parse_author_origin_no_namespace(
-            &selectors,
+            &selectors.str(),
             &UrlExtraData(url.get_arc()),
         ) {
             // Step 2.
@@ -2307,11 +2308,12 @@ impl Node {
             // Step 3.2 For each inclusiveDescendant in node’s shadow-including inclusive descendants
             // that is custom, enqueue a custom element callback reaction with inclusiveDescendant,
             // callback name "adoptedCallback", and « oldDocument, document ».
+            let custom_element_reaction_stack = ScriptThread::custom_element_reaction_stack();
             for descendant in node
                 .traverse_preorder(ShadowIncluding::Yes)
                 .filter_map(|d| d.as_custom_element())
             {
-                ScriptThread::enqueue_callback_reaction(
+                custom_element_reaction_stack.enqueue_callback_reaction(
                     &descendant,
                     CallbackReaction::Adopted(old_doc.clone(), DomRoot::from_ref(document)),
                     None,
@@ -2350,7 +2352,7 @@ impl Node {
         // Step 3.
         if let Some(child) = child {
             if !parent.is_parent_of(child) {
-                return Err(Error::NotFound);
+                return Err(Error::NotFound(None));
             }
         }
 
@@ -2554,6 +2556,7 @@ impl Node {
             SuppressObserver::Suppressed => None,
         };
 
+        let custom_element_reaction_stack = ScriptThread::custom_element_reaction_stack();
         // Step 7. For each node in nodes, in tree order:
         for kid in new_nodes {
             // Step 7.1. Adopt node into parent’s node document.
@@ -2602,7 +2605,7 @@ impl Node {
                 // Enqueue connected reactions for custom elements or try upgrade.
                 if descendant.is_custom() {
                     if descendant.is_connected() {
-                        ScriptThread::enqueue_callback_reaction(
+                        custom_element_reaction_stack.enqueue_callback_reaction(
                             &descendant,
                             CallbackReaction::Connected,
                             None,
@@ -2729,8 +2732,8 @@ impl Node {
     fn pre_remove(child: &Node, parent: &Node, can_gc: CanGc) -> Fallible<DomRoot<Node>> {
         // Step 1.
         match child.GetParentNode() {
-            Some(ref node) if &**node != parent => return Err(Error::NotFound),
-            None => return Err(Error::NotFound),
+            Some(ref node) if &**node != parent => return Err(Error::NotFound(None)),
+            None => return Err(Error::NotFound(None)),
             _ => (),
         }
 
@@ -2944,6 +2947,7 @@ impl Node {
                     Some(document.insecure_requests_policy()),
                     document.has_trustworthy_ancestor_or_current_origin(),
                     document.custom_element_reaction_stack(),
+                    document.creation_sandboxing_flag_set(),
                     can_gc,
                 );
                 DomRoot::upcast::<Node>(document)
@@ -3212,13 +3216,13 @@ impl Node {
         )
         .map_err(|error| {
             error!("Cannot serialize node: {error}");
-            Error::InvalidState
+            Error::InvalidState(None)
         })?;
 
         // FIXME(ajeffrey): Directly convert UTF8 to DOMString
         let string = DOMString::from(String::from_utf8(writer).map_err(|error| {
             error!("Cannot serialize node: {error}");
-            Error::InvalidState
+            Error::InvalidState(None)
         })?);
 
         Ok(string)
@@ -3495,7 +3499,7 @@ impl NodeMethods<crate::DomTypeHolder> for Node {
 
         // Step 3. If child’s parent is not parent, then throw a "NotFoundError" DOMException.
         if !self.is_parent_of(child) {
-            return Err(Error::NotFound);
+            return Err(Error::NotFound(None));
         }
 
         // Step 4. If node is not a DocumentFragment, DocumentType, Element, or CharacterData node,
@@ -3999,13 +4003,10 @@ impl NodeMethods<crate::DomTypeHolder> for Node {
 
     /// <https://dom.spec.whatwg.org/#dom-node-lookupnamespaceuri>
     fn LookupNamespaceURI(&self, prefix: Option<DOMString>) -> Option<DOMString> {
-        // Step 1.
-        let prefix = match prefix {
-            Some(ref p) if p.is_empty() => None,
-            pre => pre,
-        };
+        // Step 1. If prefix is the empty string, then set it to null.
+        let prefix = prefix.filter(|prefix| !prefix.is_empty());
 
-        // Step 2.
+        // Step 2. Return the result of running locate a namespace for this using prefix.
         Node::namespace_to_string(Node::locate_namespace(self, prefix))
     }
 
@@ -4096,6 +4097,14 @@ impl VirtualMethods for Node {
         // drain any ranges.
         if !self.is_in_a_shadow_tree() && !self.ranges_is_empty() {
             self.ranges().drain_to_parent(context, self);
+        }
+    }
+
+    fn handle_event(&self, event: &Event, _: CanGc) {
+        if let Some(event) = event.downcast::<KeyboardEvent>() {
+            self.owner_document()
+                .event_handler()
+                .run_default_keyboard_event_handler(event);
         }
     }
 }
@@ -4268,7 +4277,10 @@ impl<'a> ChildrenMutation<'a> {
 }
 
 /// The context of the binding to tree of a node.
-pub(crate) struct BindContext {
+pub(crate) struct BindContext<'a> {
+    /// The parent of the inclusive ancestor that was inserted.
+    pub(crate) parent: &'a Node,
+
     /// Whether the tree is connected.
     ///
     /// <https://dom.spec.whatwg.org/#connected>
@@ -4283,7 +4295,17 @@ pub(crate) struct BindContext {
     pub(crate) tree_is_in_a_shadow_tree: bool,
 }
 
-impl BindContext {
+impl<'a> BindContext<'a> {
+    /// Create a new `BindContext` value.
+    pub(crate) fn new(parent: &'a Node) -> Self {
+        BindContext {
+            parent,
+            tree_connected: parent.is_connected(),
+            tree_is_in_a_document_tree: parent.is_in_a_document_tree(),
+            tree_is_in_a_shadow_tree: parent.is_in_a_shadow_tree(),
+        }
+    }
+
     /// Return true iff the tree is inside either a document- or a shadow tree.
     pub(crate) fn is_in_tree(&self) -> bool {
         self.tree_is_in_a_document_tree || self.tree_is_in_a_shadow_tree

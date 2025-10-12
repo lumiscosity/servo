@@ -7,13 +7,8 @@ use std::rc::Rc;
 
 use crossbeam_channel::Receiver;
 use dpi::PhysicalSize;
-use embedder_traits::webdriver::WebDriverSenders;
-use embedder_traits::{
-    ContextMenuResult, InputMethodType, KeyboardEvent, MediaSessionActionType, MediaSessionEvent,
-    MouseButton, MouseButtonAction, ScreenGeometry, TouchEvent, TouchEventType, TouchId,
-    WebDriverJSResult,
-};
 use euclid::{Point2D, Rect, Scale, Size2D, Vector2D};
+use image::{DynamicImage, ImageFormat};
 use keyboard_types::{CompositionEvent, CompositionState, Key, KeyState, NamedKey};
 use log::{debug, error, info, warn};
 use raw_window_handle::{RawWindowHandle, WindowHandle};
@@ -24,15 +19,17 @@ use servo::servo_geometry::DeviceIndependentPixel;
 use servo::webrender_api::ScrollLocation;
 use servo::webrender_api::units::{DeviceIntRect, DeviceIntSize, DevicePixel};
 use servo::{
-    AllowOrDenyRequest, ImeEvent, InputEvent, LoadStatus, MouseButtonEvent, MouseMoveEvent,
-    NavigationRequest, PermissionRequest, RenderingContext, Servo, ServoDelegate, ServoError,
-    SimpleDialog, TraversalId, WebDriverCommandMsg, WebDriverLoadStatus, WebDriverScriptCommand,
-    WebView, WebViewBuilder, WebViewDelegate, WindowRenderingContext,
+    AllowOrDenyRequest, ContextMenuResult, ImeEvent, InputEvent, InputMethodType, KeyboardEvent,
+    LoadStatus, MediaSessionActionType, MediaSessionEvent, MouseButton, MouseButtonAction,
+    MouseButtonEvent, MouseMoveEvent, NavigationRequest, PermissionRequest, RenderingContext,
+    ScreenGeometry, Servo, ServoDelegate, ServoError, SimpleDialog, TouchEvent, TouchEventType,
+    TouchId, TraversalId, WebDriverCommandMsg, WebDriverJSResult, WebDriverLoadStatus,
+    WebDriverScriptCommand, WebDriverSenders, WebView, WebViewBuilder, WebViewDelegate,
+    WindowRenderingContext,
 };
 use url::Url;
 
 use crate::egl::host_trait::HostTrait;
-use crate::output_image::save_output_image_if_necessary;
 use crate::prefs::ServoShellPreferences;
 
 #[derive(Clone, Debug)]
@@ -108,6 +105,10 @@ struct RunningAppStateInner {
 
     /// The HiDPI scaling factor to use for the display of [`WebView`]s.
     hidpi_scale_factor: Scale<f32, DeviceIndependentPixel, DevicePixel>,
+
+    /// Whether or not the application has achieved stable image output. This is used
+    /// for the `exit_after_stable_image` option.
+    achieved_stable_image: Rc<Cell<bool>>,
 }
 
 struct ServoShellServoDelegate {
@@ -173,6 +174,7 @@ impl WebViewDelegate for RunningAppState {
             {
                 let _ = sender.send(WebDriverLoadStatus::Complete);
             }
+            self.maybe_request_screenshot(webview);
         }
 
         #[cfg(feature = "tracing")]
@@ -367,6 +369,7 @@ impl RunningAppState {
                 focused_webview_id: None,
                 animating_state_changed,
                 hidpi_scale_factor: Scale::new(hidpi_scale_factor),
+                achieved_stable_image: Default::default(),
             }),
         });
 
@@ -565,10 +568,10 @@ impl RunningAppState {
     /// Let Servo know that the window has been resized.
     pub fn resize(&self, coordinates: Coordinates) {
         info!("resize to {:?}", coordinates,);
-        self.active_webview().resize(PhysicalSize::new(
-            coordinates.viewport.width() as u32,
-            coordinates.viewport.height() as u32,
-        ));
+        let size = coordinates.viewport.size;
+        self.active_webview().move_resize(size.to_f32().into());
+        self.active_webview()
+            .resize(PhysicalSize::new(size.width as u32, size.height as u32));
         *self.callbacks.coordinates.borrow_mut() = coordinates;
         self.perform_updates();
     }
@@ -841,17 +844,6 @@ impl RunningAppState {
         self.perform_updates();
     }
 
-    /// Perform a click.
-    pub fn click(&self, x: f32, y: f32) {
-        self.active_webview()
-            .notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
-                MouseButtonAction::Click,
-                MouseButton::Left,
-                Point2D::new(x, y),
-            )));
-        self.perform_updates();
-    }
-
     pub fn key_down(&self, key: Key) {
         let key_event = KeyboardEvent::from_state_and_key(KeyState::Down, key);
         self.active_webview()
@@ -943,17 +935,57 @@ impl RunningAppState {
     }
 
     pub fn present_if_needed(&self) {
-        if self.inner().need_present {
-            self.inner_mut().need_present = false;
-            if !self.active_webview().paint() {
-                return;
-            }
-            save_output_image_if_necessary(&self.servoshell_preferences, &self.rendering_context);
-            self.rendering_context.present();
-            if self.servoshell_preferences.exit_after_stable_image {
-                self.request_shutdown();
-            }
+        if !self.inner().need_present {
+            return;
         }
+
+        self.inner_mut().need_present = false;
+        self.active_webview().paint();
+        self.rendering_context.present();
+
+        if self.servoshell_preferences.exit_after_stable_image &&
+            self.inner().achieved_stable_image.get()
+        {
+            self.request_shutdown();
+        }
+    }
+
+    /// If we are exiting after achieving a stable image or we want to save the display of the
+    /// [`WebView`] to an image file, request a screenshot of the [`WebView`].
+    fn maybe_request_screenshot(&self, webview: WebView) {
+        let output_path = self.servoshell_preferences.output_image_path.clone();
+        if !self.servoshell_preferences.exit_after_stable_image && output_path.is_none() {
+            return;
+        }
+
+        // Never request more than a single screenshot for now.
+        let achieved_stable_image = self.inner().achieved_stable_image.clone();
+        if achieved_stable_image.get() {
+            return;
+        }
+
+        webview.take_screenshot(None, move |image| {
+            achieved_stable_image.set(true);
+
+            let Some(output_path) = output_path else {
+                return;
+            };
+
+            let image = match image {
+                Ok(image) => image,
+                Err(error) => {
+                    error!("Could not take screenshot: {error:?}");
+                    return;
+                },
+            };
+
+            let image_format = ImageFormat::from_path(&output_path).unwrap_or(ImageFormat::Png);
+            if let Err(error) =
+                DynamicImage::ImageRgba8(image).save_with_format(output_path, image_format)
+            {
+                error!("Failed to save screenshot: {error}.");
+            }
+        });
     }
 }
 

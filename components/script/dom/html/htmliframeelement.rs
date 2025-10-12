@@ -3,13 +3,15 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::Cell;
+use std::rc::Rc;
 
 use base::id::{BrowsingContextId, PipelineId, WebViewId};
-use bitflags::bitflags;
-use constellation_traits::IFrameSandboxState::{IFrameSandboxed, IFrameUnsandboxed};
 use constellation_traits::{
     IFrameLoadInfo, IFrameLoadInfoWithData, JsEvalResult, LoadData, LoadOrigin,
     NavigationHistoryBehavior, ScriptToConstellationMessage,
+};
+use content_security_policy::sandboxing_directive::{
+    SandboxingFlagSet, parse_a_sandboxing_directive,
 };
 use dom_struct::dom_struct;
 use embedder_traits::ViewportDetails;
@@ -34,7 +36,7 @@ use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{DomRoot, LayoutDom, MutNullableDom};
 use crate::dom::bindings::str::{DOMString, USVString};
-use crate::dom::document::{Document, determine_policy_for_token};
+use crate::dom::document::Document;
 use crate::dom::domtokenlist::DOMTokenList;
 use crate::dom::element::{
     AttributeMutation, Element, LayoutElementHelpers, reflect_referrer_policy_attribute,
@@ -48,21 +50,7 @@ use crate::dom::virtualmethods::VirtualMethods;
 use crate::dom::windowproxy::WindowProxy;
 use crate::script_runtime::CanGc;
 use crate::script_thread::ScriptThread;
-
-#[derive(Clone, Copy, JSTraceable, MallocSizeOf)]
-struct SandboxAllowance(u8);
-
-bitflags! {
-    impl SandboxAllowance: u8 {
-        const ALLOW_NOTHING = 0x00;
-        const ALLOW_SAME_ORIGIN = 0x01;
-        const ALLOW_TOP_NAVIGATION = 0x02;
-        const ALLOW_FORMS = 0x04;
-        const ALLOW_SCRIPTS = 0x08;
-        const ALLOW_POINTER_LOCK = 0x10;
-        const ALLOW_POPUPS = 0x20;
-    }
-}
+use crate::script_window_proxies::ScriptWindowProxies;
 
 #[derive(PartialEq)]
 pub(crate) enum PipelineType {
@@ -90,16 +78,15 @@ pub(crate) struct HTMLIFrameElement {
     #[no_trace]
     about_blank_pipeline_id: Cell<Option<PipelineId>>,
     sandbox: MutNullableDom<DOMTokenList>,
-    sandbox_allowance: Cell<Option<SandboxAllowance>>,
+    #[no_trace]
+    sandboxing_flag_set: Cell<Option<SandboxingFlagSet>>,
     load_blocker: DomRefCell<Option<LoadBlocker>>,
     throttled: Cell<bool>,
+    #[conditional_malloc_size_of]
+    script_window_proxies: Rc<ScriptWindowProxies>,
 }
 
 impl HTMLIFrameElement {
-    pub(crate) fn is_sandboxed(&self) -> bool {
-        self.sandbox_allowance.get().is_some()
-    }
-
     /// <https://html.spec.whatwg.org/multipage/#otherwise-steps-for-iframe-or-frame-elements>,
     /// step 1.
     fn get_url(&self) -> ServoUrl {
@@ -138,12 +125,6 @@ impl HTMLIFrameElement {
         history_handling: NavigationHistoryBehavior,
         can_gc: CanGc,
     ) {
-        let sandboxed = if self.is_sandboxed() {
-            IFrameSandboxed
-        } else {
-            IFrameUnsandboxed
-        };
-
         let browsing_context_id = match self.browsing_context_id() {
             None => return warn!("Attempted to start a new pipeline on an unattached iframe."),
             Some(id) => id,
@@ -219,7 +200,6 @@ impl HTMLIFrameElement {
                     info: load_info,
                     load_data: load_data.clone(),
                     old_pipeline_id,
-                    sandbox: sandboxed,
                     viewport_details,
                     theme: window.theme(),
                 };
@@ -248,7 +228,6 @@ impl HTMLIFrameElement {
                     info: load_info,
                     load_data,
                     old_pipeline_id,
-                    sandbox: sandboxed,
                     viewport_details,
                     theme: window.theme(),
                 };
@@ -283,6 +262,7 @@ impl HTMLIFrameElement {
                 Some(window.as_global_scope().is_secure_context()),
                 Some(document.insecure_requests_policy()),
                 document.has_trustworthy_ancestor_or_current_origin(),
+                self.sandboxing_flag_set(),
             );
             load_data.destination = Destination::IFrame;
             load_data.policy_container = Some(window.as_global_scope().policy_container());
@@ -332,7 +312,7 @@ impl HTMLIFrameElement {
         // Note: despite not being explicitly stated in the spec steps, this falls back to
         // document's referrer policy here because it satisfies the expectations that when unset,
         // the iframe should inherit the referrer policy of its parent
-        let referrer_policy = match determine_policy_for_token(referrer_policy_token.str()) {
+        let referrer_policy = match ReferrerPolicy::from(&*referrer_policy_token.str()) {
             ReferrerPolicy::EmptyString => document.get_referrer_policy(),
             policy => policy,
         };
@@ -377,6 +357,7 @@ impl HTMLIFrameElement {
             Some(window.as_global_scope().is_secure_context()),
             Some(document.insecure_requests_policy()),
             document.has_trustworthy_ancestor_or_current_origin(),
+            self.sandboxing_flag_set(),
         );
         load_data.destination = Destination::IFrame;
         load_data.policy_container = Some(window.as_global_scope().policy_container());
@@ -425,6 +406,7 @@ impl HTMLIFrameElement {
             Some(window.as_global_scope().is_secure_context()),
             Some(document.insecure_requests_policy()),
             document.has_trustworthy_ancestor_or_current_origin(),
+            self.sandboxing_flag_set(),
         );
         load_data.destination = Destination::IFrame;
         load_data.policy_container = Some(window.as_global_scope().policy_container());
@@ -487,9 +469,10 @@ impl HTMLIFrameElement {
             pending_pipeline_id: Cell::new(None),
             about_blank_pipeline_id: Cell::new(None),
             sandbox: Default::default(),
-            sandbox_allowance: Cell::new(None),
+            sandboxing_flag_set: Cell::new(None),
             load_blocker: DomRefCell::new(None),
             throttled: Cell::new(false),
+            script_window_proxies: ScriptThread::window_proxies(),
         }
     }
 
@@ -526,6 +509,13 @@ impl HTMLIFrameElement {
         self.webview_id.get()
     }
 
+    #[inline]
+    pub(crate) fn sandboxing_flag_set(&self) -> SandboxingFlagSet {
+        self.sandboxing_flag_set
+            .get()
+            .unwrap_or_else(SandboxingFlagSet::empty)
+    }
+
     pub(crate) fn set_throttled(&self, throttled: bool) {
         if self.throttled.get() != throttled {
             self.throttled.set(throttled);
@@ -554,6 +544,25 @@ impl HTMLIFrameElement {
         LoadBlocker::terminate(blocker, can_gc);
 
         // TODO Step 5 - unset child document `mut iframe load` flag
+    }
+
+    /// Parse the `sandbox` attribute value given the [`Attr`]. This sets the `sandboxing_flag_set`
+    /// property or clears it is the value isn't specified. Notably, an unspecified sandboxing
+    /// attribute (no sandboxing) is different from an empty one (full sandboxing).
+    fn parse_sandbox_attribute(&self) {
+        let attribute = self
+            .upcast::<Element>()
+            .get_attribute(&ns!(), &local_name!("sandbox"));
+        self.sandboxing_flag_set
+            .set(attribute.map(|attribute_value| {
+                let tokens: Vec<_> = attribute_value
+                    .value()
+                    .as_tokens()
+                    .iter()
+                    .map(|atom| atom.to_string().to_ascii_lowercase())
+                    .collect();
+                parse_a_sandboxing_directive(&tokens)
+            }));
     }
 }
 
@@ -620,25 +629,36 @@ impl HTMLIFrameElementMethods<crate::DomTypeHolder> for HTMLIFrameElement {
         // Step 2: Set an attribute value given this, srcdoc's local name, and compliantString.
         element.set_attribute(
             &local_name!("srcdoc"),
-            AttrValue::String(value.as_ref().to_owned()),
+            AttrValue::String(value.str().to_owned()),
             can_gc,
         );
         Ok(())
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-iframe-sandbox
+    /// <https://html.spec.whatwg.org/multipage/#dom-iframe-sandbox>
+    ///
+    /// The supported tokens for sandbox's DOMTokenList are the allowed values defined in the
+    /// sandbox attribute and supported by the user agent. These range of possible values is
+    /// defined here: <https://html.spec.whatwg.org/multipage/#attr-iframe-sandbox>
     fn Sandbox(&self, can_gc: CanGc) -> DomRoot<DOMTokenList> {
         self.sandbox.or_init(|| {
             DOMTokenList::new(
                 self.upcast::<Element>(),
                 &local_name!("sandbox"),
                 Some(vec![
-                    Atom::from("allow-same-origin"),
+                    Atom::from("allow-downloads"),
                     Atom::from("allow-forms"),
+                    Atom::from("allow-modals"),
+                    Atom::from("allow-orientation-lock"),
                     Atom::from("allow-pointer-lock"),
                     Atom::from("allow-popups"),
+                    Atom::from("allow-popups-to-escape-sandbox"),
+                    Atom::from("allow-presentation"),
+                    Atom::from("allow-same-origin"),
                     Atom::from("allow-scripts"),
                     Atom::from("allow-top-navigation"),
+                    Atom::from("allow-top-navigation-by-user-activation"),
+                    Atom::from("allow-top-navigation-to-custom-protocols"),
                 ]),
                 can_gc,
             )
@@ -649,7 +669,7 @@ impl HTMLIFrameElementMethods<crate::DomTypeHolder> for HTMLIFrameElement {
     fn GetContentWindow(&self) -> Option<DomRoot<WindowProxy>> {
         self.browsing_context_id
             .get()
-            .and_then(ScriptThread::find_window_proxy)
+            .and_then(|id| self.script_window_proxies.find_window_proxy(id))
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-iframe-contentdocument
@@ -688,14 +708,14 @@ impl HTMLIFrameElementMethods<crate::DomTypeHolder> for HTMLIFrameElement {
     // https://html.spec.whatwg.org/multipage/#attr-iframe-allowfullscreen
     make_bool_setter!(SetAllowFullscreen, "allowfullscreen");
 
-    // https://html.spec.whatwg.org/multipage/#dom-dim-width
+    // <https://html.spec.whatwg.org/multipage/#dom-dim-width>
     make_getter!(Width, "width");
-    // https://html.spec.whatwg.org/multipage/#dom-dim-width
+    // <https://html.spec.whatwg.org/multipage/#dom-dim-width>
     make_dimension_setter!(SetWidth, "width");
 
-    // https://html.spec.whatwg.org/multipage/#dom-dim-height
+    // <https://html.spec.whatwg.org/multipage/#dom-dim-height>
     make_getter!(Height, "height");
-    // https://html.spec.whatwg.org/multipage/#dom-dim-height
+    // <https://html.spec.whatwg.org/multipage/#dom-dim-height>
     make_dimension_setter!(SetHeight, "height");
 
     // https://html.spec.whatwg.org/multipage/#other-elements,-attributes-and-apis:attr-iframe-frameborder
@@ -724,23 +744,18 @@ impl VirtualMethods for HTMLIFrameElement {
             .unwrap()
             .attribute_mutated(attr, mutation, can_gc);
         match *attr.local_name() {
-            local_name!("sandbox") => {
-                self.sandbox_allowance
-                    .set(mutation.new_value(attr).map(|value| {
-                        let mut modes = SandboxAllowance::ALLOW_NOTHING;
-                        for token in value.as_tokens() {
-                            modes |= match &*token.to_ascii_lowercase() {
-                                "allow-same-origin" => SandboxAllowance::ALLOW_SAME_ORIGIN,
-                                "allow-forms" => SandboxAllowance::ALLOW_FORMS,
-                                "allow-pointer-lock" => SandboxAllowance::ALLOW_POINTER_LOCK,
-                                "allow-popups" => SandboxAllowance::ALLOW_POPUPS,
-                                "allow-scripts" => SandboxAllowance::ALLOW_SCRIPTS,
-                                "allow-top-navigation" => SandboxAllowance::ALLOW_TOP_NAVIGATION,
-                                _ => SandboxAllowance::ALLOW_NOTHING,
-                            };
-                        }
-                        modes
-                    }));
+            // From <https://html.spec.whatwg.org/multipage/#attr-iframe-sandbox>:
+            //
+            // > When an iframe element's sandbox attribute is set or changed while
+            // > it has a non-null content navigable, the user agent must parse the
+            // > sandboxing directive given the attribute's value and the iframe
+            // > element's iframe sandboxing flag set.
+            //
+            // > When an iframe element's sandbox attribute is removed while it has
+            // > a non-null content navigable, the user agent must empty the iframe
+            // > element's iframe sandboxing flag set.
+            local_name!("sandbox") if self.browsing_context_id.get().is_some() => {
+                self.parse_sandbox_attribute();
             },
             local_name!("srcdoc") => {
                 // https://html.spec.whatwg.org/multipage/#the-iframe-element:the-iframe-element-9
@@ -776,6 +791,16 @@ impl VirtualMethods for HTMLIFrameElement {
         }
     }
 
+    fn attribute_affects_presentational_hints(&self, attr: &Attr) -> bool {
+        match attr.local_name() {
+            &local_name!("width") | &local_name!("height") => true,
+            _ => self
+                .super_type()
+                .unwrap()
+                .attribute_affects_presentational_hints(attr),
+        }
+    }
+
     fn parse_plain_attribute(&self, name: &LocalName, value: DOMString) -> AttrValue {
         match *name {
             local_name!("sandbox") => AttrValue::from_serialized_tokenlist(value.into()),
@@ -788,22 +813,30 @@ impl VirtualMethods for HTMLIFrameElement {
         }
     }
 
+    /// <https://html.spec.whatwg.org/multipage/#the-iframe-element:html-element-post-connection-steps>
     fn post_connection_steps(&self) {
         if let Some(s) = self.super_type() {
             s.post_connection_steps();
         }
 
-        // https://html.spec.whatwg.org/multipage/#the-iframe-element
-        // "When an iframe element is inserted into a document that has
-        // a browsing context, the user agent must create a new
-        // browsing context, set the element's nested browsing context
-        // to the newly-created browsing context, and then process the
-        // iframe attributes for the "first time"."
-        if self.upcast::<Node>().is_connected_with_browsing_context() {
-            debug!("iframe bound to browsing context.");
-            self.create_nested_browsing_context(CanGc::note());
-            self.process_the_iframe_attributes(ProcessingMode::FirstTime, CanGc::note());
+        // This isn't mentioned any longer in the specification, but still seems important. This is
+        // likely due to the fact that we have deviated a great deal with it comes to navigables
+        // and browsing contexts.
+        if !self.upcast::<Node>().is_connected_with_browsing_context() {
+            return;
         }
+
+        debug!("<iframe> running post connection steps");
+
+        // Step 1. Create a new child navigable for insertedNode.
+        self.create_nested_browsing_context(CanGc::note());
+
+        // Step 2: If insertedNode has a sandbox attribute, then parse the sandboxing directive
+        // given the attribute's value and insertedNode's iframe sandboxing flag set.
+        self.parse_sandbox_attribute();
+
+        // Step 3. Process the iframe attributes for insertedNode, with initialInsertion set to true.
+        self.process_the_iframe_attributes(ProcessingMode::FirstTime, CanGc::note());
     }
 
     fn bind_to_tree(&self, context: &BindContext, can_gc: CanGc) {

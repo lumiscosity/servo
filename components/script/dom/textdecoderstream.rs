@@ -103,7 +103,7 @@ pub(crate) struct TextDecoderStream {
     reflector_: Reflector,
 
     /// <https://encoding.spec.whatwg.org/#textdecodercommon>
-    #[ignore_malloc_size_of = "Rc is hard"]
+    #[conditional_malloc_size_of]
     decoder: Rc<TextDecoderCommon>,
 
     /// <https://streams.spec.whatwg.org/#generictransformstream>
@@ -157,7 +157,7 @@ impl TextDecoderStreamMethods<crate::DomTypeHolder> for TextDecoderStream {
         label: DOMString,
         options: &TextDecoderBinding::TextDecoderOptions,
     ) -> Fallible<DomRoot<TextDecoderStream>> {
-        let encoding = match Encoding::for_label_no_replacement(label.as_bytes()) {
+        let encoding = match Encoding::for_label_no_replacement(&label.as_bytes()) {
             Some(enc) => enc,
             None => {
                 return Err(Error::Range(

@@ -14,11 +14,12 @@ use base::id::{
 };
 use canvas_traits::canvas::{CanvasId, CanvasMsg};
 use compositing_traits::CrossProcessCompositorApi;
+use content_security_policy::sandboxing_directive::SandboxingFlagSet;
 use devtools_traits::{DevtoolScriptControlMsg, ScriptToDevtoolsControlMsg, WorkerId};
 use embedder_traits::{
     AnimationState, FocusSequenceNumber, JSValue, JavaScriptEvaluationError,
     JavaScriptEvaluationId, MediaSessionEvent, ScriptToEmbedderChan, Theme, TouchEventResult,
-    ViewportDetails, WebDriverMessageId,
+    ViewportDetails,
 };
 use euclid::default::Size2D as UntypedSize2D;
 use fonts_traits::SystemFontServiceProxySender;
@@ -27,13 +28,14 @@ use ipc_channel::ipc::IpcSender;
 use malloc_size_of_derive::MallocSizeOf;
 use net_traits::policy_container::PolicyContainer;
 use net_traits::request::{Destination, InsecureRequestsPolicy, Referrer, RequestBody};
-use net_traits::storage_thread::StorageType;
 use net_traits::{ReferrerPolicy, ResourceThreads};
 use profile_traits::mem::MemoryReportResult;
 use profile_traits::{mem, time as profile_time};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use servo_url::{ImmutableOrigin, ServoUrl};
+use storage_traits::StorageThreads;
+use storage_traits::webstorage_thread::StorageType;
 use strum_macros::IntoStaticStr;
 #[cfg(feature = "webgpu")]
 use webgpu_traits::{WebGPU, WebGPUAdapterResponse};
@@ -117,6 +119,9 @@ pub struct LoadData {
     pub crash: Option<String>,
     /// Destination, used for CSP checks
     pub destination: Destination,
+    /// The "creation sandboxing flag set" that this Pipeline should use when it is created.
+    /// See <https://html.spec.whatwg.org/multipage/#determining-the-creation-sandboxing-flags>.
+    pub creation_sandboxing_flag_set: SandboxingFlagSet,
 }
 
 /// The result of evaluating a javascript scheme url.
@@ -141,6 +146,7 @@ impl LoadData {
         inherited_secure_context: Option<bool>,
         inherited_insecure_requests_policy: Option<InsecureRequestsPolicy>,
         has_trustworthy_ancestor_origin: bool,
+        creation_sandboxing_flag_set: SandboxingFlagSet,
     ) -> LoadData {
         LoadData {
             load_origin,
@@ -159,6 +165,7 @@ impl LoadData {
             inherited_insecure_requests_policy,
             has_trustworthy_ancestor_origin,
             destination: Destination::Document,
+            creation_sandboxing_flag_set,
         }
     }
 }
@@ -361,15 +368,6 @@ pub trait ServiceWorkerManagerFactory {
     fn create(sw_senders: SWManagerSenders, origin: ImmutableOrigin);
 }
 
-/// Whether the sandbox attribute is present for an iframe element
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum IFrameSandboxState {
-    /// Sandbox attribute is present
-    IFrameSandboxed,
-    /// Sandbox attribute is not present
-    IFrameUnsandboxed,
-}
-
 /// Specifies the information required to load an auxiliary browsing context.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct AuxiliaryWebViewCreationRequest {
@@ -421,8 +419,6 @@ pub struct IFrameLoadInfoWithData {
     pub load_data: LoadData,
     /// The old pipeline ID for this iframe, if a page was previously loaded.
     pub old_pipeline_id: Option<PipelineId>,
-    /// Sandbox type of this iframe
-    pub sandbox: IFrameSandboxState,
     /// The initial viewport size for this iframe.
     pub viewport_details: ViewportDetails,
     /// The [`Theme`] to use within this iframe.
@@ -434,6 +430,8 @@ pub struct IFrameLoadInfoWithData {
 pub struct WorkerGlobalScopeInit {
     /// Chan to a resource thread
     pub resource_threads: ResourceThreads,
+    /// Chan to a storage thread
+    pub storage_threads: StorageThreads,
     /// Chan to the memory profiler
     pub mem_profiler_chan: mem::ProfilerChan,
     /// Chan to the time profiler
@@ -478,6 +476,37 @@ pub struct IFrameSizeMsg {
     pub size: ViewportDetails,
     /// The kind of sizing operation.
     pub type_: WindowSizeType,
+}
+
+/// An enum that describe a type of keyboard scroll.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub enum KeyboardScroll {
+    /// Scroll the container one line up.
+    Up,
+    /// Scroll the container one line down.
+    Down,
+    /// Scroll the container one "line" left.
+    Left,
+    /// Scroll the container one "line" right.
+    Right,
+    /// Scroll the container one page up.
+    PageUp,
+    /// Scroll the container one page down.
+    PageDown,
+    /// Scroll the container to the vertical start.
+    Home,
+    /// Scroll the container to the vertical end.
+    End,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub enum ScreenshotReadinessResponse {
+    /// The Pipeline associated with this response, is ready for a screenshot at the
+    /// provided [`Epoch`].
+    Ready(Epoch),
+    /// The Pipeline associated with this response is no longer active and should be
+    /// ignored for the purposes of the screenshot.
+    NoLongerActive,
 }
 
 /// Messages from the script to the constellation.
@@ -542,7 +571,7 @@ pub enum ScriptToConstellationMessage {
     /// 2D canvases may use the GPU and we don't want to give untrusted content access to the GPU.)
     CreateCanvasPaintThread(
         UntypedSize2D<u64>,
-        IpcSender<Option<(IpcSender<CanvasMsg>, CanvasId, ImageKey)>>,
+        IpcSender<Option<(GenericSender<CanvasMsg>, CanvasId, ImageKey)>>,
     ),
     /// Notifies the constellation that this pipeline is requesting focus.
     ///
@@ -620,8 +649,6 @@ pub enum ScriptToConstellationMessage {
     ActivateDocument,
     /// Set the document state for a pipeline (used by screenshot / reftests)
     SetDocumentState(DocumentState),
-    /// Update the layout epoch in the constellation (used by screenshot / reftests).
-    SetLayoutEpoch(Epoch, IpcSender<bool>),
     /// Update the pipeline Url, which can change after redirections.
     SetFinalUrl(ServoUrl),
     /// Script has handled a touch event, and either prevented or allowed default actions.
@@ -663,8 +690,10 @@ pub enum ScriptToConstellationMessage {
         JavaScriptEvaluationId,
         Result<JSValue, JavaScriptEvaluationError>,
     ),
-    /// Notify the completion of a webdriver command.
-    WebDriverInputComplete(WebDriverMessageId),
+    /// Forward a keyboard scroll operation from an `<iframe>` to a parent pipeline.
+    ForwardKeyboardScroll(PipelineId, KeyboardScroll),
+    /// Notify the Constellation of the screenshot readiness of a given pipeline.
+    RespondToScreenshotReadinessRequest(ScreenshotReadinessResponse),
 }
 
 impl fmt::Debug for ScriptToConstellationMessage {

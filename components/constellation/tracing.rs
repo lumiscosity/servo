@@ -36,7 +36,7 @@ pub(crate) trait LogTarget {
 }
 
 mod from_compositor {
-    use embedder_traits::InputEvent;
+    use embedder_traits::{InputEvent, InputEventAndId};
 
     use super::LogTarget;
 
@@ -50,7 +50,6 @@ mod from_compositor {
         fn log_target(&self) -> &'static str {
             match self {
                 Self::Exit => target!("Exit"),
-                Self::IsReadyToSaveImage(..) => target!("IsReadyToSaveImage"),
                 Self::AllowNavigationResponse(..) => target!("AllowNavigationResponse"),
                 Self::LoadUrl(..) => target!("LoadUrl"),
                 Self::ClearCache => target!("ClearCache"),
@@ -77,23 +76,24 @@ mod from_compositor {
                 Self::EvaluateJavaScript(..) => target!("EvaluateJavaScript"),
                 Self::CreateMemoryReport(..) => target!("CreateMemoryReport"),
                 Self::SendImageKeysForPipeline(..) => target!("SendImageKeysForPipeline"),
-                Self::SetWebDriverResponseSender(..) => target!("SetWebDriverResponseSender"),
                 Self::PreferencesUpdated(..) => target!("PreferencesUpdated"),
                 Self::NoLongerWaitingOnAsynchronousImageUpdates(..) => {
                     target!("NoLongerWaitingOnCanvas")
                 },
+                Self::RequestScreenshotReadiness(..) => target!("RequestScreenshotReadiness"),
+                Self::EmbedderControlResponse(..) => target!("EmbedderControlResponse"),
             }
         }
     }
 
-    impl LogTarget for InputEvent {
+    impl LogTarget for InputEventAndId {
         fn log_target(&self) -> &'static str {
             macro_rules! target_variant {
                 ($name:literal) => {
                     target!("ForwardInputEvent(" $name ")")
                 };
             }
-            match self {
+            match self.event {
                 InputEvent::EditingAction(..) => target_variant!("EditingAction"),
                 InputEvent::Gamepad(..) => target_variant!("Gamepad"),
                 InputEvent::Ime(..) => target_variant!("Ime"),
@@ -163,7 +163,6 @@ mod from_script {
                 Self::CreateAuxiliaryWebView(..) => target!("ScriptNewAuxiliary"),
                 Self::ActivateDocument => target!("ActivateDocument"),
                 Self::SetDocumentState(..) => target!("SetDocumentState"),
-                Self::SetLayoutEpoch(..) => target!("SetLayoutEpoch"),
                 Self::SetFinalUrl(..) => target!("SetFinalUrl"),
                 Self::TouchEventProcessed(..) => target!("TouchEventProcessed"),
                 Self::LogEntry(..) => target!("LogEntry"),
@@ -180,8 +179,11 @@ mod from_script {
                 Self::TitleChanged(..) => target!("TitleChanged"),
                 Self::IFrameSizes(..) => target!("IFrameSizes"),
                 Self::ReportMemory(..) => target!("ReportMemory"),
-                Self::WebDriverInputComplete(..) => target!("WebDriverInputComplete"),
                 Self::FinishJavaScriptEvaluation(..) => target!("FinishJavaScriptEvaluation"),
+                Self::ForwardKeyboardScroll(..) => target!("ForwardKeyboardScroll"),
+                Self::RespondToScreenshotReadinessRequest(..) => {
+                    target!("RespondToScreenshotReadinessRequest")
+                },
             }
         }
     }

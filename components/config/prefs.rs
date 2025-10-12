@@ -114,6 +114,7 @@ pub struct Preferences {
     pub dom_fontface_enabled: bool,
     pub dom_fullscreen_test: bool,
     pub dom_gamepad_enabled: bool,
+    pub dom_geolocation_enabled: bool,
     pub dom_indexeddb_enabled: bool,
     pub dom_intersection_observer_enabled: bool,
     pub dom_microdata_testing_enabled: bool,
@@ -254,6 +255,8 @@ pub struct Preferences {
     pub threadpools_image_cache_workers_max: i64,
     /// Maximum number of workers for the IndexedDB thread pool
     pub threadpools_indexeddb_workers_max: i64,
+    /// Maximum number of workers for the Web Storage thread pool
+    pub threadpools_webstorage_workers_max: i64,
     /// Maximum number of workers for the Networking async runtime thread pool
     pub threadpools_async_runtime_workers_max: i64,
     /// Maximum number of workers for the Core Resource Manager
@@ -294,6 +297,7 @@ impl Preferences {
             dom_fontface_enabled: false,
             dom_fullscreen_test: false,
             dom_gamepad_enabled: true,
+            dom_geolocation_enabled: false,
             dom_indexeddb_enabled: false,
             dom_intersection_observer_enabled: false,
             dom_microdata_testing_enabled: false,
@@ -426,6 +430,7 @@ impl Preferences {
             threadpools_fallback_worker_num: 3,
             threadpools_image_cache_workers_max: 4,
             threadpools_indexeddb_workers_max: 4,
+            threadpools_webstorage_workers_max: 4,
             threadpools_resource_workers_max: 4,
             threadpools_webrender_workers_max: 4,
             webgl_testing_context_creation_error: false,

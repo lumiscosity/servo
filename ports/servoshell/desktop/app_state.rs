@@ -2,38 +2,34 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::{Ref, RefCell, RefMut};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::mem;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use crossbeam_channel::Receiver;
-use embedder_traits::webdriver::WebDriverSenders;
-use euclid::Vector2D;
-use keyboard_types::{Key, Modifiers, NamedKey, ShortcutMatcher};
+use crossbeam_channel::{Receiver, Sender};
+use image::{DynamicImage, ImageFormat};
 use log::{error, info};
 use servo::base::generic_channel::GenericSender;
 use servo::base::id::WebViewId;
 use servo::config::pref;
 use servo::ipc_channel::ipc::IpcSender;
-use servo::webrender_api::ScrollLocation;
 use servo::webrender_api::units::{DeviceIntPoint, DeviceIntSize};
 use servo::{
     AllowOrDenyRequest, AuthenticationRequest, FilterPattern, FormControl, GamepadHapticEffectType,
-    JSValue, KeyboardEvent, LoadStatus, PermissionRequest, Servo, ServoDelegate, ServoError,
-    SimpleDialog, TraversalId, WebDriverCommandMsg, WebDriverJSResult, WebDriverLoadStatus,
-    WebDriverUserPrompt, WebView, WebViewBuilder, WebViewDelegate,
+    InputEvent, InputEventId, InputEventResult, JSValue, LoadStatus, PermissionRequest, Servo,
+    ServoDelegate, ServoError, SimpleDialog, TraversalId, WebDriverCommandMsg, WebDriverJSResult,
+    WebDriverLoadStatus, WebDriverSenders, WebDriverUserPrompt, WebView, WebViewBuilder,
+    WebViewDelegate,
 };
 use url::Url;
 
 use super::app::PumpResult;
 use super::dialog::Dialog;
 use super::gamepad::GamepadSupport;
-use super::keyutils::CMD_OR_CONTROL;
-use super::window_trait::{LINE_HEIGHT, LINE_WIDTH, WindowPortsMethods};
-use crate::output_image::save_output_image_if_necessary;
+use super::window_trait::WindowPortsMethods;
 use crate::prefs::ServoShellPreferences;
 
 pub(crate) enum AppState {
@@ -93,6 +89,15 @@ pub struct RunningAppStateInner {
     /// List of webviews that have favicon textures which are not yet uploaded
     /// to the GPU by egui.
     pending_favicon_loads: Vec<WebViewId>,
+
+    /// Whether or not the application has achieved stable image output. This is used
+    /// for the `exit_after_stable_image` option.
+    achieved_stable_image: Rc<Cell<bool>>,
+
+    /// A [`HashMap`] of pending WebDriver events. It is the WebDriver embedder's responsibility
+    /// to inform the WebDriver server when the event has been fully handled. This map is used
+    /// to report back to WebDriver when that happens.
+    pending_webdriver_events: HashMap<InputEventId, Sender<()>>,
 }
 
 impl Drop for RunningAppState {
@@ -125,6 +130,8 @@ impl RunningAppState {
                 need_repaint: false,
                 dialog_amount_changed: false,
                 pending_favicon_loads: Default::default(),
+                achieved_stable_image: Default::default(),
+                pending_webdriver_events: Default::default(),
             }),
         }
     }
@@ -180,24 +187,12 @@ impl RunningAppState {
         let Some(webview) = self.focused_webview() else {
             return;
         };
-        if !webview.paint() {
-            return;
-        }
 
-        // This needs to be done before presenting(), because `ReneringContext::read_to_image` reads
-        // from the back buffer.
-        save_output_image_if_necessary(
-            &self.servoshell_preferences,
-            &self.inner().window.rendering_context(),
-        );
+        webview.paint();
 
         let mut inner_mut = self.inner_mut();
         inner_mut.window.rendering_context().present();
         inner_mut.need_repaint = false;
-
-        if self.servoshell_preferences.exit_after_stable_image {
-            self.servo().start_shutting_down();
-        }
     }
 
     /// Spins the internal application event loop.
@@ -221,6 +216,12 @@ impl RunningAppState {
         let need_update = std::mem::replace(&mut self.inner_mut().need_update, false);
 
         self.inner_mut().dialog_amount_changed = false;
+
+        if self.servoshell_preferences.exit_after_stable_image &&
+            self.inner().achieved_stable_image.get()
+        {
+            self.servo.start_shutting_down();
+        }
 
         PumpResult::Continue {
             need_update,
@@ -412,60 +413,6 @@ impl RunningAppState {
             .position(|webview| webview.0 == focused_id)
     }
 
-    /// Handle servoshell key bindings that may have been prevented by the page in the focused webview.
-    fn handle_overridable_key_bindings(&self, webview: ::servo::WebView, event: KeyboardEvent) {
-        let origin = webview.rect().min.ceil().to_i32();
-        ShortcutMatcher::from_event(event.event)
-            .shortcut(CMD_OR_CONTROL, '=', || {
-                webview.set_zoom(1.1);
-            })
-            .shortcut(CMD_OR_CONTROL, '+', || {
-                webview.set_zoom(1.1);
-            })
-            .shortcut(CMD_OR_CONTROL, '-', || {
-                webview.set_zoom(1.0 / 1.1);
-            })
-            .shortcut(CMD_OR_CONTROL, '0', || {
-                webview.reset_zoom();
-            })
-            .shortcut(Modifiers::empty(), Key::Named(NamedKey::PageDown), || {
-                let scroll_location = ScrollLocation::Delta(Vector2D::new(
-                    0.0,
-                    self.inner().window.page_height() - 2.0 * LINE_HEIGHT,
-                ));
-                webview.notify_scroll_event(scroll_location, origin);
-            })
-            .shortcut(Modifiers::empty(), Key::Named(NamedKey::PageUp), || {
-                let scroll_location = ScrollLocation::Delta(Vector2D::new(
-                    0.0,
-                    -self.inner().window.page_height() + 2.0 * LINE_HEIGHT,
-                ));
-                webview.notify_scroll_event(scroll_location, origin);
-            })
-            .shortcut(Modifiers::empty(), Key::Named(NamedKey::Home), || {
-                webview.notify_scroll_event(ScrollLocation::Start, origin);
-            })
-            .shortcut(Modifiers::empty(), Key::Named(NamedKey::End), || {
-                webview.notify_scroll_event(ScrollLocation::End, origin);
-            })
-            .shortcut(Modifiers::empty(), Key::Named(NamedKey::ArrowUp), || {
-                let location = ScrollLocation::Delta(Vector2D::new(0.0, -LINE_HEIGHT));
-                webview.notify_scroll_event(location, origin);
-            })
-            .shortcut(Modifiers::empty(), Key::Named(NamedKey::ArrowDown), || {
-                let location = ScrollLocation::Delta(Vector2D::new(0.0, LINE_HEIGHT));
-                webview.notify_scroll_event(location, origin);
-            })
-            .shortcut(Modifiers::empty(), Key::Named(NamedKey::ArrowLeft), || {
-                let location = ScrollLocation::Delta(Vector2D::new(-LINE_WIDTH, 0.0));
-                webview.notify_scroll_event(location, origin);
-            })
-            .shortcut(Modifiers::empty(), Key::Named(NamedKey::ArrowRight), || {
-                let location = ScrollLocation::Delta(Vector2D::new(LINE_WIDTH, 0.0));
-                webview.notify_scroll_event(location, origin);
-            });
-    }
-
     pub(crate) fn set_pending_traversal(
         &self,
         traversal_id: TraversalId,
@@ -530,6 +477,64 @@ impl RunningAppState {
     /// Return a list of all webviews that have favicons that have not yet been loaded by egui.
     pub(crate) fn take_pending_favicon_loads(&self) -> Vec<WebViewId> {
         mem::take(&mut self.inner_mut().pending_favicon_loads)
+    }
+
+    /// If we are exiting after achieving a stable image or we want to save the display of the
+    /// [`WebView`] to an image file, request a screenshot of the [`WebView`].
+    fn maybe_request_screenshot(&self, webview: WebView) {
+        let output_path = self.servoshell_preferences.output_image_path.clone();
+        if !self.servoshell_preferences.exit_after_stable_image && output_path.is_none() {
+            return;
+        }
+
+        // Never request more than a single screenshot for now.
+        let achieved_stable_image = self.inner().achieved_stable_image.clone();
+        if achieved_stable_image.get() {
+            return;
+        }
+
+        webview.take_screenshot(None, move |image| {
+            achieved_stable_image.set(true);
+
+            let Some(output_path) = output_path else {
+                return;
+            };
+
+            let image = match image {
+                Ok(image) => image,
+                Err(error) => {
+                    error!("Could not take screenshot: {error:?}");
+                    return;
+                },
+            };
+
+            let image_format = ImageFormat::from_path(&output_path).unwrap_or(ImageFormat::Png);
+            if let Err(error) =
+                DynamicImage::ImageRgba8(image).save_with_format(output_path, image_format)
+            {
+                error!("Failed to save screenshot: {error}.");
+            }
+        });
+    }
+
+    pub(crate) fn handle_webdriver_input_event(
+        &self,
+        webview_id: WebViewId,
+        input_event: InputEvent,
+        response_sender: Option<Sender<()>>,
+    ) {
+        let Some(webview) = self.webview_by_id(webview_id) else {
+            error!("Could not find WebView ({webview_id:?}) for WebDriver event: {input_event:?}");
+            return;
+        };
+
+        let event_id = webview.notify_input_event(input_event);
+
+        if let Some(response_sender) = response_sender {
+            self.inner_mut()
+                .pending_webdriver_events
+                .insert(event_id, response_sender);
+        }
     }
 }
 
@@ -672,8 +677,19 @@ impl WebViewDelegate for RunningAppState {
         }
     }
 
-    fn notify_keyboard_event(&self, webview: servo::WebView, keyboard_event: KeyboardEvent) {
-        self.handle_overridable_key_bindings(webview, keyboard_event);
+    fn notify_input_event_handled(
+        &self,
+        webview: WebView,
+        id: InputEventId,
+        result: InputEventResult,
+    ) {
+        self.inner()
+            .window
+            .notify_input_event_handled(&webview, id, result);
+
+        if let Some(response_sender) = self.inner_mut().pending_webdriver_events.remove(&id) {
+            let _ = response_sender.send(());
+        }
     }
 
     fn notify_cursor_changed(&self, _webview: servo::WebView, cursor: servo::Cursor) {
@@ -692,6 +708,7 @@ impl WebViewDelegate for RunningAppState {
             {
                 let _ = sender.send(WebDriverLoadStatus::Complete);
             }
+            self.maybe_request_screenshot(webview);
         }
     }
 

@@ -28,7 +28,7 @@ use crate::script_runtime::CanGc;
 #[dom_struct]
 pub(crate) struct CSSKeyframesRule {
     cssrule: CSSRule,
-    #[ignore_malloc_size_of = "Arc"]
+    #[ignore_malloc_size_of = "Stylo"]
     #[no_trace]
     keyframesrule: RefCell<Arc<Locked<KeyframesRule>>>,
     rulelist: MutNullableDom<CSSRuleList>,
@@ -76,8 +76,9 @@ impl CSSKeyframesRule {
     }
 
     /// Given a keyframe selector, finds the index of the first corresponding rule if any
-    fn find_rule(&self, selector: &str) -> Option<usize> {
-        let mut input = ParserInput::new(selector);
+    fn find_rule(&self, selector: &DOMString) -> Option<usize> {
+        let selector = selector.str();
+        let mut input = ParserInput::new(&selector);
         let mut input = Parser::new(&mut input);
         if let Ok(sel) = KeyframeSelector::parse(&mut input) {
             let guard = self.cssrule.shared_lock().read();
@@ -116,6 +117,7 @@ impl CSSKeyframesRuleMethods<crate::DomTypeHolder> for CSSKeyframesRule {
     // https://drafts.csswg.org/css-animations/#dom-csskeyframesrule-appendrule
     fn AppendRule(&self, rule: DOMString, can_gc: CanGc) {
         let style_stylesheet = self.cssrule.parent_stylesheet().style_stylesheet();
+        let rule = rule.str();
         let rule = Keyframe::parse(
             &rule,
             &style_stylesheet.contents,
@@ -161,7 +163,7 @@ impl CSSKeyframesRuleMethods<crate::DomTypeHolder> for CSSKeyframesRule {
         // Setting this property to a CSS-wide keyword or `none` does not throw,
         // it stores a value that serializes as a quoted string.
         self.cssrule.parent_stylesheet().will_modify();
-        let name = KeyframesName::from_ident(&value);
+        let name = KeyframesName::from_ident(&value.str());
         let mut guard = self.cssrule.shared_lock().write();
         self.keyframesrule.borrow().write_with(&mut guard).name = name;
         self.cssrule.parent_stylesheet().notify_invalidations();

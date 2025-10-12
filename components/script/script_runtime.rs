@@ -59,7 +59,6 @@ use script_bindings::script_runtime::{mark_runtime_dead, runtime_is_alive};
 use servo_config::{opts, pref};
 use style::thread_state::{self, ThreadState};
 
-use crate::body::BodyMixin;
 use crate::dom::bindings::codegen::Bindings::PromiseBinding::PromiseJobCallback;
 use crate::dom::bindings::codegen::Bindings::ResponseBinding::Response_Binding::ResponseMethods;
 use crate::dom::bindings::codegen::Bindings::ResponseBinding::ResponseType as DOMResponseType;
@@ -117,6 +116,7 @@ pub(crate) enum ScriptThreadEventCategory {
     FileRead,
     FontLoading,
     FormPlannedNavigation,
+    GeolocationEvent,
     HistoryEvent,
     ImageCacheMsg,
     InputEvent,
@@ -158,6 +158,7 @@ impl From<ScriptThreadEventCategory> for ProfilerCategory {
             ScriptThreadEventCategory::FormPlannedNavigation => {
                 ProfilerCategory::ScriptPlannedNavigation
             },
+            ScriptThreadEventCategory::GeolocationEvent => ProfilerCategory::ScriptGeolocationEvent,
             ScriptThreadEventCategory::HistoryEvent => ProfilerCategory::ScriptHistoryEvent,
             ScriptThreadEventCategory::ImageCacheMsg => ProfilerCategory::ScriptImageCacheMsg,
             ScriptThreadEventCategory::InputEvent => ProfilerCategory::ScriptInputEvent,
@@ -204,6 +205,7 @@ impl From<ScriptThreadEventCategory> for ScriptHangAnnotation {
             ScriptThreadEventCategory::FormPlannedNavigation => {
                 ScriptHangAnnotation::FormPlannedNavigation
             },
+            ScriptThreadEventCategory::GeolocationEvent => ScriptHangAnnotation::GeolocationEvent,
             ScriptThreadEventCategory::HistoryEvent => ScriptHangAnnotation::HistoryEvent,
             ScriptThreadEventCategory::ImageCacheMsg => ScriptHangAnnotation::ImageCacheMsg,
             ScriptThreadEventCategory::NetworkEvent => ScriptHangAnnotation::NetworkEvent,
@@ -492,7 +494,7 @@ unsafe extern "C" fn code_for_eval_gets(
         let script_string = trusted_script.data();
         let new_string = JS_NewStringCopyN(
             *cx,
-            script_string.as_ptr() as *const libc::c_char,
+            script_string.str().as_ptr() as *const libc::c_char,
             script_string.len(),
         );
         code_for_eval.set(new_string);
@@ -552,13 +554,16 @@ unsafe extern "C" fn content_security_policy_allows(
                                 parameter_args_vec
                                     .push(TrustedScriptOrString::TrustedScript(trusted_script));
                             } else {
-                                unreachable!();
+                                // It's not a trusted script but a different object. Treat it
+                                // as if it is a string, since we don't need the actual contents
+                                // of the object.
+                                parameter_args_vec
+                                    .push(TrustedScriptOrString::String(DOMString::new()));
                             }
                         } else if value.is_string() {
-                            let string_ptr = std::ptr::NonNull::new(value.to_string()).unwrap();
-                            let dom_string = unsafe { jsstr_to_string(*cx, string_ptr) };
+                            // We don't need to know the specific string, only that it is untrusted
                             parameter_args_vec
-                                .push(TrustedScriptOrString::String(dom_string.into()));
+                                .push(TrustedScriptOrString::String(DOMString::new()));
                         } else {
                             unreachable!();
                         }
@@ -657,11 +662,14 @@ pub(crate) fn notify_about_rejected_promises(global: &GlobalScope) {
     }
 }
 
-#[derive(JSTraceable)]
+#[derive(JSTraceable, MallocSizeOf)]
 pub(crate) struct Runtime {
+    #[ignore_malloc_size_of = "Type from mozjs"]
     rt: RustRuntime,
     /// Our actual microtask queue, which is preserved and untouched by the debugger when running debugger scripts.
+    #[conditional_malloc_size_of]
     pub(crate) microtask_queue: Rc<MicrotaskQueue>,
+    #[ignore_malloc_size_of = "Type from mozjs"]
     job_queue: *mut JobQueue,
     networking_task_src: Option<Box<SendableTaskSource>>,
 }

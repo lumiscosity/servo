@@ -43,6 +43,7 @@ use net_traits::{
     FetchMetadata, FetchResponseListener, Metadata, NetworkError, ReferrerPolicy,
     ResourceFetchTiming, ResourceTimingType,
 };
+use script_bindings::domstring::BytesView;
 use script_bindings::error::Fallible;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use servo_url::ServoUrl;
@@ -435,7 +436,7 @@ impl crate::unminify::ScriptSource for ModuleSource {
         self.unminified_dir.clone()
     }
 
-    fn extract_bytes(&self) -> &[u8] {
+    fn extract_bytes(&self) -> BytesView<'_> {
         self.source.as_bytes()
     }
 
@@ -467,13 +468,15 @@ impl ModuleTree {
         options: ScriptFetchOptions,
         mut module_script: RustMutableHandleObject,
         inline: bool,
-        can_gc: CanGc,
+        line_number: u64,
         introduction_type: Option<&'static CStr>,
+        can_gc: CanGc,
     ) -> Result<(), RethrowError> {
         let cx = GlobalScope::get_cx();
         let _ac = JSAutoRealm::new(*cx, *global.reflector().get_jsobject());
 
-        let mut compile_options = unsafe { CompileOptionsWrapper::new(*cx, url.as_str(), 1) };
+        let mut compile_options =
+            unsafe { CompileOptionsWrapper::new(*cx, url.as_str(), line_number as u32) };
         if let Some(introduction_type) = introduction_type {
             compile_options.set_introduction_type(introduction_type);
         }
@@ -489,7 +492,7 @@ impl ModuleTree {
             module_script.set(CompileModule1(
                 *cx,
                 compile_options.ptr,
-                &mut transform_str_to_source_text(&module_source.source),
+                &mut transform_str_to_source_text(&module_source.source.str()),
             ));
 
             if module_script.is_null() {
@@ -693,6 +696,7 @@ impl ModuleTree {
         let as_url = Self::resolve_url_like_module_specifier(&specifier, base_url);
         // Step 8. Let normalizedSpecifier be the serialization of asURL, if asURL is non-null;
         // otherwise, specifier.
+        let specifier = specifier.str();
         let normalized_specifier = match &as_url {
             Some(url) => url.as_str(),
             None => &specifier,
@@ -768,13 +772,15 @@ impl ModuleTree {
         base_url: &ServoUrl,
     ) -> Option<ServoUrl> {
         // Step 1. If specifier starts with "/", "./", or "../", then:
-        if specifier.starts_with('/') || specifier.starts_with("./") || specifier.starts_with("../")
+        if specifier.starts_with('/') ||
+            specifier.starts_with_str("./") ||
+            specifier.starts_with_str("../")
         {
             // Step 1.1. Let url be the result of URL parsing specifier with baseURL.
-            return ServoUrl::parse_with_base(Some(base_url), specifier).ok();
+            return ServoUrl::parse_with_base(Some(base_url), &specifier.str()).ok();
         }
         // Step 2. Let url be the result of URL parsing specifier (with no base URL).
-        ServoUrl::parse(specifier).ok()
+        ServoUrl::parse(&specifier.str()).ok()
     }
 
     /// <https://html.spec.whatwg.org/multipage/#finding-the-first-parse-error>
@@ -1079,7 +1085,7 @@ impl ModuleOwner {
                                 fetch_options,
                                 ScriptType::Module,
                                 global.unminified_js_dir(),
-                                Err(Error::NotFound),
+                                Err(Error::NotFound(None)),
                             )),
                         },
                     }
@@ -1339,8 +1345,9 @@ impl FetchResponseListener for ModuleContext {
                     self.options.clone(),
                     compiled_module.handle_mut(),
                     false,
-                    CanGc::note(),
+                    1, // external scripts start at the first line of the file
                     self.introduction_type,
+                    CanGc::note(),
                 );
 
                 match compiled_module_result {
@@ -1719,7 +1726,7 @@ impl DynamicModuleList {
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 #[derive(JSTraceable, MallocSizeOf)]
 struct DynamicModule {
-    #[ignore_malloc_size_of = "Rc is hard"]
+    #[conditional_malloc_size_of]
     promise: Rc<Promise>,
     #[ignore_malloc_size_of = "GC types are hard"]
     specifier: Heap<*mut JSObject>,
@@ -1888,6 +1895,7 @@ pub(crate) fn fetch_inline_module_script(
     url: ServoUrl,
     script_id: ScriptId,
     options: ScriptFetchOptions,
+    line_number: u64,
     can_gc: CanGc,
 ) {
     let global = owner.global();
@@ -1904,8 +1912,9 @@ pub(crate) fn fetch_inline_module_script(
         options.clone(),
         compiled_module.handle_mut(),
         true,
-        can_gc,
+        line_number,
         Some(IntroductionType::INLINE_SCRIPT),
+        can_gc,
     );
 
     match compiled_module_result {
@@ -2172,7 +2181,7 @@ pub(crate) fn parse_an_import_map_string(
     can_gc: CanGc,
 ) -> Fallible<ImportMap> {
     // Step 1. Let parsed be the result of parsing a JSON string to an Infra value given input.
-    let parsed: JsonValue = serde_json::from_str(input.str())
+    let parsed: JsonValue = serde_json::from_str(&input.str())
         .map_err(|_| Error::Type("The value needs to be a JSON object.".to_owned()))?;
     // Step 2. If parsed is not an ordered map, then throw a TypeError indicating that the
     // top-level value needs to be a JSON object.

@@ -1,7 +1,6 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
-use crate::dom::bindings::codegen::Bindings::EventBinding::Event_Binding::EventMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLElementBinding::HTMLElementMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLOrSVGElementBinding::FocusOptions;
 use crate::dom::bindings::inheritance::Castable;
@@ -62,22 +61,23 @@ pub(crate) trait Validatable {
             return true;
         }
 
-        // Step 1.1.
-        let event = self
+        // Step 1.1: Let `report` be the result of firing an event named invalid at element,
+        // with the cancelable attribute initialized to true.
+        let report = self
             .as_element()
             .upcast::<EventTarget>()
             .fire_cancelable_event(atom!("invalid"), can_gc);
 
-        // Step 1.2.
-        if !event.DefaultPrevented() {
+        // Step 1.2. If `report` is true, for the element,
+        // report the problem, run focusing steps, scroll into view.
+        if report {
             let flags = self.validity_state().invalid_flags();
             println!(
                 "Validation error: {}",
                 validation_message_for_flags(&self.validity_state(), flags)
             );
             if let Some(html_elem) = self.as_element().downcast::<HTMLElement>() {
-                // TODO: "Focusing steps" has a different meaning from the focus() method.
-                // The actual focusing steps should be implemented
+                // Run focusing steps and scroll into view.
                 html_elem.Focus(&FocusOptions::default(), can_gc);
             }
         }

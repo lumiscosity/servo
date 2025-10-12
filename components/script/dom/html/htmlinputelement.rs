@@ -11,14 +11,15 @@ use std::ptr::NonNull;
 use std::str::FromStr;
 use std::{f64, ptr};
 
-use base::generic_channel;
+use base::IpcSend;
 use dom_struct::dom_struct;
 use embedder_traits::{
-    EmbedderMsg, FilterPattern, FormControl as EmbedderFormControl, InputMethodType, RgbColor,
+    FilterPattern, FormControlRequest as EmbedderFormControl, InputMethodType, RgbColor,
 };
 use encoding_rs::Encoding;
 use euclid::{Point2D, Rect, Size2D};
-use html5ever::{LocalName, Prefix, local_name, ns};
+use html5ever::{LocalName, Prefix, QualName, local_name, ns};
+use itertools::Itertools;
 use js::jsapi::{
     ClippedTime, DateGetMsecSinceEpoch, Handle, JS_ClearPendingException, JSObject, NewDateObject,
     NewUCRegExpObject, ObjectIsDate, RegExpFlag_UnicodeSets, RegExpFlags,
@@ -26,15 +27,15 @@ use js::jsapi::{
 use js::jsval::UndefinedValue;
 use js::rust::wrappers::{CheckRegExpSyntax, ExecuteRegExpNoStatics, ObjectIsRegExp};
 use js::rust::{HandleObject, MutableHandleObject};
+use net_traits::CoreResourceMsg;
 use net_traits::blob_url_store::get_blob_origin;
 use net_traits::filemanager_thread::{FileManagerResult, FileManagerThreadMsg};
-use net_traits::{CoreResourceMsg, IpcSend};
 use script_bindings::codegen::GenericBindings::CharacterDataBinding::CharacterDataMethods;
 use script_bindings::codegen::GenericBindings::DocumentBinding::DocumentMethods;
 use servo_config::pref;
 use style::attr::AttrValue;
 use style::selector_parser::PseudoElement;
-use style::str::{split_commas, str_join};
+use style::str::split_commas;
 use stylo_atoms::Atom;
 use stylo_dom::ElementState;
 use time::{Month, OffsetDateTime, Time};
@@ -60,14 +61,16 @@ use crate::dom::bindings::str::{DOMString, FromInputValueString, ToInputValueStr
 use crate::dom::clipboardevent::ClipboardEvent;
 use crate::dom::compositionevent::CompositionEvent;
 use crate::dom::document::Document;
-use crate::dom::element::{AttributeMutation, Element, LayoutElementHelpers};
+use crate::dom::document_embedder_controls::ControlElement;
+use crate::dom::element::{
+    AttributeMutation, CustomElementCreationMode, Element, ElementCreator, LayoutElementHelpers,
+};
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::file::File;
 use crate::dom::filelist::{FileList, LayoutFileListHelpers};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::html::htmldatalistelement::HTMLDataListElement;
-use crate::dom::html::htmldivelement::HTMLDivElement;
 use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::html::htmlfieldsetelement::HTMLFieldSetElement;
 use crate::dom::html::htmlformelement::{
@@ -123,9 +126,9 @@ const DEFAULT_FILE_INPUT_VALUE: &str = "No file chosen";
 //                      TextNode within an inline flow. Another example is the horizontal scroll.
 // FIXME(#38263): Refactor these logics into a TextControl wrapper that would decouple all textual input.
 struct InputTypeTextShadowTree {
-    inner_container: Dom<HTMLDivElement>,
-    text_container: Dom<HTMLDivElement>,
-    placeholder_container: DomRefCell<Option<Dom<HTMLDivElement>>>,
+    inner_container: Dom<Element>,
+    text_container: Dom<Element>,
+    placeholder_container: DomRefCell<Option<Dom<Element>>>,
 }
 
 impl InputTypeTextShadowTree {
@@ -158,7 +161,7 @@ impl InputTypeTextShadowTree {
 /// The shadow tree consists of a single div with the currently selected color as
 /// the background.
 struct InputTypeColorShadowTree {
-    color_value: Dom<HTMLDivElement>,
+    color_value: Dom<Element>,
 }
 
 #[derive(Clone, JSTraceable, MallocSizeOf)]
@@ -178,8 +181,17 @@ fn create_ua_widget_div_with_text_node(
     implemented_pseudo: PseudoElement,
     as_first_child: bool,
     can_gc: CanGc,
-) -> DomRoot<HTMLDivElement> {
-    let el = HTMLDivElement::new(local_name!("div"), None, document, None, can_gc);
+) -> DomRoot<Element> {
+    let el = Element::create(
+        QualName::new(None, ns!(html), local_name!("div")),
+        None,
+        document,
+        ElementCreator::ScriptCreated,
+        CustomElementCreationMode::Asynchronous,
+        None,
+        can_gc,
+    );
+
     parent
         .upcast::<Node>()
         .AppendChild(el.upcast::<Node>(), can_gc)
@@ -835,13 +847,13 @@ impl HTMLInputElement {
     fn step_up_or_down(&self, n: i32, dir: StepDirection, can_gc: CanGc) -> ErrorResult {
         // Step 1
         if !self.does_value_as_number_apply() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
         let step_base = self.step_base();
         // Step 2
         let allowed_value_step = match self.allowed_value_step() {
             Some(avs) => avs,
-            None => return Err(Error::InvalidState),
+            None => return Err(Error::InvalidState(None)),
         };
         let minimum = self.minimum();
         let maximum = self.maximum();
@@ -990,12 +1002,12 @@ impl HTMLInputElement {
 
         match self.input_type() {
             // https://html.spec.whatwg.org/multipage/#url-state-(type%3Durl)%3Asuffering-from-a-type-mismatch
-            InputType::Url => Url::parse(value).is_err(),
+            InputType::Url => Url::parse(&value.str()).is_err(),
             // https://html.spec.whatwg.org/multipage/#e-mail-state-(type%3Demail)%3Asuffering-from-a-type-mismatch
             // https://html.spec.whatwg.org/multipage/#e-mail-state-(type%3Demail)%3Asuffering-from-a-type-mismatch-2
             InputType::Email => {
                 if self.Multiple() {
-                    !split_commas(value).all(|string| string.is_valid_email_address_string())
+                    !split_commas(&value.str()).all(|string| string.is_valid_email_address_string())
                 } else {
                     !value.str().is_valid_email_address_string()
                 }
@@ -1019,12 +1031,12 @@ impl HTMLInputElement {
         let _ac = enter_realm(self);
         rooted!(in(*cx) let mut pattern = ptr::null_mut::<JSObject>());
 
-        if compile_pattern(cx, &pattern_str, pattern.handle_mut()) {
+        if compile_pattern(cx, &pattern_str.str(), pattern.handle_mut()) {
             if self.Multiple() && self.does_multiple_apply() {
-                !split_commas(value)
+                !split_commas(&value.str())
                     .all(|s| matches_js_regex(cx, pattern.handle(), s).unwrap_or(true))
             } else {
-                !matches_js_regex(cx, pattern.handle(), value).unwrap_or(true)
+                !matches_js_regex(cx, pattern.handle(), &value.str()).unwrap_or(true)
             }
         } else {
             // Element doesn't suffer from pattern mismatch if pattern is invalid.
@@ -1168,8 +1180,15 @@ impl HTMLInputElement {
         let shadow_root = self.shadow_root(can_gc);
         Node::replace_all(None, shadow_root.upcast::<Node>(), can_gc);
 
-        let inner_container =
-            HTMLDivElement::new(local_name!("div"), None, &document, None, can_gc);
+        let inner_container = Element::create(
+            QualName::new(None, ns!(html), local_name!("div")),
+            None,
+            &document,
+            ElementCreator::ScriptCreated,
+            CustomElementCreationMode::Asynchronous,
+            None,
+            can_gc,
+        );
         shadow_root
             .upcast::<Node>()
             .AppendChild(inner_container.upcast::<Node>(), can_gc)
@@ -1223,7 +1242,15 @@ impl HTMLInputElement {
         let shadow_root = self.shadow_root(can_gc);
         Node::replace_all(None, shadow_root.upcast::<Node>(), can_gc);
 
-        let color_value = HTMLDivElement::new(local_name!("div"), None, &document, None, can_gc);
+        let color_value = Element::create(
+            QualName::new(None, ns!(html), local_name!("div")),
+            None,
+            &document,
+            ElementCreator::ScriptCreated,
+            CustomElementCreationMode::Asynchronous,
+            None,
+            can_gc,
+        );
         shadow_root
             .upcast::<Node>()
             .AppendChild(color_value.upcast::<Node>(), can_gc)
@@ -1312,6 +1339,7 @@ impl HTMLInputElement {
         let value_text = match (value.is_empty(), self.input_type()) {
             // For a password input, we replace all of the character with its replacement char.
             (false, InputType::Password) => value
+                .str()
                 .chars()
                 .map(|_| PASSWORD_REPLACEMENT_CHAR)
                 .collect::<String>()
@@ -1343,10 +1371,11 @@ impl HTMLInputElement {
             value = DOMString::from("#000000");
         }
         let style = format!("background-color: {value}");
-        color_shadow_tree
-            .color_value
-            .upcast::<Element>()
-            .set_string_attribute(&local_name!("style"), style.into(), can_gc);
+        color_shadow_tree.color_value.set_string_attribute(
+            &local_name!("style"),
+            style.into(),
+            can_gc,
+        );
     }
 
     fn update_shadow_tree(&self, can_gc: CanGc) {
@@ -1469,8 +1498,8 @@ impl<'dom> LayoutHTMLInputElementHelpers<'dom> for LayoutDom<'dom, HTMLInputElem
                 let sel = UTF8Bytes::unwrap_range(sorted_selection_offsets_range);
 
                 // Translate indices from the raw value to indices in the replacement value.
-                let char_start = text[..sel.start].chars().count();
-                let char_end = char_start + text[sel].chars().count();
+                let char_start = text.str()[..sel.start].chars().count();
+                let char_end = char_start + text.str()[sel].chars().count();
 
                 let bytes_per_char = PASSWORD_REPLACEMENT_CHAR.len_utf8();
                 Some(char_start * bytes_per_char..char_end * bytes_per_char)
@@ -1640,7 +1669,7 @@ impl HTMLInputElementMethods<crate::DomTypeHolder> for HTMLInputElement {
                     Some(ref fl) => match fl.Item(0) {
                         Some(ref f) => {
                             path.push_str("C:\\fakepath\\");
-                            path.push_str(f.name());
+                            path.push_str(&f.name().str());
                             path
                         },
                         None => path,
@@ -1689,7 +1718,7 @@ impl HTMLInputElementMethods<crate::DomTypeHolder> for HTMLInputElement {
                     let fl = FileList::new(&window, vec![], can_gc);
                     self.filelist.set(Some(&fl));
                 } else {
-                    return Err(Error::InvalidState);
+                    return Err(Error::InvalidState(None));
                 }
             },
         }
@@ -1738,7 +1767,7 @@ impl HTMLInputElementMethods<crate::DomTypeHolder> for HTMLInputElement {
     ) -> ErrorResult {
         rooted!(in(*cx) let value = value);
         if !self.does_value_as_date_apply() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
         if value.is_null() {
             return self.SetValue(DOMString::from(""), can_gc);
@@ -1780,7 +1809,7 @@ impl HTMLInputElementMethods<crate::DomTypeHolder> for HTMLInputElement {
         if value.is_infinite() {
             Err(Error::Type("value is not finite".to_string()))
         } else if !self.does_value_as_number_apply() {
-            Err(Error::InvalidState)
+            Err(Error::InvalidState(None))
         } else if value.is_nan() {
             self.SetValue(DOMString::from(""), can_gc)
         } else if let Some(converted) = self.convert_number_to_string(value) {
@@ -2347,7 +2376,7 @@ impl HTMLInputElement {
             let opt_test_paths = opt_test_paths.map(|paths| {
                 paths
                     .iter()
-                    .filter_map(|p| PathBuf::from_str(p).ok())
+                    .filter_map(|p| PathBuf::from_str(&p.str()).ok())
                     .collect()
             });
 
@@ -2457,11 +2486,11 @@ impl HTMLInputElement {
                 }
             },
             InputType::DatetimeLocal => {
-                match value
+                let time = value
                     .str()
                     .parse_local_date_time_string()
-                    .map(|date_time| date_time.to_local_date_time_string())
-                {
+                    .map(|date_time| date_time.to_local_date_time_string());
+                match time {
                     Some(normalized_string) => *value = DOMString::from_string(normalized_string),
                     None => value.clear(),
                 }
@@ -2533,15 +2562,14 @@ impl HTMLInputElement {
                     value.strip_newlines();
                     value.strip_leading_and_trailing_ascii_whitespace();
                 } else {
-                    let sanitized = str_join(
-                        split_commas(value).map(|token| {
-                            let mut token = DOMString::from_string(token.to_string());
+                    let sanitized = split_commas(&value.str())
+                        .map(|token| {
+                            let mut token = DOMString::from(token.to_string());
                             token.strip_newlines();
                             token.strip_leading_and_trailing_ascii_whitespace();
                             token
-                        }),
-                        ",",
-                    );
+                        })
+                        .join(",");
                     value.clear();
                     value.push_str(sanitized.as_str());
                 }
@@ -2775,7 +2803,7 @@ impl HTMLInputElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#show-the-picker,-if-applicable>
-    fn show_the_picker_if_applicable(&self, can_gc: CanGc) {
+    fn show_the_picker_if_applicable(&self) {
         // FIXME: Implement most of this algorithm
 
         // Step 2. If element is not mutable, then return.
@@ -2786,8 +2814,6 @@ impl HTMLInputElement {
         // Step 6. Otherwise, the user agent should show the relevant user interface for selecting a value for element,
         // in the way it normally would when the user interacts with the control.
         if self.input_type() == InputType::Color {
-            let (ipc_sender, ipc_receiver) = generic_channel::channel::<Option<RgbColor>>()
-                .expect("Failed to create IPC channel!");
             let document = self.owner_document();
             let rect = self.upcast::<Node>().border_box().unwrap_or_default();
             let rect = Rect::new(
@@ -2796,29 +2822,27 @@ impl HTMLInputElement {
             );
             let current_value = self.Value();
             let current_color = RgbColor {
-                red: u8::from_str_radix(&current_value[1..3], 16).unwrap(),
-                green: u8::from_str_radix(&current_value[3..5], 16).unwrap(),
-                blue: u8::from_str_radix(&current_value[5..7], 16).unwrap(),
+                red: u8::from_str_radix(&current_value.str()[1..3], 16).unwrap(),
+                green: u8::from_str_radix(&current_value.str()[3..5], 16).unwrap(),
+                blue: u8::from_str_radix(&current_value.str()[5..7], 16).unwrap(),
             };
-            document.send_to_embedder(EmbedderMsg::ShowFormControl(
-                document.webview_id(),
+            document.embedder_controls().show_form_control(
+                ControlElement::ColorInput(DomRoot::from_ref(self)),
                 DeviceIntRect::from_untyped(&rect.to_box2d()),
-                EmbedderFormControl::ColorPicker(current_color, ipc_sender),
-            ));
-
-            let Ok(response) = ipc_receiver.recv() else {
-                log::error!("Failed to receive response");
-                return;
-            };
-
-            if let Some(selected_color) = response {
-                let formatted_color = format!(
-                    "#{:0>2x}{:0>2x}{:0>2x}",
-                    selected_color.red, selected_color.green, selected_color.blue
-                );
-                let _ = self.SetValue(formatted_color.into(), can_gc);
-            }
+                EmbedderFormControl::ColorPicker(current_color),
+            );
         }
+    }
+
+    pub(crate) fn handle_color_picker_response(&self, response: Option<RgbColor>, can_gc: CanGc) {
+        let Some(selected_color) = response else {
+            return;
+        };
+        let formatted_color = format!(
+            "#{:0>2x}{:0>2x}{:0>2x}",
+            selected_color.red, selected_color.green, selected_color.blue
+        );
+        let _ = self.SetValue(formatted_color.into(), can_gc);
     }
 }
 
@@ -3537,7 +3561,7 @@ impl Activatable for HTMLInputElement {
             },
             // https://html.spec.whatwg.org/multipage/#color-state-(type=color):input-activation-behavior
             InputType::Color => {
-                self.show_the_picker_if_applicable(can_gc);
+                self.show_the_picker_if_applicable();
             },
             _ => (),
         }
@@ -3547,7 +3571,7 @@ impl Activatable for HTMLInputElement {
 // https://html.spec.whatwg.org/multipage/#attr-input-accept
 fn filter_from_accept(s: &DOMString) -> Vec<FilterPattern> {
     let mut filter = vec![];
-    for p in split_commas(s) {
+    for p in split_commas(&s.str()) {
         let p = p.trim();
         if let Some('.') = p.chars().next() {
             filter.push(FilterPattern(p[1..].to_string()));

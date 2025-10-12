@@ -38,8 +38,9 @@ use canvas_traits::webgl::WebGLPipeline;
 use chrono::{DateTime, Local};
 use compositing_traits::{CrossProcessCompositorApi, PipelineExitSource};
 use constellation_traits::{
-    JsEvalResult, LoadData, LoadOrigin, NavigationHistoryBehavior, ScriptToConstellationChan,
-    ScriptToConstellationMessage, StructuredSerializedData, WindowSizeType,
+    JsEvalResult, LoadData, LoadOrigin, NavigationHistoryBehavior, ScreenshotReadinessResponse,
+    ScriptToConstellationChan, ScriptToConstellationMessage, StructuredSerializedData,
+    WindowSizeType,
 };
 use crossbeam_channel::unbounded;
 use data_url::mime::Mime;
@@ -49,11 +50,9 @@ use devtools_traits::{
 };
 use embedder_traits::user_content_manager::UserContentManager;
 use embedder_traits::{
-    FocusSequenceNumber, InputEvent, JavaScriptEvaluationError, JavaScriptEvaluationId,
-    MediaSessionActionType, MouseButton, MouseButtonAction, MouseButtonEvent, Theme,
-    ViewportDetails, WebDriverScriptCommand,
+    EmbedderControlId, FocusSequenceNumber, FormControlResponse, JavaScriptEvaluationError,
+    JavaScriptEvaluationId, MediaSessionActionType, Theme, ViewportDetails, WebDriverScriptCommand,
 };
-use euclid::Point2D;
 use euclid::default::Rect;
 use fonts::{FontContext, SystemFontServiceProxy};
 use headers::{HeaderMapExt, LastModified, ReferrerPolicy as ReferrerPolicyHeader};
@@ -73,7 +72,6 @@ use metrics::MAX_TASK_NS;
 use net_traits::image_cache::{ImageCache, ImageCacheResponseMessage};
 use net_traits::request::{Referrer, RequestId};
 use net_traits::response::ResponseInit;
-use net_traits::storage_thread::StorageType;
 use net_traits::{
     FetchMetadata, FetchResponseListener, FetchResponseMsg, Metadata, NetworkError,
     ResourceFetchTiming, ResourceThreads, ResourceTimingType,
@@ -82,13 +80,15 @@ use percent_encoding::percent_decode;
 use profile_traits::mem::{ProcessReports, ReportsChan, perform_memory_report};
 use profile_traits::time::ProfilerCategory;
 use profile_traits::time_profile;
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use script_traits::{
     ConstellationInputEvent, DiscardBrowsingContext, DocumentActivity, InitialScriptState,
     NewLayoutInfo, Painter, ProgressiveWebMetricType, ScriptThreadMessage, UpdatePipelineIdReason,
 };
 use servo_config::{opts, prefs};
 use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
+use storage_traits::StorageThreads;
+use storage_traits::webstorage_thread::StorageType;
 use style::thread_state::{self, ThreadState};
 use stylo_atoms::Atom;
 use timers::{TimerEventRequest, TimerId, TimerScheduler};
@@ -96,7 +96,7 @@ use url::Position;
 #[cfg(feature = "webgpu")]
 use webgpu_traits::{WebGPUDevice, WebGPUMsg};
 use webrender_api::ExternalScrollId;
-use webrender_api::units::{DevicePixel, LayoutVector2D};
+use webrender_api::units::LayoutVector2D;
 
 use crate::document_collection::DocumentCollection;
 use crate::document_loader::DocumentLoader;
@@ -115,7 +115,7 @@ use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::settings_stack::AutoEntryScript;
 use crate::dom::bindings::str::DOMString;
-use crate::dom::bindings::trace::{HashMapTracedValues, JSTraceable};
+use crate::dom::bindings::trace::JSTraceable;
 use crate::dom::csp::{CspReporting, GlobalCspReporting, Violation};
 use crate::dom::customelementregistry::{
     CallbackReaction, CustomElementDefinition, CustomElementReactionStack,
@@ -132,7 +132,7 @@ use crate::dom::types::DebuggerGlobalScope;
 #[cfg(feature = "webgpu")]
 use crate::dom::webgpu::identityhub::IdentityHub;
 use crate::dom::window::Window;
-use crate::dom::windowproxy::{CreatorBrowsingContextInfo, WindowProxy};
+use crate::dom::windowproxy::WindowProxy;
 use crate::dom::worklet::WorkletThreadPool;
 use crate::dom::workletglobalscope::WorkletGlobalScopeInit;
 use crate::fetch::FetchCanceller;
@@ -150,6 +150,7 @@ use crate::script_runtime::{
     CanGc, IntroductionType, JSContext, JSContextHelper, Runtime, ScriptThreadEventCategory,
     ThreadSafeJSContext,
 };
+use crate::script_window_proxies::ScriptWindowProxies;
 use crate::task_queue::TaskQueue;
 use crate::task_source::{SendableTaskSource, TaskSourceName};
 use crate::webdriver_handlers::jsval_to_webdriver;
@@ -226,9 +227,7 @@ pub struct ScriptThread {
     /// The documents for pipelines managed by this thread
     documents: DomRefCell<DocumentCollection>,
     /// The window proxies known by this thread
-    /// TODO: this map grows, but never shrinks. Issue #15258.
-    window_proxies:
-        DomRefCell<HashMapTracedValues<BrowsingContextId, Dom<WindowProxy>, FxBuildHasher>>,
+    window_proxies: Rc<ScriptWindowProxies>,
     /// A list of data pertaining to loads that have not yet received a network response
     incomplete_loads: DomRefCell<Vec<InProgressLoad>>,
     /// A vector containing parser contexts which have not yet been fully processed
@@ -249,6 +248,9 @@ pub struct ScriptThread {
     /// there are many iframes.
     #[no_trace]
     resource_threads: ResourceThreads,
+
+    #[no_trace]
+    storage_threads: StorageThreads,
 
     /// A queue of tasks to be executed in this script-thread.
     task_queue: TaskQueue<MainThreadScriptMsg>,
@@ -344,10 +346,6 @@ pub struct ScriptThread {
     /// A factory for making new layouts. This allows layout to depend on script.
     #[no_trace]
     layout_factory: Arc<dyn LayoutFactory>,
-
-    /// The screen coordinates where the primary mouse button was pressed.
-    #[no_trace]
-    relative_mouse_down_point: Cell<Point2D<f32, DevicePixel>>,
 
     /// The [`TimerId`] of a ScriptThread-scheduled "update the rendering" call, if any.
     /// The ScriptThread schedules calls to "update the rendering," but the renderer can
@@ -719,24 +717,13 @@ impl ScriptThread {
             })
     }
 
-    pub(crate) fn find_window_proxy(id: BrowsingContextId) -> Option<DomRoot<WindowProxy>> {
-        with_script_thread(|script_thread| {
-            script_thread
-                .window_proxies
-                .borrow()
-                .get(&id)
-                .map(|context| DomRoot::from_ref(&**context))
-        })
+    pub(crate) fn window_proxies() -> Rc<ScriptWindowProxies> {
+        with_script_thread(|script_thread| script_thread.window_proxies.clone())
     }
 
     pub(crate) fn find_window_proxy_by_name(name: &DOMString) -> Option<DomRoot<WindowProxy>> {
         with_script_thread(|script_thread| {
-            for (_, proxy) in script_thread.window_proxies.borrow().iter() {
-                if proxy.get_name() == *name {
-                    return Some(DomRoot::from_ref(&**proxy));
-                }
-            }
-            None
+            script_thread.window_proxies.find_window_proxy_by_name(name)
         })
     }
 
@@ -751,6 +738,7 @@ impl ScriptThread {
                     let init = WorkletGlobalScopeInit {
                         to_script_thread_sender: script_thread.senders.self_sender.clone(),
                         resource_threads: script_thread.resource_threads.clone(),
+                        storage_threads: script_thread.storage_threads.clone(),
                         mem_profiler_chan: script_thread.senders.memory_profiler_sender.clone(),
                         time_profiler_chan: script_thread.senders.time_profiler_sender.clone(),
                         devtools_chan: script_thread.senders.devtools_server_sender.clone(),
@@ -950,6 +938,7 @@ impl ScriptThread {
             script_to_constellation_chan,
             senders.pipeline_to_embedder_sender.clone(),
             state.resource_threads.clone(),
+            state.storage_threads.clone(),
             #[cfg(feature = "webgpu")]
             gpu_id_hub.clone(),
             CanGc::note(),
@@ -959,13 +948,14 @@ impl ScriptThread {
         ScriptThread {
             documents: DomRefCell::new(DocumentCollection::default()),
             last_render_opportunity_time: Default::default(),
-            window_proxies: DomRefCell::new(HashMapTracedValues::new_fx()),
+            window_proxies: Default::default(),
             incomplete_loads: DomRefCell::new(vec![]),
             incomplete_parser_contexts: IncompleteParserContexts(RefCell::new(vec![])),
             senders,
             receivers,
             image_cache: state.image_cache.clone(),
             resource_threads: state.resource_threads,
+            storage_threads: state.storage_threads,
             task_queue,
             background_hang_monitor,
             closing,
@@ -995,7 +985,6 @@ impl ScriptThread {
             gpu_id_hub,
             inherited_secure_context: state.inherited_secure_context,
             layout_factory,
-            relative_mouse_down_point: Cell::new(Point2D::zero()),
             scheduled_update_the_rendering: Default::default(),
             needs_rendering_update: Arc::new(AtomicBool::new(false)),
             debugger_global: debugger_global.as_traced(),
@@ -1302,17 +1291,14 @@ impl ScriptThread {
         }
     }
 
-    /// If waiting for an idle `Pipeline` state in order to dump a screenshot at
-    /// the right time, inform the `Constellation` this `Pipeline` has entered
-    /// the idle state when applicable.
-    fn maybe_send_idle_document_state_to_constellation(&self) {
-        if !opts::get().wait_for_stable_image {
-            return;
-        }
+    /// If any `Pipeline`s are waiting to become ready for the purpose of taking a
+    /// screenshot, check to see if the `Pipeline` is now ready and send a message to the
+    /// Constellation, if so.
+    fn maybe_resolve_pending_screenshot_readiness_requests(&self) {
         for (_, document) in self.documents.borrow().iter() {
             document
                 .window()
-                .maybe_send_idle_document_state_to_constellation();
+                .maybe_resolve_pending_screenshot_readiness_requests();
         }
     }
 
@@ -1539,7 +1525,7 @@ impl ScriptThread {
             self.update_the_rendering(can_gc);
 
         self.maybe_fulfill_font_ready_promises(can_gc);
-        self.maybe_send_idle_document_state_to_constellation();
+        self.maybe_resolve_pending_screenshot_readiness_requests();
 
         // This must happen last to detect if any change above makes a rendering update necessary.
         self.maybe_schedule_rendering_opportunity_after_ipc_message(built_any_display_lists);
@@ -1623,6 +1609,14 @@ impl ScriptThread {
                     profiler_chan,
                     f
                 ),
+                ScriptThreadEventCategory::GeolocationEvent => {
+                    time_profile!(
+                        ProfilerCategory::ScriptGeolocationEvent,
+                        None,
+                        profiler_chan,
+                        f
+                    )
+                },
                 ScriptThreadEventCategory::HistoryEvent => {
                     time_profile!(ProfilerCategory::ScriptHistoryEvent, None, profiler_chan, f)
                 },
@@ -1910,6 +1904,17 @@ impl ScriptThread {
                     current_preferences.set_value(&name, value);
                 }
                 prefs::set(current_preferences);
+            },
+            ScriptThreadMessage::ForwardKeyboardScroll(pipeline_id, scroll) => {
+                if let Some(document) = self.documents.borrow().find_document(pipeline_id) {
+                    document.event_handler().do_keyboard_scroll(scroll);
+                }
+            },
+            ScriptThreadMessage::RequestScreenshotReadiness(pipeline_id) => {
+                self.handle_request_screenshot_readiness(pipeline_id);
+            },
+            ScriptThreadMessage::EmbedderControlResponse(id, response) => {
+                self.handle_embedder_control_response(id, response, can_gc);
             },
         }
     }
@@ -2520,7 +2525,6 @@ impl ScriptThread {
         } = new_layout_info;
 
         // Kick off the fetch for the new resource.
-        let url = load_data.url.clone();
         let new_load = InProgressLoad::new(
             new_pipeline_id,
             browsing_context_id,
@@ -2532,13 +2536,7 @@ impl ScriptThread {
             origin,
             load_data,
         );
-        if url.as_str() == "about:blank" {
-            self.start_page_load_about_blank(new_load);
-        } else if url.as_str() == "about:srcdoc" {
-            self.page_load_about_srcdoc(new_load);
-        } else {
-            self.pre_page_load(new_load);
-        }
+        self.pre_page_load(new_load);
     }
 
     fn collect_reports(&self, reports_chan: ReportsChan) {
@@ -2732,7 +2730,8 @@ impl ScriptThread {
             Some(window) => {
                 // FIXME: synchronously talks to constellation.
                 // send the required info as part of postmessage instead.
-                let source = match self.remote_window_proxy(
+                let source = match self.window_proxies.remote_window_proxy(
+                    &self.senders,
                     window.upcast::<GlobalScope>(),
                     source_browsing_context,
                     source_pipeline_id,
@@ -2792,7 +2791,9 @@ impl ScriptThread {
         if let Some(window) = self.documents.borrow().find_window(new_pipeline_id) {
             // Ensure that the state of any local window proxies accurately reflects
             // the new pipeline.
-            let _ = self.local_window_proxy(
+            let _ = self.window_proxies.local_window_proxy(
+                &self.senders,
+                &self.documents,
                 &window,
                 browsing_context_id,
                 webview_id,
@@ -3085,21 +3086,6 @@ impl ScriptThread {
         }
     }
 
-    fn ask_constellation_for_browsing_context_info(
-        &self,
-        pipeline_id: PipelineId,
-    ) -> Option<(BrowsingContextId, Option<PipelineId>)> {
-        let (result_sender, result_receiver) = ipc::channel().unwrap();
-        let msg = ScriptToConstellationMessage::GetBrowsingContextInfo(pipeline_id, result_sender);
-        self.senders
-            .pipeline_to_constellation_sender
-            .send((pipeline_id, msg))
-            .expect("Failed to send to constellation.");
-        result_receiver
-            .recv()
-            .expect("Failed to get browsing context info from constellation.")
-    }
-
     fn ask_constellation_for_top_level_info(
         &self,
         sender_pipeline: PipelineId,
@@ -3117,104 +3103,6 @@ impl ScriptThread {
         result_receiver
             .recv()
             .expect("Failed to get top-level id from constellation.")
-    }
-
-    // Get the browsing context for a pipeline that may exist in another
-    // script thread.  If the browsing context already exists in the
-    // `window_proxies` map, we return it, otherwise we recursively
-    // get the browsing context for the parent if there is one,
-    // construct a new dissimilar-origin browsing context, add it
-    // to the `window_proxies` map, and return it.
-    fn remote_window_proxy(
-        &self,
-        global_to_clone: &GlobalScope,
-        webview_id: WebViewId,
-        pipeline_id: PipelineId,
-        opener: Option<BrowsingContextId>,
-    ) -> Option<DomRoot<WindowProxy>> {
-        let (browsing_context_id, parent_pipeline_id) =
-            self.ask_constellation_for_browsing_context_info(pipeline_id)?;
-        if let Some(window_proxy) = self.window_proxies.borrow().get(&browsing_context_id) {
-            return Some(DomRoot::from_ref(window_proxy));
-        }
-
-        let parent_browsing_context = parent_pipeline_id.and_then(|parent_id| {
-            self.remote_window_proxy(global_to_clone, webview_id, parent_id, opener)
-        });
-
-        let opener_browsing_context = opener.and_then(ScriptThread::find_window_proxy);
-
-        let creator = CreatorBrowsingContextInfo::from(
-            parent_browsing_context.as_deref(),
-            opener_browsing_context.as_deref(),
-        );
-
-        let window_proxy = WindowProxy::new_dissimilar_origin(
-            global_to_clone,
-            browsing_context_id,
-            webview_id,
-            parent_browsing_context.as_deref(),
-            opener,
-            creator,
-        );
-        self.window_proxies
-            .borrow_mut()
-            .insert(browsing_context_id, Dom::from_ref(&*window_proxy));
-        Some(window_proxy)
-    }
-
-    // Get the browsing context for a pipeline that exists in this
-    // script thread.  If the browsing context already exists in the
-    // `window_proxies` map, we return it, otherwise we recursively
-    // get the browsing context for the parent if there is one,
-    // construct a new similar-origin browsing context, add it
-    // to the `window_proxies` map, and return it.
-    fn local_window_proxy(
-        &self,
-        window: &Window,
-        browsing_context_id: BrowsingContextId,
-        webview_id: WebViewId,
-        parent_info: Option<PipelineId>,
-        opener: Option<BrowsingContextId>,
-    ) -> DomRoot<WindowProxy> {
-        if let Some(window_proxy) = self.window_proxies.borrow().get(&browsing_context_id) {
-            // Note: we do not set the window to be the currently-active one,
-            // this will be done instead when the script-thread handles the `SetDocumentActivity` msg.
-            return DomRoot::from_ref(window_proxy);
-        }
-        let iframe = parent_info.and_then(|parent_id| {
-            self.documents
-                .borrow()
-                .find_iframe(parent_id, browsing_context_id)
-        });
-        let parent_browsing_context = match (parent_info, iframe.as_ref()) {
-            (_, Some(iframe)) => Some(iframe.owner_window().window_proxy()),
-            (Some(parent_id), _) => {
-                self.remote_window_proxy(window.upcast(), webview_id, parent_id, opener)
-            },
-            _ => None,
-        };
-
-        let opener_browsing_context = opener.and_then(ScriptThread::find_window_proxy);
-
-        let creator = CreatorBrowsingContextInfo::from(
-            parent_browsing_context.as_deref(),
-            opener_browsing_context.as_deref(),
-        );
-
-        let window_proxy = WindowProxy::new(
-            window,
-            browsing_context_id,
-            webview_id,
-            iframe.as_deref().map(Castable::upcast),
-            parent_browsing_context.as_deref(),
-            opener,
-            creator,
-        );
-        self.window_proxies
-            .borrow_mut()
-            .insert(browsing_context_id, Dom::from_ref(&*window_proxy));
-        window_proxy
     }
 
     /// The entry point to document loading. Defines bindings, sets up the window and document
@@ -3286,6 +3174,7 @@ impl ScriptThread {
             self.senders.image_cache_sender.clone(),
             image_cache.clone(),
             self.resource_threads.clone(),
+            self.storage_threads.clone(),
             #[cfg(feature = "bluetooth")]
             self.senders.bluetooth_sender.clone(),
             self.senders.memory_profiler_sender.clone(),
@@ -3330,7 +3219,9 @@ impl ScriptThread {
         let _realm = enter_realm(&*window);
 
         // Initialize the browsing context for the window.
-        let window_proxy = self.local_window_proxy(
+        let window_proxy = self.window_proxies.local_window_proxy(
+            &self.senders,
+            &self.documents,
             &window,
             incomplete.browsing_context_id,
             incomplete.webview_id,
@@ -3401,6 +3292,7 @@ impl ScriptThread {
             incomplete.load_data.inherited_insecure_requests_policy,
             incomplete.load_data.has_trustworthy_ancestor_origin,
             self.custom_element_reaction_stack.clone(),
+            incomplete.load_data.creation_sandboxing_flag_set,
             can_gc,
         );
 
@@ -3527,61 +3419,6 @@ impl ScriptThread {
             warn!("Compositor event sent to closed pipeline {pipeline_id}.");
             return;
         };
-
-        // Also send a 'click' event with same hit-test result if this is release
-
-        // MAYBE? TODO: https://developer.mozilla.org/en-US/docs/Web/API/Element/click_event
-        // If the button is pressed on one element and the pointer is moved outside the element
-        // before the button is released, the event is fired on the most specific ancestor element
-        // that contained both elements.
-
-        // But spec doesn't specify this https://w3c.github.io/uievents/#event-type-click
-        // "The click event type MUST be dispatched on the topmost event target indicated by
-        // the pointer, when the user presses down and releases the primary pointer button"
-
-        // Servo-specific: Trigger if within 10px of the down point
-        if let InputEvent::MouseButton(mouse_button_event) = &event.event {
-            if let MouseButton::Left = mouse_button_event.button {
-                match mouse_button_event.action {
-                    MouseButtonAction::Up => {
-                        let pixel_dist =
-                            self.relative_mouse_down_point.get() - mouse_button_event.point;
-                        let pixel_dist =
-                            (pixel_dist.x * pixel_dist.x + pixel_dist.y * pixel_dist.y).sqrt();
-                        if pixel_dist < 10.0 * document.window().device_pixel_ratio().get() {
-                            // Pass webdriver_id to the newly generated click event
-                            document.event_handler().note_pending_input_event(
-                                ConstellationInputEvent {
-                                    hit_test_result: event.hit_test_result.clone(),
-                                    pressed_mouse_buttons: event.pressed_mouse_buttons,
-                                    active_keyboard_modifiers: event.active_keyboard_modifiers,
-                                    event: event.event.clone().with_webdriver_message_id(None),
-                                },
-                            );
-                            document.event_handler().note_pending_input_event(
-                                ConstellationInputEvent {
-                                    hit_test_result: event.hit_test_result,
-                                    pressed_mouse_buttons: event.pressed_mouse_buttons,
-                                    active_keyboard_modifiers: event.active_keyboard_modifiers,
-                                    event: InputEvent::MouseButton(MouseButtonEvent::new(
-                                        MouseButtonAction::Click,
-                                        mouse_button_event.button,
-                                        mouse_button_event.point,
-                                    ))
-                                    .with_webdriver_message_id(event.event.webdriver_message_id()),
-                                },
-                            );
-                            return;
-                        }
-                    },
-                    MouseButtonAction::Down => {
-                        self.relative_mouse_down_point.set(mouse_button_event.point)
-                    },
-                    MouseButtonAction::Click => {},
-                }
-            }
-        }
-
         document.event_handler().note_pending_input_event(event);
     }
 
@@ -3649,7 +3486,21 @@ impl ScriptThread {
     /// Instructs the constellation to fetch the document that will be loaded. Stores the InProgressLoad
     /// argument until a notification is received that the fetch is complete.
     fn pre_page_load(&self, mut incomplete: InProgressLoad) {
-        let context = ParserContext::new(incomplete.pipeline_id, incomplete.load_data.url.clone());
+        let url_str = incomplete.load_data.url.as_str();
+        if url_str == "about:blank" {
+            self.start_page_load_about_blank(incomplete);
+            return;
+        }
+        if url_str == "about:srcdoc" {
+            self.page_load_about_srcdoc(incomplete);
+            return;
+        }
+
+        let context = ParserContext::new(
+            incomplete.pipeline_id,
+            incomplete.load_data.url.clone(),
+            incomplete.load_data.creation_sandboxing_flag_set,
+        );
         self.incomplete_parser_contexts
             .0
             .borrow_mut()
@@ -3806,7 +3657,11 @@ impl ScriptThread {
         let id = incomplete.pipeline_id;
 
         let url = ServoUrl::parse("about:blank").unwrap();
-        let mut context = ParserContext::new(id, url.clone());
+        let mut context = ParserContext::new(
+            id,
+            url.clone(),
+            incomplete.load_data.creation_sandboxing_flag_set,
+        );
 
         let mut meta = Metadata::default(url);
         meta.set_content_type(Some(&mime::TEXT_HTML));
@@ -3849,9 +3704,11 @@ impl ScriptThread {
         let chunk = srcdoc.into_bytes();
 
         let policy_container = incomplete.load_data.policy_container.clone();
+        let creation_sandboxing_flag_set = incomplete.load_data.creation_sandboxing_flag_set;
+
         self.incomplete_loads.borrow_mut().push(incomplete);
 
-        let mut context = ParserContext::new(id, url);
+        let mut context = ParserContext::new(id, url, creation_sandboxing_flag_set);
         let dummy_request_id = RequestId::default();
 
         context.process_response(dummy_request_id, Ok(FetchMetadata::Unfiltered(meta)));
@@ -4000,9 +3857,7 @@ impl ScriptThread {
             return_value.handle(),
             (&realm).into(),
             can_gc,
-        )
-        .map_err(|_| JavaScriptEvaluationError::SerializationError);
-
+        );
         let _ = self.senders.pipeline_to_constellation_sender.send((
             pipeline_id,
             ScriptToConstellationMessage::FinishJavaScriptEvaluation(evaluation_id, result),
@@ -4018,6 +3873,33 @@ impl ScriptThread {
 
     pub(crate) fn is_servo_privileged(url: ServoUrl) -> bool {
         with_script_thread(|script_thread| script_thread.privileged_urls.contains(&url))
+    }
+
+    fn handle_request_screenshot_readiness(&self, pipeline_id: PipelineId) {
+        let Some(window) = self.documents.borrow().find_window(pipeline_id) else {
+            let _ = self.senders.pipeline_to_constellation_sender.send((
+                pipeline_id,
+                ScriptToConstellationMessage::RespondToScreenshotReadinessRequest(
+                    ScreenshotReadinessResponse::NoLongerActive,
+                ),
+            ));
+            return;
+        };
+        window.request_screenshot_readiness();
+    }
+
+    fn handle_embedder_control_response(
+        &self,
+        id: EmbedderControlId,
+        response: FormControlResponse,
+        can_gc: CanGc,
+    ) {
+        let Some(document) = self.documents.borrow().find_document(id.pipeline_id) else {
+            return;
+        };
+        document
+            .embedder_controls()
+            .handle_embedder_control_response(id, response, can_gc);
     }
 }
 

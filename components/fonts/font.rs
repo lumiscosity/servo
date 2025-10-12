@@ -12,6 +12,7 @@ use std::time::Instant;
 use std::{iter, str};
 
 use app_units::Au;
+use base::id::RenderingGroupId;
 use bitflags::bitflags;
 use euclid::default::{Point2D, Rect};
 use euclid::num::Zero;
@@ -21,6 +22,7 @@ use malloc_size_of_derive::MallocSizeOf;
 use parking_lot::RwLock;
 use read_fonts::tables::os2::{Os2, SelectionFlags};
 use read_fonts::types::Tag;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use style::computed_values::font_variant_caps;
@@ -28,7 +30,7 @@ use style::properties::style_structs::Font as FontStyleStruct;
 use style::values::computed::font::{
     FamilyName, FontFamilyNameSyntax, GenericFontFamily, SingleFontFamily,
 };
-use style::values::computed::{FontStretch, FontStyle, FontWeight};
+use style::values::computed::{FontStretch, FontStyle, FontSynthesis, FontWeight};
 use unicode_script::Script;
 use webrender_api::{FontInstanceFlags, FontInstanceKey, FontVariation};
 
@@ -66,20 +68,25 @@ pub trait PlatformFontMethods: Sized {
         pt_size: Option<Au>,
         variations: &[FontVariation],
         data: &Option<FontData>,
+        synthetic_bold: bool,
     ) -> Result<PlatformFont, &'static str> {
         let template = template.borrow();
         let font_identifier = template.identifier.clone();
 
         match font_identifier {
-            FontIdentifier::Local(font_identifier) => {
-                Self::new_from_local_font_identifier(font_identifier, pt_size, variations)
-            },
+            FontIdentifier::Local(font_identifier) => Self::new_from_local_font_identifier(
+                font_identifier,
+                pt_size,
+                variations,
+                synthetic_bold,
+            ),
             FontIdentifier::Web(_) => Self::new_from_data(
                 font_identifier,
                 data.as_ref()
                     .expect("Should never create a web font without data."),
                 pt_size,
                 variations,
+                synthetic_bold,
             ),
         }
     }
@@ -88,6 +95,7 @@ pub trait PlatformFontMethods: Sized {
         font_identifier: LocalFontIdentifier,
         pt_size: Option<Au>,
         variations: &[FontVariation],
+        synthetic_bold: bool,
     ) -> Result<PlatformFont, &'static str>;
 
     fn new_from_data(
@@ -95,6 +103,7 @@ pub trait PlatformFontMethods: Sized {
         data: &FontData,
         pt_size: Option<Au>,
         variations: &[FontVariation],
+        synthetic_bold: bool,
     ) -> Result<PlatformFont, &'static str>;
 
     /// Get a [`FontTemplateDescriptor`] from a [`PlatformFont`]. This is used to get
@@ -223,7 +232,7 @@ pub struct Font {
 
     shaper: OnceLock<Shaper>,
     cached_shape_data: RwLock<CachedShapeData>,
-    pub(crate) font_instance_key: OnceLock<FontInstanceKey>,
+    font_instance_key: RwLock<FxHashMap<RenderingGroupId, FontInstanceKey>>,
 
     /// If this is a synthesized small caps font, then this font reference is for
     /// the version of the font used to replace lowercase ASCII letters. It's up
@@ -248,12 +257,15 @@ impl malloc_size_of::MallocSizeOf for Font {
     fn size_of(&self, ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
         // TODO: Collect memory usage for platform fonts and for shapers.
         // This skips the template, because they are already stored in the template cache.
+
         self.metrics.size_of(ops) +
             self.descriptor.size_of(ops) +
             self.cached_shape_data.read().size_of(ops) +
             self.font_instance_key
-                .get()
-                .map_or(0, |key| key.size_of(ops))
+                .read()
+                .values()
+                .map(|key| key.size_of(ops))
+                .sum::<usize>()
     }
 }
 
@@ -264,11 +276,19 @@ impl Font {
         data: Option<FontData>,
         synthesized_small_caps: Option<FontRef>,
     ) -> Result<Font, &'static str> {
+        let synthetic_bold = {
+            let is_bold = descriptor.weight >= FontWeight::BOLD_THRESHOLD;
+            let allows_synthetic_bold = matches!(descriptor.synthesis_weight, FontSynthesis::Auto);
+
+            is_bold && allows_synthetic_bold
+        };
+
         let handle = PlatformFont::new_from_template(
             template.clone(),
             Some(descriptor.pt_size),
             &descriptor.variation_settings,
             &data,
+            synthetic_bold,
         )?;
         let metrics = handle.metrics();
 
@@ -306,10 +326,16 @@ impl Font {
         })
     }
 
-    pub fn key(&self, font_context: &FontContext) -> FontInstanceKey {
+    pub fn key(
+        &self,
+        rendering_group_id: RenderingGroupId,
+        font_context: &FontContext,
+    ) -> FontInstanceKey {
         *self
             .font_instance_key
-            .get_or_init(|| font_context.create_font_instance_key(self))
+            .write()
+            .entry(rendering_group_id)
+            .or_insert_with(|| font_context.create_font_instance_key(self, rendering_group_id))
     }
 
     /// Return the data for this `Font`. Note that this is currently highly inefficient for system
@@ -592,6 +618,7 @@ impl FontGroup {
         codepoint: char,
         next_codepoint: Option<char>,
         first_fallback: Option<FontRef>,
+        lang: Option<String>,
     ) -> Option<FontRef> {
         // Tab characters are converted into spaces when rendering.
         // TODO: We should not render a tab character. Instead they should be converted into tab stops
@@ -601,7 +628,7 @@ impl FontGroup {
             _ => codepoint,
         };
 
-        let options = FallbackFontSelectionOptions::new(codepoint, next_codepoint);
+        let options = FallbackFontSelectionOptions::new(codepoint, next_codepoint, lang);
 
         let should_look_for_small_caps = self.descriptor.variant == font_variant_caps::T::SmallCaps &&
             options.character.is_ascii_lowercase();
@@ -647,7 +674,7 @@ impl FontGroup {
 
         if let Some(font) = self.find_fallback(
             font_context,
-            options,
+            options.clone(),
             char_in_template,
             font_has_glyph_and_presentation,
         ) {

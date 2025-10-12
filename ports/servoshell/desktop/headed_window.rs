@@ -23,11 +23,11 @@ use servo::servo_geometry::{
 use servo::webrender_api::ScrollLocation;
 use servo::webrender_api::units::{DeviceIntPoint, DeviceIntRect, DeviceIntSize, DevicePixel};
 use servo::{
-    Cursor, ImeEvent, InputEvent, Key, KeyState, KeyboardEvent, Modifiers,
-    MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent,
-    MouseMoveEvent, NamedKey, OffscreenRenderingContext, RenderingContext, ScreenGeometry, Theme,
-    TouchEvent, TouchEventType, TouchId, WebRenderDebugOption, WebView, WheelDelta, WheelEvent,
-    WheelMode, WindowRenderingContext,
+    Cursor, ImeEvent, InputEvent, InputEventId, InputEventResult, Key, KeyState, KeyboardEvent,
+    Modifiers, MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent,
+    MouseLeftViewportEvent, MouseMoveEvent, NamedKey, OffscreenRenderingContext, RenderingContext,
+    ScreenGeometry, Theme, TouchEvent, TouchEventType, TouchId, WebRenderDebugOption, WebView,
+    WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
 };
 use url::Url;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
@@ -79,6 +79,14 @@ pub struct Window {
     /// the target of egui rendering and also where Servo rendering results are finally
     /// blitted.
     window_rendering_context: Rc<WindowRenderingContext>,
+    /// A helper that simulates touch events when the `--simulate-touch-events` flag
+    /// is enabled.
+    touch_event_simulator: Option<TouchEventSimulator>,
+    /// Keyboard events that have been sent to Servo that have still not been handled yet.
+    /// When these are handled, they will optionally be used to trigger keybindings that
+    /// are overridable by web content.
+    pending_keyboard_events: RefCell<HashMap<InputEventId, KeyboardEvent>>,
+
     // Keep this as the last field of the struct to ensure that the rendering context is
     // dropped first.
     // (https://github.com/servo/servo/issues/36711)
@@ -179,6 +187,10 @@ impl Window {
             modifiers_state: Cell::new(ModifiersState::empty()),
             toolbar_height: Cell::new(Default::default()),
             window_rendering_context,
+            touch_event_simulator: servoshell_preferences
+                .simulate_touch_events
+                .then(Default::default),
+            pending_keyboard_events: Default::default(),
             rendering_context,
         }
     }
@@ -222,7 +234,9 @@ impl Window {
         for xr_window_pose in &*xr_poses {
             xr_window_pose.handle_xr_translation(&event);
         }
-        webview.notify_input_event(InputEvent::Keyboard(event));
+
+        let id = webview.notify_input_event(InputEvent::Keyboard(event.clone()));
+        self.pending_keyboard_events.borrow_mut().insert(id, event);
     }
 
     fn handle_keyboard_input(&self, state: Rc<RunningAppState>, winit_event: KeyEvent) {
@@ -267,7 +281,11 @@ impl Window {
             for xr_window_pose in &*xr_poses {
                 xr_window_pose.handle_xr_rotation(&winit_event, self.modifiers_state.get());
             }
-            webview.notify_input_event(InputEvent::Keyboard(keyboard_event));
+
+            let id = webview.notify_input_event(InputEvent::Keyboard(keyboard_event.clone()));
+            self.pending_keyboard_events
+                .borrow_mut()
+                .insert(id, keyboard_event);
         }
 
         // servoshell also has key bindings that are visible to, and overridable by, the page.
@@ -275,7 +293,29 @@ impl Window {
     }
 
     /// Helper function to handle a click
-    fn handle_mouse(&self, webview: &WebView, button: MouseButton, action: ElementState) {
+    fn handle_mouse_button_event(
+        &self,
+        webview: &WebView,
+        button: MouseButton,
+        action: ElementState,
+    ) {
+        // `point` can be outside viewport, such as at toolbar with negative y-coordinate.
+        let point = self.webview_relative_mouse_point.get();
+        if !webview.rect().contains(point) {
+            return;
+        }
+
+        if self
+            .touch_event_simulator
+            .as_ref()
+            .is_some_and(|touch_event_simulator| {
+                touch_event_simulator
+                    .maybe_consume_move_button_event(webview, button, action, point)
+            })
+        {
+            return;
+        }
+
         let mouse_button = match &button {
             MouseButton::Left => ServoMouseButton::Left,
             MouseButton::Right => ServoMouseButton::Right,
@@ -285,11 +325,6 @@ impl Window {
             MouseButton::Other(value) => ServoMouseButton::Other(*value),
         };
 
-        let point = self.webview_relative_mouse_point.get();
-        // `point` can be outside viewport, such as at toolbar with negative y-coordinate.
-        if !webview.rect().contains(point) {
-            return;
-        }
         let action = match action {
             ElementState::Pressed => MouseButtonAction::Down,
             ElementState::Released => MouseButtonAction::Up,
@@ -300,6 +335,36 @@ impl Window {
             mouse_button,
             point,
         )));
+    }
+
+    /// Helper function to handle mouse move events.
+    fn handle_mouse_move_event(&self, webview: &WebView, position: PhysicalPosition<f64>) {
+        let mut point = winit_position_to_euclid_point(position).to_f32();
+        point.y -= (self.toolbar_height() * self.hidpi_scale_factor()).0;
+
+        let previous_point = self.webview_relative_mouse_point.get();
+        self.webview_relative_mouse_point.set(point);
+
+        if !webview.rect().contains(point) {
+            if webview.rect().contains(previous_point) {
+                webview.notify_input_event(InputEvent::MouseLeftViewport(
+                    MouseLeftViewportEvent::default(),
+                ));
+            }
+            return;
+        }
+
+        if self
+            .touch_event_simulator
+            .as_ref()
+            .is_some_and(|touch_event_simulator| {
+                touch_event_simulator.maybe_consume_mouse_move_event(webview, point)
+            })
+        {
+            return;
+        }
+
+        webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point)));
     }
 
     /// Handle key events before sending them to Servo.
@@ -334,15 +399,16 @@ impl Window {
             })
             .shortcut(CMD_OR_CONTROL, 'X', || {
                 focused_webview
-                    .notify_input_event(InputEvent::EditingAction(servo::EditingActionEvent::Cut))
+                    .notify_input_event(InputEvent::EditingAction(servo::EditingActionEvent::Cut));
             })
             .shortcut(CMD_OR_CONTROL, 'C', || {
                 focused_webview
-                    .notify_input_event(InputEvent::EditingAction(servo::EditingActionEvent::Copy))
+                    .notify_input_event(InputEvent::EditingAction(servo::EditingActionEvent::Copy));
             })
             .shortcut(CMD_OR_CONTROL, 'V', || {
-                focused_webview
-                    .notify_input_event(InputEvent::EditingAction(servo::EditingActionEvent::Paste))
+                focused_webview.notify_input_event(InputEvent::EditingAction(
+                    servo::EditingActionEvent::Paste,
+                ));
             })
             .shortcut(Modifiers::CONTROL, Key::Named(NamedKey::F9), || {
                 focused_webview.capture_webrender();
@@ -477,12 +543,6 @@ impl WindowPortsMethods for Window {
         self.device_pixel_ratio_override
             .map(Scale::new)
             .unwrap_or_else(|| self.device_hidpi_scale_factor())
-    }
-
-    fn page_height(&self) -> f32 {
-        let dpr = self.hidpi_scale_factor();
-        let size = self.winit_window.inner_size();
-        size.height as f32 * dpr.get()
     }
 
     fn set_title(&self, title: &str) {
@@ -623,22 +683,10 @@ impl WindowPortsMethods for Window {
             WindowEvent::KeyboardInput { event, .. } => self.handle_keyboard_input(state, event),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers_state.set(modifiers.state()),
             WindowEvent::MouseInput { state, button, .. } => {
-                self.handle_mouse(&webview, button, state);
+                self.handle_mouse_button_event(&webview, button, state);
             },
             WindowEvent::CursorMoved { position, .. } => {
-                let mut point = winit_position_to_euclid_point(position).to_f32();
-                point.y -= (self.toolbar_height() * self.hidpi_scale_factor()).0;
-
-                let previous_point = self.webview_relative_mouse_point.get();
-                if webview.rect().contains(point) {
-                    webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point)));
-                } else if webview.rect().contains(previous_point) {
-                    webview.notify_input_event(InputEvent::MouseLeftViewport(
-                        MouseLeftViewportEvent::default(),
-                    ));
-                }
-
-                self.webview_relative_mouse_point.set(point);
+                self.handle_mouse_move_event(&webview, position);
             },
             WindowEvent::CursorLeft { .. } => {
                 if webview
@@ -828,6 +876,35 @@ impl WindowPortsMethods for Window {
     fn maximize(&self, _webview: &WebView) {
         self.winit_window.set_maximized(true);
     }
+
+    /// Handle servoshell key bindings that may have been prevented by the page in the focused webview.
+    fn notify_input_event_handled(
+        &self,
+        webview: &WebView,
+        id: InputEventId,
+        result: InputEventResult,
+    ) {
+        let Some(keyboard_event) = self.pending_keyboard_events.borrow_mut().remove(&id) else {
+            return;
+        };
+        if result.intersects(InputEventResult::DefaultPrevented | InputEventResult::Consumed) {
+            return;
+        }
+
+        ShortcutMatcher::from_event(keyboard_event.event)
+            .shortcut(CMD_OR_CONTROL, '=', || {
+                webview.set_page_zoom(webview.page_zoom() + 0.1);
+            })
+            .shortcut(CMD_OR_CONTROL, '+', || {
+                webview.set_page_zoom(webview.page_zoom() + 0.1);
+            })
+            .shortcut(CMD_OR_CONTROL, '-', || {
+                webview.set_page_zoom(webview.page_zoom() - 0.1);
+            })
+            .shortcut(CMD_OR_CONTROL, '0', || {
+                webview.set_page_zoom(1.0);
+            });
+    }
 }
 
 fn winit_phase_to_touch_event_type(phase: TouchPhase) -> TouchEventType {
@@ -965,5 +1042,59 @@ impl XRWindowPose {
         let y: Rotation3D<_, UnknownUnit, UnknownUnit> = Rotation3D::around_y(Angle::degrees(y));
         let rotation = self.xr_rotation.get().then(&x).then(&y);
         self.xr_rotation.set(rotation);
+    }
+}
+
+#[derive(Default)]
+pub struct TouchEventSimulator {
+    pub left_mouse_button_down: Cell<bool>,
+}
+
+impl TouchEventSimulator {
+    fn maybe_consume_move_button_event(
+        &self,
+        webview: &WebView,
+        button: MouseButton,
+        action: ElementState,
+        point: Point2D<f32, DevicePixel>,
+    ) -> bool {
+        if button != MouseButton::Left {
+            return false;
+        }
+
+        if action == ElementState::Pressed && !self.left_mouse_button_down.get() {
+            webview.notify_input_event(InputEvent::Touch(TouchEvent::new(
+                TouchEventType::Down,
+                TouchId(0),
+                point,
+            )));
+            self.left_mouse_button_down.set(true);
+        } else if action == ElementState::Released {
+            webview.notify_input_event(InputEvent::Touch(TouchEvent::new(
+                TouchEventType::Up,
+                TouchId(0),
+                point,
+            )));
+            self.left_mouse_button_down.set(false);
+        }
+
+        true
+    }
+
+    fn maybe_consume_mouse_move_event(
+        &self,
+        webview: &WebView,
+        point: Point2D<f32, DevicePixel>,
+    ) -> bool {
+        if !self.left_mouse_button_down.get() {
+            return false;
+        }
+
+        webview.notify_input_event(InputEvent::Touch(TouchEvent::new(
+            TouchEventType::Move,
+            TouchId(0),
+            point,
+        )));
+        true
     }
 }

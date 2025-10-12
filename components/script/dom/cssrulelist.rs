@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use dom_struct::dom_struct;
 use itertools::izip;
 use script_bindings::inheritance::Castable;
+use script_bindings::str::DOMString;
 use servo_arc::Arc;
 use style::shared_lock::{Locked, SharedRwLockReadGuard};
 use style::stylesheets::{
@@ -28,7 +29,7 @@ use crate::dom::cssstylesheet::CSSStyleSheet;
 use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::window::Window;
 use crate::script_runtime::CanGc;
-use crate::stylesheet_loader::StylesheetLoader;
+use crate::stylesheet_loader::ElementStylesheetLoader;
 
 unsafe_no_jsmanaged_fields!(RulesSource);
 
@@ -38,7 +39,7 @@ impl Convert<Error> for RulesMutateError {
             RulesMutateError::Syntax => Error::Syntax(None),
             RulesMutateError::IndexSize => Error::IndexSize,
             RulesMutateError::HierarchyRequest => Error::HierarchyRequest,
-            RulesMutateError::InvalidState => Error::InvalidState,
+            RulesMutateError::InvalidState => Error::InvalidState(None),
         }
     }
 }
@@ -47,7 +48,7 @@ impl Convert<Error> for RulesMutateError {
 pub(crate) struct CSSRuleList {
     reflector_: Reflector,
     parent_stylesheet: Dom<CSSStyleSheet>,
-    #[ignore_malloc_size_of = "Arc"]
+    #[ignore_malloc_size_of = "Stylo"]
     rules: RefCell<RulesSource>,
     dom_rules: DomRefCell<Vec<MutNullableDom<CSSRule>>>,
 }
@@ -105,7 +106,7 @@ impl CSSRuleList {
     /// for keyframes-backed rules.
     pub(crate) fn insert_rule(
         &self,
-        rule: &str,
+        rule: &DOMString,
         idx: u32,
         containing_rule_types: CssRuleTypes,
         parse_relative_rule_type: Option<CssRuleType>,
@@ -129,7 +130,7 @@ impl CSSRuleList {
             .and_then(DomRoot::downcast::<HTMLElement>);
         let loader = owner
             .as_ref()
-            .map(|element| StylesheetLoader::for_element(element));
+            .map(|element| ElementStylesheetLoader::new(element));
         let allow_import_rules = if self.parent_stylesheet.is_constructed() {
             AllowImportRules::No
         } else {
@@ -138,7 +139,7 @@ impl CSSRuleList {
         let new_rule = css_rules
             .insert_rule(
                 &parent_stylesheet.shared_lock,
-                rule,
+                &rule.str(),
                 &parent_stylesheet.contents,
                 index,
                 containing_rule_types,

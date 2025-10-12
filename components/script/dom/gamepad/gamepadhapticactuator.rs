@@ -61,7 +61,7 @@ pub(crate) struct GamepadHapticActuator {
     /// <https://www.w3.org/TR/gamepad/#dfn-effects>
     effects: Vec<GamepadHapticEffectType>,
     /// <https://www.w3.org/TR/gamepad/#dfn-playingeffectpromise>
-    #[ignore_malloc_size_of = "Rc is hard"]
+    #[conditional_malloc_size_of]
     playing_effect_promise: DomRefCell<Option<Rc<Promise>>>,
     /// The current sequence ID for playing effects,
     /// incremented on every call to playEffect() or reset().
@@ -192,7 +192,7 @@ impl GamepadHapticActuatorMethods<crate::DomTypeHolder> for GamepadHapticActuato
 
         let document = self.global().as_window().Document();
         if !document.is_fully_active() {
-            playing_effect_promise.reject_error(Error::InvalidState, can_gc);
+            playing_effect_promise.reject_error(Error::InvalidState(None), can_gc);
         }
 
         self.sequence_id.set(self.sequence_id.get().wrapping_add(1));
@@ -259,7 +259,7 @@ impl GamepadHapticActuatorMethods<crate::DomTypeHolder> for GamepadHapticActuato
 
         let document = self.global().as_window().Document();
         if !document.is_fully_active() {
-            promise.reject_error(Error::InvalidState, can_gc);
+            promise.reject_error(Error::InvalidState(None), can_gc);
             return promise;
         }
 

@@ -11,16 +11,17 @@ use itertools::Itertools;
 use js::conversions::jsstr_to_string;
 use js::gc::MutableHandle;
 use js::jsapi::{
-    ClippedTime, ESClass, GetBuiltinClass, IsArrayBufferObject, JS_GetStringLength,
-    JS_IsArrayBufferViewObject, JS_NewObject, NewDateObject,
+    ClippedTime, ESClass, GetArrayLength, GetBuiltinClass, IsArrayBufferObject, JS_GetStringLength,
+    JS_HasOwnPropertyById, JS_IndexToId, JS_IsArrayBufferViewObject, JS_NewObject, NewDateObject,
+    PropertyKey,
 };
 use js::jsval::{DoubleValue, UndefinedValue};
 use js::rust::wrappers::{IsArrayObject, JS_GetProperty, JS_HasOwnProperty, JS_IsIdentifier};
-use js::rust::{HandleValue, MutableHandleValue};
-use net_traits::indexeddb_thread::{BackendResult, IndexedDBKeyRange, IndexedDBKeyType};
+use js::rust::{HandleValue, IntoHandle, IntoMutableHandle, MutableHandleValue};
 use profile_traits::ipc;
 use profile_traits::ipc::IpcReceiver;
 use serde::{Deserialize, Serialize};
+use storage_traits::indexeddb_thread::{BackendResult, IndexedDBKeyRange, IndexedDBKeyType};
 
 use crate::dom::bindings::codegen::Bindings::BlobBinding::BlobMethods;
 use crate::dom::bindings::codegen::Bindings::FileBinding::FileMethods;
@@ -105,11 +106,12 @@ pub(crate) fn is_valid_key_path(key_path: &StrOrStringSequence) -> Result<bool, 
 
         // An identifier, which is a string matching the IdentifierName production from the
         // ECMAScript Language Specification [ECMA-262].
-        let is_identifier = is_identifier_name(path)?;
+        let is_identifier = is_identifier_name(&path.str())?;
 
         // A string consisting of two or more identifiers separated by periods (U+002E FULL STOP).
         let is_identifier_list = path
-            .split(".")
+            .str()
+            .split('.')
             .map(is_identifier_name)
             .try_collect::<bool, Vec<bool>, Error>()?
             .iter()
@@ -158,7 +160,7 @@ pub fn convert_value_to_key(
     seen: Option<Vec<HandleValue>>,
 ) -> Result<ConversionResult, Error> {
     // Step 1: If seen was not given, then let seen be a new empty set.
-    let _seen = seen.unwrap_or_default();
+    let mut seen = seen.unwrap_or_default();
 
     // Step 2: If seen contains input, then return invalid.
     // FIXME:(arihant2math) implement this
@@ -189,13 +191,13 @@ pub fn convert_value_to_key(
             let mut built_in_class = ESClass::Other;
 
             if !GetBuiltinClass(*cx, object.handle().into(), &mut built_in_class) {
-                return Err(Error::Data);
+                return Err(Error::JSFailed);
             }
 
             if let ESClass::Date = built_in_class {
                 let mut f = f64::NAN;
                 if !js::jsapi::DateGetMsecSinceEpoch(*cx, object.handle().into(), &mut f) {
-                    return Err(Error::Data);
+                    return Err(Error::JSFailed);
                 }
                 if f.is_nan() {
                     return Err(Error::Data);
@@ -212,9 +214,45 @@ pub fn convert_value_to_key(
             }
 
             if let ESClass::Array = built_in_class {
-                // FIXME:(arihant2math)
-                error!("Arrays as keys is currently unsupported");
-                return Err(Error::NotSupported);
+                let mut len = 0;
+                if !GetArrayLength(*cx, object.handle().into_handle(), &mut len) {
+                    return Err(Error::JSFailed);
+                }
+                seen.push(input);
+                let mut values = vec![];
+                for i in 0..len {
+                    rooted!(in(*cx) let mut id: PropertyKey);
+                    if !JS_IndexToId(*cx, i, js::jsapi::MutableHandleId::from(id.handle_mut())) {
+                        return Err(Error::JSFailed);
+                    }
+                    let mut has_own = false;
+                    if !JS_HasOwnPropertyById(
+                        *cx,
+                        object.handle().into_handle(),
+                        id.handle().into_handle(),
+                        &mut has_own,
+                    ) {
+                        return Err(Error::JSFailed);
+                    }
+                    if !has_own {
+                        return Ok(ConversionResult::Invalid);
+                    }
+                    rooted!(in(*cx) let mut item = UndefinedValue());
+                    if !js::jsapi::JS_GetPropertyById(
+                        *cx,
+                        object.handle().into_handle(),
+                        id.handle().into_handle(),
+                        item.handle_mut().into_handle_mut(),
+                    ) {
+                        return Err(Error::JSFailed);
+                    }
+                    let key = match convert_value_to_key(cx, item.handle(), Some(seen.clone()))? {
+                        ConversionResult::Valid(key) => key,
+                        ConversionResult::Invalid => return Ok(ConversionResult::Invalid),
+                    };
+                    values.push(key);
+                }
+                return Ok(ConversionResult::Valid(IndexedDBKeyType::Array(values)));
             }
         }
     }
@@ -330,7 +368,7 @@ pub(crate) fn evaluate_key_path_on_value(
             // Step 3. Let identifiers be the result of strictly splitting keyPath on U+002E
             // FULL STOP characters (.).
             // Step 4. For each identifier of identifiers, jump to the appropriate step below:
-            for identifier in key_path.split('.') {
+            for identifier in key_path.str().split('.') {
                 // If Type(value) is String, and identifier is "length"
                 if identifier == "length" && current_value.is_string() {
                     // Let value be a Number equal to the number of elements in value.

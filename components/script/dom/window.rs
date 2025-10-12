@@ -26,23 +26,25 @@ use bluetooth_traits::BluetoothRequest;
 use canvas_traits::webgl::WebGLChan;
 use compositing_traits::CrossProcessCompositorApi;
 use constellation_traits::{
-    DocumentState, LoadData, LoadOrigin, NavigationHistoryBehavior, ScriptToConstellationChan,
-    ScriptToConstellationMessage, StructuredSerializedData, WindowSizeType,
+    LoadData, LoadOrigin, NavigationHistoryBehavior, ScreenshotReadinessResponse,
+    ScriptToConstellationChan, ScriptToConstellationMessage, StructuredSerializedData,
+    WindowSizeType,
 };
+use content_security_policy::sandboxing_directive::SandboxingFlagSet;
 use crossbeam_channel::{Sender, unbounded};
 use cssparser::SourceLocation;
 use devtools_traits::{ScriptToDevtoolsControlMsg, TimelineMarker, TimelineMarkerType};
 use dom_struct::dom_struct;
 use embedder_traits::user_content_manager::{UserContentManager, UserScript};
 use embedder_traits::{
-    AlertResponse, ConfirmResponse, EmbedderMsg, PromptResponse, ScriptToEmbedderChan,
-    SimpleDialog, Theme, UntrustedNodeAddress, ViewportDetails, WebDriverJSError,
+    AlertResponse, ConfirmResponse, EmbedderMsg, JavaScriptEvaluationError, PromptResponse,
+    ScriptToEmbedderChan, SimpleDialog, Theme, UntrustedNodeAddress, ViewportDetails,
     WebDriverJSResult, WebDriverLoadStatus,
 };
 use euclid::default::{Point2D as UntypedPoint2D, Rect as UntypedRect, Size2D as UntypedSize2D};
 use euclid::{Point2D, Scale, Size2D, Vector2D};
 use fonts::FontContext;
-use ipc_channel::ipc::{self, IpcSender};
+use ipc_channel::ipc::IpcSender;
 use js::glue::DumpJSStack;
 use js::jsapi::{
     GCReason, Heap, JS_GC, JSAutoRealm, JSContext as RawJSContext, JSObject, JSPROP_ENUMERATE,
@@ -57,7 +59,7 @@ use layout_api::{
     BoxAreaType, ElementsFromPointFlags, ElementsFromPointResult, FragmentType, Layout,
     LayoutImageDestination, PendingImage, PendingImageState, PendingRasterizationImage, QueryMsg,
     ReflowGoal, ReflowPhasesRun, ReflowRequest, ReflowRequestRestyle, RestyleReason,
-    ScrollContainerQueryType, ScrollContainerResponse, TrustedNodeAddress,
+    ScrollContainerQueryFlags, ScrollContainerResponse, TrustedNodeAddress,
     combine_id_with_fragment_type,
 };
 use malloc_size_of::MallocSizeOf;
@@ -67,7 +69,6 @@ use net_traits::image_cache::{
     ImageCache, ImageCacheResponseMessage, ImageLoadListener, ImageResponse, PendingImageId,
     PendingImageResponse, RasterizationCompleteResponse,
 };
-use net_traits::storage_thread::StorageType;
 use num_traits::ToPrimitive;
 use profile_traits::generic_channel as ProfiledGenericChannel;
 use profile_traits::mem::ProfilerChan as MemProfilerChan;
@@ -80,9 +81,11 @@ use script_bindings::root::Root;
 use script_traits::{ConstellationInputEvent, ScriptThreadMessage};
 use selectors::attr::CaseSensitivity;
 use servo_arc::Arc as ServoArc;
-use servo_config::{opts, pref};
+use servo_config::pref;
 use servo_geometry::{DeviceIndependentIntRect, f32_rect_to_au_rect};
 use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
+use storage_traits::StorageThreads;
+use storage_traits::webstorage_thread::StorageType;
 use style::error_reporting::{ContextualParseError, ParseErrorReporter};
 use style::properties::PropertyId;
 use style::properties::style_structs::Font;
@@ -109,15 +112,18 @@ use crate::dom::bindings::codegen::Bindings::ImageBitmapBinding::{
 };
 use crate::dom::bindings::codegen::Bindings::MediaQueryListBinding::MediaQueryList_Binding::MediaQueryListMethods;
 use crate::dom::bindings::codegen::Bindings::ReportingObserverBinding::Report;
-use crate::dom::bindings::codegen::Bindings::RequestBinding::RequestInit;
+use crate::dom::bindings::codegen::Bindings::RequestBinding::{RequestInfo, RequestInit};
 use crate::dom::bindings::codegen::Bindings::VoidFunctionBinding::VoidFunction;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::{
-    self, FrameRequestCallback, ScrollBehavior, WindowMethods, WindowPostMessageOptions,
+    self, DeferredRequestInit, FrameRequestCallback, ScrollBehavior, WindowMethods,
+    WindowPostMessageOptions,
 };
 use crate::dom::bindings::codegen::UnionTypes::{
     RequestOrUSVString, TrustedScriptOrString, TrustedScriptOrStringOrFunction,
 };
-use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
+use crate::dom::bindings::error::{
+    Error, ErrorInfo, ErrorResult, Fallible, javascript_error_info_from_error_info,
+};
 use crate::dom::bindings::inheritance::{Castable, ElementTypeId, HTMLElementTypeId, NodeTypeId};
 use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::refcounted::Trusted;
@@ -138,6 +144,7 @@ use crate::dom::document::{AnimationFrameCallback, Document};
 use crate::dom::element::Element;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
+use crate::dom::fetchlaterresult::FetchLaterResult;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::hashchangeevent::HashChangeEvent;
 use crate::dom::history::History;
@@ -157,6 +164,7 @@ use crate::dom::promise::Promise;
 use crate::dom::reportingendpoint::{ReportingEndpoint, SendReportsToEndpoints};
 use crate::dom::reportingobserver::ReportingObserver;
 use crate::dom::screen::Screen;
+use crate::dom::scrolling_box::{ScrollingBox, ScrollingBoxSource};
 use crate::dom::selection::Selection;
 use crate::dom::shadowroot::ShadowRoot;
 use crate::dom::storage::Storage;
@@ -176,6 +184,7 @@ use crate::microtask::MicrotaskQueue;
 use crate::realms::{InRealm, enter_realm};
 use crate::script_runtime::{CanGc, JSContext, Runtime};
 use crate::script_thread::ScriptThread;
+use crate::script_window_proxies::ScriptWindowProxies;
 use crate::timers::{IsInterval, TimerCallback};
 use crate::unminify::unminified_path;
 use crate::webdriver_handlers::{find_node_by_unique_id_in_document, jsval_to_webdriver};
@@ -261,7 +270,7 @@ pub(crate) struct Window {
     #[ignore_malloc_size_of = "TODO: Add MallocSizeOf support to layout"]
     layout: RefCell<Box<dyn Layout>>,
     navigator: MutNullableDom<Navigator>,
-    #[ignore_malloc_size_of = "Arc"]
+    #[ignore_malloc_size_of = "ImageCache"]
     #[no_trace]
     image_cache: Arc<dyn ImageCache>,
     #[no_trace]
@@ -308,7 +317,7 @@ pub(crate) struct Window {
     dom_static: GlobalStaticData,
 
     /// The JavaScript runtime.
-    #[ignore_malloc_size_of = "Rc<T> is hard"]
+    #[conditional_malloc_size_of]
     js_runtime: DomRefCell<Option<Rc<Runtime>>>,
 
     /// The [`ViewportDetails`] of this [`Window`]'s frame.
@@ -425,7 +434,7 @@ pub(crate) struct Window {
     /// A shared marker for the validity of any cached layout values. A value of true
     /// indicates that any such values remain valid; any new layout that invalidates
     /// those values will cause the marker to be set to false.
-    #[ignore_malloc_size_of = "Rc is hard"]
+    #[conditional_malloc_size_of]
     layout_marker: DomRefCell<Rc<Cell<bool>>>,
 
     /// <https://dom.spec.whatwg.org/#window-current-event>
@@ -440,6 +449,13 @@ pub(crate) struct Window {
     /// <https://w3c.github.io/reporting/#windoworworkerglobalscope-endpoints>
     #[no_trace]
     endpoints_list: DomRefCell<Vec<ReportingEndpoint>>,
+
+    /// The window proxies the script thread knows.
+    #[conditional_malloc_size_of]
+    script_window_proxies: Rc<ScriptWindowProxies>,
+
+    /// Whether or not this [`Window`] has a pending screenshot readiness request.
+    has_pending_screenshot_readiness_request: Cell<bool>,
 }
 
 impl Window {
@@ -605,7 +621,8 @@ impl Window {
     /// <https://html.spec.whatwg.org/multipage/#top-level-browsing-context>
     pub(crate) fn webview_window_proxy(&self) -> Option<DomRoot<WindowProxy>> {
         self.undiscarded_window_proxy().and_then(|window_proxy| {
-            ScriptThread::find_window_proxy(window_proxy.webview_id().into())
+            self.script_window_proxies
+                .find_window_proxy(window_proxy.webview_id().into())
         })
     }
 
@@ -793,6 +810,38 @@ impl Window {
         // 3. Abort a document and its descendants given document.
         doc.abort(can_gc);
     }
+
+    /// <https://html.spec.whatwg.org/multipage/#cannot-show-simple-dialogs>
+    fn cannot_show_simple_dialogs(&self) -> bool {
+        // Step 1: If the active sandboxing flag set of window's associated Document has
+        // the sandboxed modals flag set, then return true.
+        if self
+            .Document()
+            .has_active_sandboxing_flag(SandboxingFlagSet::SANDBOXED_MODALS_FLAG)
+        {
+            return true;
+        }
+
+        // Step 2: If window's relevant settings object's origin and window's relevant settings
+        // object's top-level origin are not same origin-domain, then return true.
+        //
+        // TODO: This check doesn't work currently because it seems that comparing two
+        // opaque domains doesn't work between GlobalScope::top_level_creation_url and
+        // Document::origin().
+
+        // Step 3: If window's relevant agent's event loop's termination nesting level is nonzero,
+        // then optionally return true.
+        // TODO: This is unsupported currently.
+
+        // Step 4: Optionally, return true. (For example, the user agent might give the
+        // user the option to ignore all modal dialogs, and would thus abort at this step
+        // whenever the method was invoked.)
+        // TODO: The embedder currently cannot block an alert before it is sent to the embedder. This
+        // requires changes to the API.
+
+        // Step 5: Return false.
+        false
+    }
 }
 
 // https://html.spec.whatwg.org/multipage/#atob
@@ -800,14 +849,18 @@ pub(crate) fn base64_btoa(input: DOMString) -> Fallible<DOMString> {
     // "The btoa() method must throw an InvalidCharacterError exception if
     //  the method's first argument contains any character whose code point
     //  is greater than U+00FF."
-    if input.chars().any(|c: char| c > '\u{FF}') {
+    if input.str().chars().any(|c: char| c > '\u{FF}') {
         Err(Error::InvalidCharacter)
     } else {
         // "Otherwise, the user agent must convert that argument to a
         //  sequence of octets whose nth octet is the eight-bit
         //  representation of the code point of the nth character of
         //  the argument,"
-        let octets = input.chars().map(|c: char| c as u8).collect::<Vec<u8>>();
+        let octets = input
+            .str()
+            .chars()
+            .map(|c: char| c as u8)
+            .collect::<Vec<u8>>();
 
         // "and then must apply the base64 algorithm to that sequence of
         //  octets, and return the result. [RFC4648]"
@@ -825,6 +878,7 @@ pub(crate) fn base64_atob(input: DOMString) -> Fallible<DOMString> {
         HTML_SPACE_CHARACTERS.contains(&c)
     }
     let without_spaces = input
+        .str()
         .chars()
         .filter(|&c| !is_html_space(c))
         .collect::<String>();
@@ -871,50 +925,103 @@ pub(crate) fn base64_atob(input: DOMString) -> Fallible<DOMString> {
 }
 
 impl WindowMethods<crate::DomTypeHolder> for Window {
-    // https://html.spec.whatwg.org/multipage/#dom-alert
+    /// <https://html.spec.whatwg.org/multipage/#dom-alert>
     fn Alert_(&self) {
+        // Step 2: If the method was invoked with no arguments, then let message be the
+        // empty string; otherwise, let message be the method's first argument.
         self.Alert(DOMString::new());
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-alert
-    fn Alert(&self, s: DOMString) {
-        // Print to the console.
-        // Ensure that stderr doesn't trample through the alert() we use to
-        // communicate test results (see executorservo.py in wptrunner).
+    /// <https://html.spec.whatwg.org/multipage/#dom-alert>
+    fn Alert(&self, mut message: DOMString) {
+        // Step 1: If we cannot show simple dialogs for this, then return.
+        if self.cannot_show_simple_dialogs() {
+            return;
+        }
+
+        // Step 2 is handled in the other variant of this method.
+        //
+        // Step 3: Set message to the result of normalizing newlines given message.
+        message.normalize_newlines();
+
+        // Step 4. Set message to the result of optionally truncating message.
+        // This is up to the embedder.
+
+        // Step 5: Let userPromptHandler be WebDriver BiDi user prompt opened with this,
+        // "alert", and message.
+        // TODO: Add support for WebDriver BiDi.
+
+        // Step 6: If userPromptHandler is "none", then:
+        //  1. Show message to the user, treating U+000A LF as a line break.
+        //  2. Optionally, pause while waiting for the user to acknowledge the message.
         {
+            // Print to the console.
+            // Ensure that stderr doesn't trample through the alert() we use to
+            // communicate test results (see executorservo.py in wptrunner).
             let stderr = stderr();
             let mut stderr = stderr.lock();
             let stdout = stdout();
             let mut stdout = stdout.lock();
-            writeln!(&mut stdout, "\nALERT: {}", s).unwrap();
+            writeln!(&mut stdout, "\nALERT: {message}").unwrap();
             stdout.flush().unwrap();
             stderr.flush().unwrap();
         }
+
         let (sender, receiver) =
             ProfiledGenericChannel::channel(self.global().time_profiler_chan().clone()).unwrap();
         let dialog = SimpleDialog::Alert {
-            message: s.to_string(),
+            message: message.to_string(),
             response_sender: sender,
         };
-        let msg = EmbedderMsg::ShowSimpleDialog(self.webview_id(), dialog);
-        self.send_to_embedder(msg);
+        self.send_to_embedder(EmbedderMsg::ShowSimpleDialog(self.webview_id(), dialog));
         receiver.recv().unwrap_or_else(|_| {
             // If the receiver is closed, we assume the dialog was cancelled.
             debug!("Alert dialog was cancelled or failed to show.");
             AlertResponse::Ok
         });
+
+        // Step 7: Invoke WebDriver BiDi user prompt closed with this, "alert", and true.
+        // TODO: Implement support for WebDriver BiDi.
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-confirm
-    fn Confirm(&self, s: DOMString) -> bool {
+    /// <https://html.spec.whatwg.org/multipage/#dom-confirm>
+    fn Confirm(&self, mut message: DOMString) -> bool {
+        // Step 1: If we cannot show simple dialogs for this, then return false.
+        if self.cannot_show_simple_dialogs() {
+            return false;
+        }
+
+        // Step 2: Set message to the result of normalizing newlines given message.
+        message.normalize_newlines();
+
+        // Step 3: Set message to the result of optionally truncating message.
+        // We let the embedder handle this.
+
+        // Step 4: Show message to the user, treating U+000A LF as a line break, and ask
+        // the user to respond with a positive or negative response.
         let (sender, receiver) =
             ProfiledGenericChannel::channel(self.global().time_profiler_chan().clone()).unwrap();
         let dialog = SimpleDialog::Confirm {
-            message: s.to_string(),
+            message: message.to_string(),
             response_sender: sender,
         };
-        let msg = EmbedderMsg::ShowSimpleDialog(self.webview_id(), dialog);
-        self.send_to_embedder(msg);
+        self.send_to_embedder(EmbedderMsg::ShowSimpleDialog(self.webview_id(), dialog));
+
+        // Step 5: Let userPromptHandler be WebDriver BiDi user prompt opened with this,
+        // "confirm", and message.
+        //
+        // Step 6: Let accepted be false.
+        //
+        // Step 7: If userPromptHandler is "none", then:
+        //  1. Pause until the user responds either positively or negatively.
+        //  2. If the user responded positively, then set accepted to true.
+        //
+        // Step 8: If userPromptHandler is "accept", then set accepted to true.
+        //
+        // Step 9: Invoke WebDriver BiDi user prompt closed with this, "confirm", and accepted.
+        // TODO: Implement WebDriver BiDi and handle these steps.
+        //
+        // Step 10: Return accepted.
         match receiver.recv() {
             Ok(ConfirmResponse::Ok) => true,
             Ok(ConfirmResponse::Cancel) => false,
@@ -925,8 +1032,23 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
         }
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-prompt
-    fn Prompt(&self, message: DOMString, default: DOMString) -> Option<DOMString> {
+    /// <https://html.spec.whatwg.org/multipage/#dom-prompt>
+    fn Prompt(&self, mut message: DOMString, default: DOMString) -> Option<DOMString> {
+        // Step 1: If we cannot show simple dialogs for this, then return null.
+        if self.cannot_show_simple_dialogs() {
+            return None;
+        }
+
+        // Step 2: Set message to the result of normalizing newlines given message.
+        message.normalize_newlines();
+
+        // Step 3. Set message to the result of optionally truncating message.
+        // Step 4: Set default to the result of optionally truncating default.
+        // We let the embedder handle these steps.
+
+        // Step 5: Show message to the user, treating U+000A LF as a line break, and ask
+        // the user to either respond with a string value or abort. The response must be
+        // defaulted to the value given by default.
         let (sender, receiver) =
             ProfiledGenericChannel::channel(self.global().time_profiler_chan().clone()).unwrap();
         let dialog = SimpleDialog::Prompt {
@@ -934,8 +1056,26 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
             default: default.to_string(),
             response_sender: sender,
         };
-        let msg = EmbedderMsg::ShowSimpleDialog(self.webview_id(), dialog);
-        self.send_to_embedder(msg);
+        self.send_to_embedder(EmbedderMsg::ShowSimpleDialog(self.webview_id(), dialog));
+
+        // Step 6: Let userPromptHandler be WebDriver BiDi user prompt opened with this,
+        // "prompt", and message.
+        // TODO: Add support for WebDriver BiDi.
+        //
+        // Step 7: Let result be null.
+        //
+        // Step 8: If userPromptHandler is "none", then:
+        //  1. Pause while waiting for the user's response.
+        //  2. If the user did not abort, then set result to the string that the user responded with.
+        //
+        // Step 9: Otherwise, if userPromptHandler is "accept", then set result to the empty string.
+        // TODO: Implement this.
+        //
+        // Step 10: Invoke WebDriver BiDi user prompt closed with this, "prompt", false if
+        // result is null or true otherwise, and result.
+        // TODO: Add support for WebDriver BiDi.
+        //
+        // Step 11: Return result.
         match receiver.recv() {
             Ok(PromptResponse::Ok(input)) => Some(input.into()),
             Ok(PromptResponse::Cancel) => None,
@@ -1466,30 +1606,26 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
         }
     }
 
-    fn WebdriverCallback(&self, cx: JSContext, val: HandleValue, realm: InRealm, can_gc: CanGc) {
-        let rv = jsval_to_webdriver(cx, &self.globalscope, val, realm, can_gc);
-        let opt_chan = self.webdriver_script_chan.borrow_mut().take();
-        if let Some(chan) = opt_chan {
-            let _ = chan.send(rv);
+    fn WebdriverCallback(&self, cx: JSContext, value: HandleValue, realm: InRealm, can_gc: CanGc) {
+        let webdriver_script_sender = self.webdriver_script_chan.borrow_mut().take();
+        if let Some(webdriver_script_sender) = webdriver_script_sender {
+            let result = jsval_to_webdriver(cx, &self.globalscope, value, realm, can_gc);
+            let _ = webdriver_script_sender.send(result);
         }
     }
 
-    fn WebdriverException(&self, cx: JSContext, val: HandleValue, realm: InRealm, can_gc: CanGc) {
-        let rv = jsval_to_webdriver(cx, &self.globalscope, val, realm, can_gc);
-        let opt_chan = self.webdriver_script_chan.borrow_mut().take();
-        if let Some(chan) = opt_chan {
-            if let Ok(rv) = rv {
-                let _ = chan.send(Err(WebDriverJSError::JSException(rv)));
-            } else {
-                let _ = chan.send(rv);
-            }
-        }
-    }
-
-    fn WebdriverTimeout(&self) {
-        let opt_chan = self.webdriver_script_chan.borrow_mut().take();
-        if let Some(chan) = opt_chan {
-            let _ = chan.send(Err(WebDriverJSError::Timeout));
+    fn WebdriverException(&self, cx: JSContext, value: HandleValue, can_gc: CanGc) {
+        let webdriver_script_sender = self.webdriver_script_chan.borrow_mut().take();
+        if let Some(webdriver_script_sender) = webdriver_script_sender {
+            let _ =
+                webdriver_script_sender.send(Err(JavaScriptEvaluationError::EvaluationFailure(
+                    Some(javascript_error_info_from_error_info(
+                        cx,
+                        &ErrorInfo::from_value(value, cx),
+                        value,
+                        can_gc,
+                    )),
+                )));
         }
     }
 
@@ -1519,7 +1655,7 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
             return None;
         }
 
-        if self.webview_id().to_string() == webview_id.str() {
+        if self.webview_id().to_string() == webview_id {
             Some(DomRoot::from_ref(&window_proxy))
         } else {
             None
@@ -1791,14 +1927,14 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
 
     // https://drafts.csswg.org/cssom-view/#dom-window-matchmedia
     fn MatchMedia(&self, query: DOMString) -> DomRoot<MediaQueryList> {
-        let media_query_list = MediaList::parse_media_list(&query, self);
+        let media_query_list = MediaList::parse_media_list(&query.str(), self);
         let document = self.Document();
         let mql = MediaQueryList::new(&document, media_query_list, CanGc::note());
         self.media_query_lists.track(&*mql);
         mql
     }
 
-    // https://fetch.spec.whatwg.org/#fetch-method
+    /// <https://fetch.spec.whatwg.org/#dom-global-fetch>
     fn Fetch(
         &self,
         input: RequestOrUSVString,
@@ -1807,6 +1943,16 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
         can_gc: CanGc,
     ) -> Rc<Promise> {
         fetch::Fetch(self.upcast(), input, init, comp, can_gc)
+    }
+
+    /// <https://fetch.spec.whatwg.org/#dom-window-fetchlater>
+    fn FetchLater(
+        &self,
+        input: RequestInfo,
+        init: RootedTraceableBox<DeferredRequestInit>,
+        can_gc: CanGc,
+    ) -> Fallible<DomRoot<FetchLaterResult>> {
+        fetch::FetchLater(self, input, init, can_gc)
     }
 
     #[cfg(feature = "bluetooth")]
@@ -1880,7 +2026,7 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
 
         let iframe_iter = iframes.iter().map(|iframe| iframe.upcast::<Element>());
 
-        let name = Atom::from(&*name);
+        let name = Atom::from(name);
 
         // Step 1.
         let elements_with_name = document.get_elements_with_name(&name);
@@ -2160,9 +2306,9 @@ impl Window {
         // the x-coordinate x of the viewport scrolling area with the left of the viewport
         // and aligning the y-coordinate y of the viewport scrolling area with the top of
         // the viewport.
-        let scrolling_area = self.scrolling_area_query(None);
-        let x = xfinite.clamp(0.0, scrolling_area.width() as f32 - viewport.width);
-        let y = yfinite.clamp(0.0, scrolling_area.height() as f32 - viewport.height);
+        let scrolling_area = self.scrolling_area_query(None).to_f32();
+        let x = xfinite.clamp(0.0, 0.0f32.max(scrolling_area.width() - viewport.width));
+        let y = yfinite.clamp(0.0, 0.0f32.max(scrolling_area.height() - viewport.height));
 
         // Step 10: If position is the same as the viewport’s current scroll position, and
         // the viewport does not have an ongoing smooth scroll, abort these steps.
@@ -2293,6 +2439,7 @@ impl Window {
 
         let reflow = ReflowRequest {
             document: document.upcast::<Node>().to_trusted_node_address(),
+            epoch: document.current_rendering_epoch(),
             restyle,
             viewport_details: self.viewport_details.get(),
             origin: self.origin().immutable().clone(),
@@ -2300,7 +2447,7 @@ impl Window {
             dom_count: document.dom_count(),
             animation_timeline_value: document.current_animation_timeline_value(),
             animations: document.animations().sets.clone(),
-            node_to_animating_image_map: document.image_animation_manager().node_to_image_map(),
+            animating_images: document.image_animation_manager().animating_images(),
             theme: self.theme.get(),
             highlighted_dom_node: document.highlighted_dom_node().map(|node| node.to_opaque()),
         };
@@ -2327,22 +2474,27 @@ impl Window {
         }
 
         document.update_animations_post_reflow();
-        self.update_constellation_epoch();
 
         reflow_result.reflow_phases_run
     }
 
-    pub(crate) fn maybe_send_idle_document_state_to_constellation(&self) {
-        if !opts::get().wait_for_stable_image {
-            return;
-        }
+    pub(crate) fn request_screenshot_readiness(&self) {
+        self.has_pending_screenshot_readiness_request.set(true);
+        self.maybe_resolve_pending_screenshot_readiness_requests();
+    }
 
-        if self.has_sent_idle_message.get() {
+    pub(crate) fn maybe_resolve_pending_screenshot_readiness_requests(&self) {
+        let pending_request = self.has_pending_screenshot_readiness_request.get();
+        if !pending_request {
             return;
         }
 
         let document = self.Document();
         if document.ReadyState() != DocumentReadyState::Complete {
+            return;
+        }
+
+        if document.render_blocking_element_count() > 0 {
             return;
         }
 
@@ -2366,21 +2518,23 @@ impl Window {
             return;
         }
 
-        if self.Document().needs_rendering_update() {
+        let document = self.Document();
+        if document.needs_rendering_update() {
             return;
         }
 
-        // When all these conditions are met, notify the constellation
-        // that this pipeline is ready to write the image (from the script thread
-        // perspective at least).
-        debug!(
-            "{:?}: Sending DocumentState::Idle to Constellation",
-            self.pipeline_id()
+        // When all these conditions are met, notify the Constellation that we are ready to
+        // have our screenshot taken, when the given layout Epoch has been rendered.
+        let epoch = document.current_rendering_epoch();
+        let pipeline_id = self.pipeline_id();
+        debug!("Ready to take screenshot of {pipeline_id:?} at epoch={epoch:?}");
+
+        self.send_to_constellation(
+            ScriptToConstellationMessage::RespondToScreenshotReadinessRequest(
+                ScreenshotReadinessResponse::Ready(epoch),
+            ),
         );
-        self.send_to_constellation(ScriptToConstellationMessage::SetDocumentState(
-            DocumentState::Idle,
-        ));
-        self.has_sent_idle_message.set(true);
+        self.has_pending_screenshot_readiness_request.set(false);
     }
 
     /// If parsing has taken a long time and reflows are still waiting for the `load` event,
@@ -2442,24 +2596,6 @@ impl Window {
 
     pub(crate) fn layout_blocked(&self) -> bool {
         self.layout_blocker.get().layout_blocked()
-    }
-
-    /// If writing a screenshot, synchronously update the layout epoch that it set
-    /// in the constellation.
-    pub(crate) fn update_constellation_epoch(&self) {
-        if !opts::get().wait_for_stable_image {
-            return;
-        }
-
-        let epoch = self.layout.borrow().current_epoch();
-        debug!(
-            "{:?}: Updating constellation epoch: {epoch:?}",
-            self.pipeline_id()
-        );
-        let (sender, receiver) = ipc::channel().expect("Failed to create IPC channel!");
-        let event = ScriptToConstellationMessage::SetLayoutEpoch(epoch, sender);
-        self.send_to_constellation(event);
-        let _ = receiver.recv();
     }
 
     /// Trigger a reflow that is required by a certain queries.
@@ -2628,13 +2764,37 @@ impl Window {
 
     pub(crate) fn scroll_container_query(
         &self,
-        node: &Node,
-        query_type: ScrollContainerQueryType,
+        node: Option<&Node>,
+        flags: ScrollContainerQueryFlags,
     ) -> Option<ScrollContainerResponse> {
         self.layout_reflow(QueryMsg::ScrollParentQuery);
         self.layout
             .borrow()
-            .query_scroll_container(node.to_trusted_node_address(), query_type)
+            .query_scroll_container(node.map(Node::to_trusted_node_address), flags)
+    }
+
+    #[allow(unsafe_code)]
+    pub(crate) fn scrolling_box_query(
+        &self,
+        node: Option<&Node>,
+        flags: ScrollContainerQueryFlags,
+    ) -> Option<ScrollingBox> {
+        self.scroll_container_query(node, flags)
+            .and_then(|response| {
+                Some(match response {
+                    ScrollContainerResponse::Viewport(overflow) => {
+                        (ScrollingBoxSource::Viewport(self.Document()), overflow)
+                    },
+                    ScrollContainerResponse::Element(parent_node_address, overflow) => {
+                        let node = unsafe { from_untrusted_node_address(parent_node_address) };
+                        (
+                            ScrollingBoxSource::Element(DomRoot::downcast(node)?),
+                            overflow,
+                        )
+                    },
+                })
+            })
+            .map(|(source, overflow)| ScrollingBox::new(source, overflow))
     }
 
     pub(crate) fn text_index_query(
@@ -3167,9 +3327,7 @@ impl Window {
             node.dirty(NodeDamage::Other);
         }
     }
-}
 
-impl Window {
     #[allow(unsafe_code)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -3181,6 +3339,7 @@ impl Window {
         image_cache_sender: IpcSender<ImageCacheResponseMessage>,
         image_cache: Arc<dyn ImageCache>,
         resource_threads: ResourceThreads,
+        storage_threads: StorageThreads,
         #[cfg(feature = "bluetooth")] bluetooth_thread: IpcSender<BluetoothRequest>,
         mem_profiler_chan: MemProfilerChan,
         time_profiler_chan: TimeProfilerChan,
@@ -3228,6 +3387,7 @@ impl Window {
                 constellation_chan,
                 embedder_chan,
                 resource_threads,
+                storage_threads,
                 origin,
                 creation_url,
                 Some(top_level_creation_url),
@@ -3300,6 +3460,8 @@ impl Window {
             reporting_observer_list: Default::default(),
             report_list: Default::default(),
             endpoints_list: Default::default(),
+            script_window_proxies: ScriptThread::window_proxies(),
+            has_pending_screenshot_readiness_request: Default::default(),
         });
 
         WindowBinding::Wrap::<crate::DomTypeHolder>(GlobalScope::get_cx(), win)
@@ -3324,7 +3486,7 @@ impl Window {
 /// performed.
 #[derive(MallocSizeOf)]
 pub(crate) struct LayoutValue<T: MallocSizeOf> {
-    #[ignore_malloc_size_of = "Rc is hard"]
+    #[conditional_malloc_size_of]
     is_valid: Rc<Cell<bool>>,
     value: T,
 }

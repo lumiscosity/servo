@@ -12,10 +12,8 @@ use std::time::Instant;
 use std::{env, fs};
 
 use ::servo::ServoBuilder;
-use constellation_traits::EmbedderToConstellationMessage;
 use crossbeam_channel::unbounded;
-use euclid::{Point2D, Vector2D};
-use ipc_channel::ipc;
+use euclid::Vector2D;
 use log::{info, trace, warn};
 use net::protocols::ProtocolRegistry;
 use servo::config::opts::Opts;
@@ -24,9 +22,8 @@ use servo::servo_url::ServoUrl;
 use servo::user_content_manager::{UserContentManager, UserScript};
 use servo::webrender_api::ScrollLocation;
 use servo::{
-    EventLoopWaker, ImeEvent, InputEvent, KeyboardEvent, MouseButtonEvent, MouseMoveEvent,
-    WebDriverCommandMsg, WebDriverScriptCommand, WebDriverUserPromptAction, WheelDelta, WheelEvent,
-    WheelMode,
+    EventLoopWaker, InputEvent, ScreenshotCaptureError, WebDriverCommandMsg,
+    WebDriverScriptCommand, WebDriverUserPromptAction, WheelEvent,
 };
 use url::Url;
 use winit::application::ApplicationHandler;
@@ -171,24 +168,7 @@ impl App {
         // Initialize WebDriver server here before `servo` is moved.
         let webdriver_receiver = self.servoshell_preferences.webdriver_port.map(|port| {
             let (embedder_sender, embedder_receiver) = unbounded();
-            let (webdriver_response_sender, webdriver_response_receiver) = ipc::channel().unwrap();
-
-            // Set the WebDriver response sender to constellation.
-            // TODO: consider using Servo API to notify embedder about input events completions
-            servo
-                .constellation_sender()
-                .send(EmbedderToConstellationMessage::SetWebDriverResponseSender(
-                    webdriver_response_sender,
-                ))
-                .expect("Failed to set WebDriver response sender in constellation when initing");
-
-            webdriver_server::start_server(
-                port,
-                embedder_sender,
-                self.waker.clone(),
-                webdriver_response_receiver,
-            );
-
+            webdriver_server::start_server(port, embedder_sender, self.waker.clone());
             embedder_receiver
         });
 
@@ -351,9 +331,6 @@ impl App {
 
         while let Ok(msg) = webdriver_receiver.try_recv() {
             match msg {
-                WebDriverCommandMsg::SetWebDriverResponseSender(..) => {
-                    running_state.servo().execute_webdriver_command(msg);
-                },
                 WebDriverCommandMsg::IsWebViewOpen(webview_id, sender) => {
                     let context = running_state.webview_by_id(webview_id);
 
@@ -493,76 +470,30 @@ impl App {
                         running_state.set_pending_traversal(traversal_id, load_status_sender);
                     }
                 },
-                // Key events don't need hit test so can be forwarded to constellation for now
-                WebDriverCommandMsg::DispatchComposition(webview_id, composition_event) => {
+                WebDriverCommandMsg::InputEvent(webview_id, input_event, response_sender) => {
                     if let Some(webview) = running_state.webview_by_id(webview_id) {
-                        webview.notify_input_event(InputEvent::Ime(ImeEvent::Composition(
-                            composition_event,
-                        )));
-                    }
-                },
-                WebDriverCommandMsg::KeyboardAction(webview_id, key_event, msg_id) => {
-                    // TODO: We should do processing like in `headed_window:handle_keyboard_input`.
-                    if let Some(webview) = running_state.webview_by_id(webview_id) {
-                        webview.notify_input_event(
-                            InputEvent::Keyboard(KeyboardEvent::new(key_event))
-                                .with_webdriver_message_id(msg_id),
-                        );
-                    }
-                },
-                WebDriverCommandMsg::MouseButtonAction(
-                    webview_id,
-                    mouse_event_type,
-                    mouse_button,
-                    x,
-                    y,
-                    webdriver_message_id,
-                ) => {
-                    if let Some(webview) = running_state.webview_by_id(webview_id) {
-                        webview.notify_input_event(
-                            InputEvent::MouseButton(MouseButtonEvent::new(
-                                mouse_event_type,
-                                mouse_button,
-                                Point2D::new(x, y),
-                            ))
-                            .with_webdriver_message_id(webdriver_message_id),
-                        );
-                    }
-                },
-                WebDriverCommandMsg::MouseMoveAction(webview_id, x, y, webdriver_message_id) => {
-                    if let Some(webview) = running_state.webview_by_id(webview_id) {
-                        webview.notify_input_event(
-                            InputEvent::MouseMove(MouseMoveEvent::new(Point2D::new(x, y)))
-                                .with_webdriver_message_id(webdriver_message_id),
-                        );
-                    }
-                },
-                WebDriverCommandMsg::WheelScrollAction(
-                    webview_id,
-                    x,
-                    y,
-                    dx,
-                    dy,
-                    webdriver_message_id,
-                ) => {
-                    if let Some(webview) = running_state.webview_by_id(webview_id) {
-                        let delta = WheelDelta {
-                            x: -dx,
-                            y: -dy,
-                            z: 0.0,
-                            mode: WheelMode::DeltaPixel,
+                        // TODO: Scroll events triggered by wheel events should happen as
+                        // a default event action in the compositor.
+                        let scroll_event = match &input_event {
+                            InputEvent::Wheel(WheelEvent { delta, point }) => {
+                                let scroll_location = ScrollLocation::Delta(Vector2D::new(
+                                    -delta.x as f32,
+                                    -delta.y as f32,
+                                ));
+                                Some((scroll_location, point.to_i32()))
+                            },
+                            _ => None,
                         };
 
-                        let point = Point2D::new(x, y);
-                        let scroll_location =
-                            ScrollLocation::Delta(Vector2D::new(dx as f32, dy as f32));
-
-                        webview.notify_input_event(
-                            InputEvent::Wheel(WheelEvent::new(delta, point.to_f32()))
-                                .with_webdriver_message_id(webdriver_message_id),
+                        running_state.handle_webdriver_input_event(
+                            webview_id,
+                            input_event,
+                            response_sender,
                         );
 
-                        webview.notify_scroll_event(scroll_location, point.to_i32());
+                        if let Some((scroll_location, scroll_point)) = scroll_event {
+                            webview.notify_scroll_event(scroll_location, scroll_point);
+                        }
                     }
                 },
                 WebDriverCommandMsg::ScriptCommand(_, ref webdriver_script_command) => {
@@ -615,8 +546,22 @@ impl App {
                 WebDriverCommandMsg::SendAlertText(webview_id, text) => {
                     running_state.set_alert_text_of_newest_dialog(webview_id, text);
                 },
-                WebDriverCommandMsg::TakeScreenshot(..) => {
-                    running_state.servo().execute_webdriver_command(msg);
+                WebDriverCommandMsg::TakeScreenshot(webview_id, rect, result_sender) => {
+                    let Some(webview) = running_state.webview_by_id(webview_id) else {
+                        if let Err(error) =
+                            result_sender.send(Err(ScreenshotCaptureError::WebViewDoesNotExist))
+                        {
+                            warn!("Failed to send response to TakeScreenshot: {error}");
+                        }
+                        continue;
+                    };
+                    let rect =
+                        rect.map(|rect| rect.to_box2d() * webview.device_pixels_per_css_pixel());
+                    webview.take_screenshot(rect, move |result| {
+                        if let Err(error) = result_sender.send(result) {
+                            warn!("Failed to send response to TakeScreenshot: {error}");
+                        }
+                    });
                 },
             };
         }

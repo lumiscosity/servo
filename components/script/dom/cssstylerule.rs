@@ -28,7 +28,7 @@ use crate::script_runtime::CanGc;
 #[dom_struct]
 pub(crate) struct CSSStyleRule {
     cssgroupingrule: CSSGroupingRule,
-    #[ignore_malloc_size_of = "Arc"]
+    #[ignore_malloc_size_of = "Stylo"]
     #[no_trace]
     stylerule: RefCell<Arc<Locked<StyleRule>>>,
     style_decl: MutNullableDom<CSSStyleDeclaration>,
@@ -151,6 +151,7 @@ impl CSSStyleRuleMethods<crate::DomTypeHolder> for CSSStyleRule {
             url_data: &url_data,
             for_supports_rule: false,
         };
+        let value = value.str();
         let mut css_parser = CssParserInput::new(&value);
         let mut css_parser = CssParser::new(&mut css_parser);
         // TODO: Maybe allow setting relative selectors from the OM, if we're in a nested style

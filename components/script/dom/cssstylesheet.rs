@@ -55,7 +55,7 @@ pub(crate) struct CSSStyleSheet {
     rulelist: MutNullableDom<CSSRuleList>,
 
     /// The inner Stylo's [Stylesheet].
-    #[ignore_malloc_size_of = "Arc"]
+    #[ignore_malloc_size_of = "Stylo"]
     #[no_trace]
     style_stylesheet: DomRefCell<Arc<StyleStyleSheet>>,
 
@@ -294,7 +294,7 @@ impl CSSStyleSheetMethods<crate::DomTypeHolder> for CSSStyleSheet {
         let media = Arc::new(shared_lock.wrap(match &options.media {
             Some(media) => match media {
                 MediaListOrString::MediaList(media_list) => media_list.clone_media_list(),
-                MediaListOrString::String(str) => MediaList::parse_media_list(str, window),
+                MediaListOrString::String(str) => MediaList::parse_media_list(&str.str(), window),
             },
             None => StyleMediaList::empty(),
         }));
@@ -392,7 +392,7 @@ impl CSSStyleSheetMethods<crate::DomTypeHolder> for CSSStyleSheet {
             rule.push_str(" { }");
         } else {
             rule.push_str(" { ");
-            rule.push_str(block.str());
+            rule.push_str(&block.str());
             rule.push_str(" }");
         };
 

@@ -15,11 +15,6 @@ use servo_url::ServoUrl;
 /// Global flags for Servo, currently set on the command line.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Opts {
-    /// Whether or not Servo should wait for web content to go into an idle state, therefore
-    /// likely producing a stable output image. This is useful for taking screenshots of pages
-    /// after they have loaded.
-    pub wait_for_stable_image: bool,
-
     /// `None` to disable the time profiler or `Some` to enable it with:
     ///
     ///  - an interval in seconds to cause it to produce output on that interval.
@@ -122,29 +117,14 @@ pub struct DebugOptions {
     /// Periodically print out on which events script threads spend their processing time.
     pub profile_script_events: bool,
 
-    /// True if each step of layout is traced to an external JSON file
-    /// for debugging purposes. Setting this implies sequential layout
-    /// and paint.
-    pub trace_layout: bool,
-
     /// Disable the style sharing cache.
     pub disable_share_style_cache: bool,
 
     /// Whether to show in stdout style sharing cache stats after a restyle.
     pub dump_style_statistics: bool,
 
-    /// Translate mouse input into touch events.
-    pub convert_mouse_to_touch: bool,
-
     /// Log GC passes and their durations.
     pub gc_profile: bool,
-
-    /// Show webrender profiling stats on screen.
-    pub webrender_stats: bool,
-
-    /// True to use OS native signposting facilities. This makes profiling events (script activity,
-    /// reflow, compositing, etc.) appear in Instruments.app on macOS.
-    pub signpost: bool,
 }
 
 impl DebugOptions {
@@ -152,21 +132,17 @@ impl DebugOptions {
         for option in debug_string.split(',') {
             match option {
                 "help" => self.help = true,
-                "convert-mouse-to-touch" => self.convert_mouse_to_touch = true,
                 "disable-share-style-cache" => self.disable_share_style_cache = true,
                 "dump-display-list" => self.dump_display_list = true,
                 "dump-stacking-context-tree" => self.dump_stacking_context_tree = true,
                 "dump-flow-tree" => self.dump_flow_tree = true,
                 "dump-rule-tree" => self.dump_rule_tree = true,
                 "dump-style-tree" => self.dump_style_tree = true,
+                "dump-style-stats" => self.dump_style_statistics = true,
                 "dump-scroll-tree" => self.dump_scroll_tree = true,
                 "gc-profile" => self.gc_profile = true,
                 "profile-script-events" => self.profile_script_events = true,
                 "relayout-event" => self.relayout_event = true,
-                "signpost" => self.signpost = true,
-                "dump-style-stats" => self.dump_style_statistics = true,
-                "trace-layout" => self.trace_layout = true,
-                "wr-stats" => self.webrender_stats = true,
                 "" => {},
                 _ => return Err(String::from(option)),
             };
@@ -186,7 +162,6 @@ pub enum OutputOptions {
 impl Default for Opts {
     fn default() -> Self {
         Self {
-            wait_for_stable_image: false,
             time_profiling: None,
             time_profiler_trace_path: None,
             nonincremental_layout: false,

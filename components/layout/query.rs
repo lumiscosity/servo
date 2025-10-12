@@ -12,8 +12,8 @@ use euclid::{SideOffsets2D, Size2D};
 use itertools::Itertools;
 use layout_api::wrapper_traits::{LayoutNode, ThreadSafeLayoutElement, ThreadSafeLayoutNode};
 use layout_api::{
-    BoxAreaType, LayoutElementType, LayoutNodeType, OffsetParentResponse, ScrollContainerQueryType,
-    ScrollContainerResponse,
+    AxesOverflow, BoxAreaType, LayoutElementType, LayoutNodeType, OffsetParentResponse,
+    ScrollContainerQueryFlags, ScrollContainerResponse,
 };
 use script::layout_dom::{ServoLayoutNode, ServoThreadSafeLayoutNode};
 use servo_arc::Arc as ServoArc;
@@ -64,9 +64,8 @@ fn root_transform_for_layout_node(
         .first()
         .and_then(Fragment::retrieve_box_fragment)?
         .borrow();
-    let scroll_tree_node_id = box_fragment.spatial_tree_node.borrow();
-    let scroll_tree_node_id = (*scroll_tree_node_id)?;
-    Some(scroll_tree.cumulative_node_to_root_transform(&scroll_tree_node_id))
+    let scroll_tree_node_id = box_fragment.spatial_tree_node()?;
+    Some(scroll_tree.cumulative_node_to_root_transform(scroll_tree_node_id))
 }
 
 pub(crate) fn process_box_area_request(
@@ -566,7 +565,10 @@ fn offset_parent_fragments(node: ServoLayoutNode<'_>) -> Option<OffsetParentFrag
 }
 
 #[inline]
-pub fn process_offset_parent_query(node: ServoLayoutNode<'_>) -> Option<OffsetParentResponse> {
+pub fn process_offset_parent_query(
+    scroll_tree: &ScrollTree,
+    node: ServoLayoutNode<'_>,
+) -> Option<OffsetParentResponse> {
     // Only consider the first fragment of the node found as per a
     // possible interpretation of the specification: "[...] return the
     // y-coordinate of the top border edge of the first CSS layout box
@@ -589,6 +591,16 @@ pub fn process_offset_parent_query(node: ServoLayoutNode<'_>) -> Option<OffsetPa
         .first()
         .cloned()?;
     let mut border_box = fragment.cumulative_box_area_rect(BoxAreaType::Border)?;
+    let cumulative_sticky_offsets = fragment
+        .retrieve_box_fragment()
+        .and_then(|box_fragment| box_fragment.borrow().spatial_tree_node())
+        .map(|node_id| {
+            scroll_tree
+                .cumulative_sticky_offsets(node_id)
+                .map(Au::from_f32_px)
+                .cast_unit()
+        });
+    border_box = border_box.translate(cumulative_sticky_offsets.unwrap_or_default());
 
     // 2.  If the offsetParent of the element is null return the x-coordinate of the left
     //     border edge of the first CSS layout box associated with the element, relative to
@@ -639,7 +651,18 @@ pub fn process_offset_parent_query(node: ServoLayoutNode<'_>) -> Option<OffsetPa
         }
     } else {
         parent_fragment.offset_by_containing_block(&parent_fragment.padding_rect())
-    };
+    }
+    .translate(
+        cumulative_sticky_offsets
+            .and_then(|_| parent_fragment.spatial_tree_node())
+            .map(|node_id| {
+                scroll_tree
+                    .cumulative_sticky_offsets(node_id)
+                    .map(Au::from_f32_px)
+                    .cast_unit()
+            })
+            .unwrap_or_default(),
+    );
 
     border_box = border_box.translate(-parent_offset_rect.origin.to_vector());
 
@@ -654,9 +677,14 @@ pub fn process_offset_parent_query(node: ServoLayoutNode<'_>) -> Option<OffsetPa
 ///
 #[inline]
 pub(crate) fn process_scroll_container_query(
-    node: ServoLayoutNode<'_>,
-    query_type: ScrollContainerQueryType,
+    node: Option<ServoLayoutNode<'_>>,
+    query_flags: ScrollContainerQueryFlags,
+    viewport_overflow: AxesOverflow,
 ) -> Option<ScrollContainerResponse> {
+    let Some(node) = node else {
+        return Some(ScrollContainerResponse::Viewport(viewport_overflow));
+    };
+
     let layout_data = node.to_threadsafe().inner_layout_data()?;
 
     // 1. If any of the following holds true, return null and terminate this algorithm:
@@ -664,20 +692,29 @@ pub(crate) fn process_scroll_container_query(
     let layout_box = layout_data.self_box.borrow();
     let layout_box = layout_box.as_ref()?;
 
-    let (mut current_position_value, flags) = layout_box
-        .with_first_base(|base| (base.style.clone_position(), base.base_fragment_info.flags))?;
+    let (style, flags) =
+        layout_box.with_first_base(|base| (base.style.clone(), base.base_fragment_info.flags))?;
 
     // - The element is the root element.
     // - The element is the body element.
     //
     // Note: We only do this for `scrollParent`, which needs to be null. But `scrollIntoView` on the
     // `<body>` or root element should still bring it into view by scrolling the viewport.
-    if query_type == ScrollContainerQueryType::ForScrollParent &&
+    if query_flags.contains(ScrollContainerQueryFlags::ForScrollParent) &&
         flags.intersects(
             FragmentFlags::IS_ROOT_ELEMENT | FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT,
         )
     {
         return None;
+    }
+
+    if query_flags.contains(ScrollContainerQueryFlags::Inclusive) &&
+        style.establishes_scroll_container(flags)
+    {
+        return Some(ScrollContainerResponse::Element(
+            node.opaque().into(),
+            style.effective_overflow(flags),
+        ));
     }
 
     // - The element’s computed value of the position property is fixed and no ancestor
@@ -699,6 +736,7 @@ pub(crate) fn process_scroll_container_query(
     // Notes: We don't follow the specification exactly below, but we follow the spirit.
     //
     // TODO: Handle the situation where the ancestor is "closed-shadow-hidden" from the element.
+    let mut current_position_value = style.clone_position();
     let mut current_ancestor = node.as_element()?;
     while let Some(ancestor) = current_ancestor.traversal_parent() {
         current_ancestor = ancestor;
@@ -735,6 +773,7 @@ pub(crate) fn process_scroll_container_query(
         if ancestor_style.establishes_scroll_container(ancestor_flags) {
             return Some(ScrollContainerResponse::Element(
                 ancestor.as_node().opaque().into(),
+                ancestor_style.effective_overflow(ancestor_flags),
             ));
         }
 
@@ -743,7 +782,7 @@ pub(crate) fn process_scroll_container_query(
 
     match current_position_value {
         Position::Fixed => None,
-        _ => Some(ScrollContainerResponse::Viewport),
+        _ => Some(ScrollContainerResponse::Viewport(viewport_overflow)),
     }
 }
 

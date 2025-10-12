@@ -19,6 +19,7 @@ use parking_lot::ReentrantMutex;
 use read_fonts::types::Tag;
 use read_fonts::{FontRef, ReadError, TableProvider};
 use servo_arc::Arc;
+use skrifa::attribute::Weight;
 use style::Zero;
 use webrender_api::{FontInstanceFlags, FontVariation};
 
@@ -27,6 +28,8 @@ use crate::FontData;
 use crate::font::{FontMetrics, FontTableMethods, FractionalPixel, PlatformFontMethods};
 use crate::glyph::GlyphId;
 use crate::platform::freetype::freetype_face::FreeTypeFace;
+
+const SEMI_BOLD_U16: u16 = Weight::SEMI_BOLD.value() as u16;
 
 /// Convert FreeType-style 26.6 fixed point to an [`f64`].
 fn fixed_26_dot_6_to_float(fixed: FT_F26Dot6) -> f64 {
@@ -56,6 +59,7 @@ pub struct PlatformFont {
     requested_face_size: Au,
     actual_face_size: Au,
     variations: Vec<FontVariation>,
+    synthetic_bold: bool,
 
     /// A member that allows using `skrifa` to read values from this font.
     table_provider_data: FreeTypeFaceTableProviderData,
@@ -67,6 +71,7 @@ impl PlatformFontMethods for PlatformFont {
         font_data: &FontData,
         requested_size: Option<Au>,
         variations: &[FontVariation],
+        synthetic_bold: bool,
     ) -> Result<PlatformFont, &'static str> {
         let library = FreeTypeLibraryHandle::get().lock();
         let data: &[u8] = font_data.as_ref();
@@ -79,12 +84,17 @@ impl PlatformFontMethods for PlatformFont {
             None => (Au::zero(), Au::zero()),
         };
 
+        let table_provider_data = FreeTypeFaceTableProviderData::Web(font_data.clone());
+
+        let synthetic_bold = table_provider_data.should_apply_synthetic_bold(synthetic_bold);
+
         Ok(PlatformFont {
             face: ReentrantMutex::new(face),
             requested_face_size,
             actual_face_size,
-            table_provider_data: FreeTypeFaceTableProviderData::Web(font_data.clone()),
+            table_provider_data,
             variations: normalized_variations,
+            synthetic_bold,
         })
     }
 
@@ -92,6 +102,7 @@ impl PlatformFontMethods for PlatformFont {
         font_identifier: LocalFontIdentifier,
         requested_size: Option<Au>,
         variations: &[FontVariation],
+        synthetic_bold: bool,
     ) -> Result<PlatformFont, &'static str> {
         let library = FreeTypeLibraryHandle::get().lock();
         let filename = CString::new(&*font_identifier.path).expect("filename contains NUL byte!");
@@ -115,15 +126,20 @@ impl PlatformFontMethods for PlatformFont {
             return Err("Could not memory map");
         };
 
+        let table_provider_data = FreeTypeFaceTableProviderData::Local(
+            Arc::new(memory_mapped_font_data),
+            font_identifier.index(),
+        );
+
+        let synthetic_bold = table_provider_data.should_apply_synthetic_bold(synthetic_bold);
+
         Ok(PlatformFont {
             face: ReentrantMutex::new(face),
             requested_face_size,
             actual_face_size,
-            table_provider_data: FreeTypeFaceTableProviderData::Local(
-                Arc::new(memory_mapped_font_data),
-                font_identifier.index(),
-            ),
+            table_provider_data,
             variations: normalized_variations,
+            synthetic_bold,
         })
     }
 
@@ -183,6 +199,10 @@ impl PlatformFontMethods for PlatformFont {
         let void_glyph = face.as_ref().glyph;
         let slot: FT_GlyphSlot = void_glyph;
         assert!(!slot.is_null());
+
+        if self.synthetic_bold {
+            mozilla_glyphslot_embolden_less(slot);
+        }
 
         let advance = unsafe { (*slot).metrics.horiAdvance };
         Some(fixed_26_dot_6_to_float(advance) * self.unscalable_font_metrics_scale())
@@ -358,7 +378,15 @@ impl PlatformFontMethods for PlatformFont {
         // On other platforms, we only pass this when we know that we are loading a font with
         // color characters, but not passing this flag simply *prevents* WebRender from
         // loading bitmaps. There's no harm to always passing it.
-        FontInstanceFlags::EMBEDDED_BITMAPS
+        let mut flags = FontInstanceFlags::EMBEDDED_BITMAPS;
+
+        // TODO: Add support for synthetic italics.
+        // <https://github.com/servo/servo/issues/39637>
+        if self.synthetic_bold {
+            flags |= FontInstanceFlags::SYNTHETIC_BOLD;
+        }
+
+        flags
     }
 
     fn variations(&self) -> &[FontVariation] {
@@ -388,10 +416,68 @@ impl FreeTypeFaceTableProviderData {
             Self::Local(mmap, index) => FontRef::from_index(mmap, *index),
         }
     }
+
+    fn should_apply_synthetic_bold(&self, synthetic_bold: bool) -> bool {
+        // Ensures that a font face is not emboldened if it's a variable font or
+        // if it's already bold.
+        let face_is_bold = self
+            .font_ref()
+            .and_then(|font_ref| font_ref.os2())
+            .is_ok_and(|table| table.us_weight_class() >= SEMI_BOLD_U16);
+        let is_variable_font = self
+            .font_ref()
+            .and_then(|font_ref| font_ref.fvar())
+            .is_ok_and(|table| table.axis_count() > 0);
+        !face_is_bold && !is_variable_font && synthetic_bold
+    }
 }
 
 impl std::fmt::Debug for FreeTypeFaceTableProviderData {
     fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Ok(())
     }
+}
+
+// This is copied from the webrender glyph rasterizer
+// https://github.com/servo/webrender/blob/c4bd5b47d8f5cd684334b445e67a1f945d106848/wr_glyph_rasterizer/src/platform/unix/font.rs#L115
+//
+// Custom version of FT_GlyphSlot_Embolden to be less aggressive with outline
+// fonts than the default implementation in FreeType.
+fn mozilla_glyphslot_embolden_less(slot: FT_GlyphSlot) {
+    use freetype_sys::{
+        FT_GLYPH_FORMAT_OUTLINE, FT_GlyphSlot_Embolden, FT_Long, FT_MulFix, FT_Outline_Embolden,
+    };
+
+    if slot.is_null() {
+        return;
+    }
+
+    let slot_ = unsafe { &mut *slot };
+    let format = slot_.format;
+    if format != FT_GLYPH_FORMAT_OUTLINE {
+        // For non-outline glyphs, just fall back to FreeType's function.
+        unsafe { FT_GlyphSlot_Embolden(slot) };
+        return;
+    }
+
+    let face_ = unsafe { &*slot_.face };
+
+    // FT_GlyphSlot_Embolden uses a divisor of 24 here; we'll be only half as
+    // bold.
+    let size_ = unsafe { &*face_.size };
+    let strength = unsafe { FT_MulFix(face_.units_per_EM as FT_Long, size_.metrics.y_scale) / 48 };
+    unsafe { FT_Outline_Embolden(&raw mut slot_.outline, strength) };
+
+    // Adjust metrics to suit the fattened glyph.
+    if slot_.advance.x != 0 {
+        slot_.advance.x += strength;
+    }
+    if slot_.advance.y != 0 {
+        slot_.advance.y += strength;
+    }
+    slot_.metrics.width += strength;
+    slot_.metrics.height += strength;
+    slot_.metrics.horiAdvance += strength;
+    slot_.metrics.vertAdvance += strength;
+    slot_.metrics.horiBearingY += strength;
 }

@@ -415,7 +415,7 @@ pub(crate) fn follow_hyperlink(
         if let Some(suffix) = hyperlink_suffix {
             href.push_str(&suffix);
         }
-        let Ok(url) = document.base_url().join(&href) else {
+        let Ok(url) = document.base_url().join(&href.str()) else {
             return;
         };
 
@@ -444,6 +444,7 @@ pub(crate) fn follow_hyperlink(
             Some(secure),
             Some(document.insecure_requests_policy()),
             document.has_trustworthy_ancestor_origin(),
+            document.creation_sandboxing_flag_set_considering_parent_iframe(),
         );
         let target = Trusted::new(target_window);
         let task = task!(navigate_follow_hyperlink: move || {

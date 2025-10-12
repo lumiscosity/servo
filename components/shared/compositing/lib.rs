@@ -7,12 +7,12 @@
 use std::fmt::{Debug, Error, Formatter};
 
 use base::Epoch;
-use base::id::{PipelineId, WebViewId};
+use base::id::{PipelineId, RenderingGroupId, WebViewId};
 use crossbeam_channel::Sender;
 use embedder_traits::{AnimationState, EventLoopWaker, TouchEventResult};
-use ipc_channel::ipc::IpcSender;
 use log::warn;
 use malloc_size_of_derive::MallocSizeOf;
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use strum_macros::IntoStaticStr;
 use webrender_api::{DocumentId, FontVariation};
@@ -21,7 +21,6 @@ pub mod display_list;
 pub mod rendering_context;
 pub mod viewport_description;
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use base::generic_channel::{self, GenericCallback, GenericSender};
@@ -88,8 +87,6 @@ pub enum CompositorMsg {
     RemoveWebView(WebViewId),
     /// Script has handled a touch event, and either prevented or allowed default actions.
     TouchEventProcessed(WebViewId, TouchEventResult),
-    /// A reply to the compositor asking if the output image is stable.
-    IsReadyToSaveImageReply(bool),
     /// Set whether to use less resources by stopping animations.
     SetThrottled(WebViewId, PipelineId, bool),
     /// WebRender has produced a new frame. This message informs the compositor that
@@ -101,10 +98,8 @@ pub enum CompositorMsg {
     /// they have fully shut it down, to avoid recreating it due to any subsequent
     /// messages.
     PipelineExited(WebViewId, PipelineId, PipelineExitSource),
-    /// The load of a page has completed
-    LoadComplete(WebViewId),
     /// Inform WebRender of the existence of this pipeline.
-    SendInitialTransaction(WebRenderPipelineId),
+    SendInitialTransaction(WebViewId, WebRenderPipelineId),
     /// Perform a scroll operation.
     SendScrollNode(
         WebViewId,
@@ -112,6 +107,15 @@ pub enum CompositorMsg {
         LayoutVector2D,
         ExternalScrollId,
     ),
+    /// Update the rendering epoch of the given `Pipeline`.
+    UpdateEpoch {
+        /// The [`WebViewId`] that this display list belongs to.
+        webview_id: WebViewId,
+        /// The [`PipelineId`] of the `Pipeline` to update.
+        pipeline_id: PipelineId,
+        /// The new [`Epoch`] value.
+        epoch: Epoch,
+    },
     /// Inform WebRender of a new display list for the given pipeline.
     SendDisplayList {
         /// The [`WebViewId`] that this display list belongs to.
@@ -126,7 +130,7 @@ pub enum CompositorMsg {
     GenerateFrame,
     /// Create a new image key. The result will be returned via the
     /// provided channel sender.
-    GenerateImageKey(IpcSender<ImageKey>),
+    GenerateImageKey(GenericSender<ImageKey>),
     /// The same as the above but it will be forwarded to the pipeline instead
     /// of send via a channel.
     GenerateImageKeysForPipeline(PipelineId),
@@ -144,6 +148,7 @@ pub enum CompositorMsg {
         usize,
         usize,
         GenericSender<(Vec<FontKey>, Vec<FontInstanceKey>)>,
+        RenderingGroupId,
     ),
     /// Add a font with the given data and font key.
     AddFont(FontKey, Arc<IpcSharedMemory>, u32),
@@ -164,6 +169,9 @@ pub enum CompositorMsg {
     CollectMemoryReport(ReportsChan),
     /// A top-level frame has parsed a viewport metatag and is sending the new constraints.
     Viewport(WebViewId, ViewportDescription),
+    /// Let the compositor know that the given WebView is ready to have a screenshot taken
+    /// after the given pipeline's epochs have been rendered.
+    ScreenshotReadinessReponse(WebViewId, FxHashMap<PipelineId, Epoch>),
 }
 
 impl Debug for CompositorMsg {
@@ -204,8 +212,11 @@ impl CrossProcessCompositorApi {
     }
 
     /// Inform WebRender of the existence of this pipeline.
-    pub fn send_initial_transaction(&self, pipeline: WebRenderPipelineId) {
-        if let Err(e) = self.0.send(CompositorMsg::SendInitialTransaction(pipeline)) {
+    pub fn send_initial_transaction(&self, webview_id: WebViewId, pipeline: WebRenderPipelineId) {
+        if let Err(e) = self
+            .0
+            .send(CompositorMsg::SendInitialTransaction(webview_id, pipeline))
+        {
             warn!("Error sending initial transaction: {}", e);
         }
     }
@@ -240,6 +251,18 @@ impl CrossProcessCompositorApi {
             image_keys,
         )) {
             warn!("Error delaying frames for canvas image updates {error:?}");
+        }
+    }
+
+    /// Inform the renderer that the rendering epoch has advanced. This typically happens after
+    /// a new display list is sent and/or canvas and animated images are updated.
+    pub fn update_epoch(&self, webview_id: WebViewId, pipeline_id: PipelineId, epoch: Epoch) {
+        if let Err(error) = self.0.send(CompositorMsg::UpdateEpoch {
+            webview_id,
+            pipeline_id,
+            epoch,
+        }) {
+            warn!("Error updating epoch for pipeline: {error:?}");
         }
     }
 
@@ -286,7 +309,7 @@ impl CrossProcessCompositorApi {
 
     /// Create a new image key. Blocks until the key is available.
     pub fn generate_image_key_blocking(&self) -> Option<ImageKey> {
-        let (sender, receiver) = ipc::channel().unwrap();
+        let (sender, receiver) = generic_channel::channel().unwrap();
         self.0.send(CompositorMsg::GenerateImageKey(sender)).ok()?;
         receiver.recv().ok()
     }
@@ -373,12 +396,14 @@ impl CrossProcessCompositorApi {
         &self,
         number_of_font_keys: usize,
         number_of_font_instance_keys: usize,
+        rendering_group_id: RenderingGroupId,
     ) -> (Vec<FontKey>, Vec<FontInstanceKey>) {
         let (sender, receiver) = generic_channel::channel().expect("Could not create IPC channel");
         let _ = self.0.send(CompositorMsg::GenerateFontKeys(
             number_of_font_keys,
             number_of_font_instance_keys,
             sender,
+            rendering_group_id,
         ));
         receiver.recv().unwrap()
     }
@@ -427,7 +452,7 @@ pub enum WebrenderImageHandlerType {
 #[derive(Default)]
 pub struct WebrenderExternalImageRegistry {
     /// Map of all generated external images.
-    external_images: HashMap<ExternalImageId, WebrenderImageHandlerType>,
+    external_images: FxHashMap<ExternalImageId, WebrenderImageHandlerType>,
     /// Id generator for the next external image identifier.
     next_image_id: u64,
 }
@@ -493,7 +518,12 @@ impl ExternalImageHandler for WebrenderExternalImageHandlers {
     /// image content.
     /// The WR client should not change the image content until the
     /// unlock() call.
-    fn lock(&mut self, key: ExternalImageId, _channel_index: u8) -> ExternalImage<'_> {
+    fn lock(
+        &mut self,
+        key: ExternalImageId,
+        _channel_index: u8,
+        _is_composited: bool,
+    ) -> ExternalImage<'_> {
         let external_images = self.external_images.lock().unwrap();
         let handler_type = external_images
             .get(&key)
@@ -609,6 +639,7 @@ impl From<SerializableImageData> for ImageData {
 /// layer.
 pub trait WebViewTrait {
     fn id(&self) -> WebViewId;
+    fn rendering_group_id(&self) -> Option<RenderingGroupId>;
     fn screen_geometry(&self) -> Option<ScreenGeometry>;
     fn set_animating(&self, new_value: bool);
 }

@@ -16,11 +16,11 @@ pub enum Error {
     /// IndexSizeError DOMException
     IndexSize,
     /// NotFoundError DOMException
-    NotFound,
+    NotFound(Option<String>),
     /// HierarchyRequestError DOMException
     HierarchyRequest,
     /// WrongDocumentError DOMException
-    WrongDocument,
+    WrongDocument(Option<String>),
     /// InvalidCharacterError DOMException
     InvalidCharacter,
     /// NotSupportedError DOMException
@@ -28,7 +28,7 @@ pub enum Error {
     /// InUseAttributeError DOMException
     InUseAttribute,
     /// InvalidStateError DOMException
-    InvalidState,
+    InvalidState(Option<String>),
     /// SyntaxError DOMException
     Syntax(Option<String>),
     /// NamespaceError DOMException

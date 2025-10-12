@@ -50,10 +50,11 @@ use style::data::ElementData;
 use style::dom::OpaqueNode;
 use style::invalidation::element::restyle_hints::RestyleHint;
 use style::media_queries::Device;
-use style::properties::PropertyId;
 use style::properties::style_structs::Font;
+use style::properties::{ComputedValues, PropertyId};
 use style::selector_parser::{PseudoElement, RestyleDamage, Snapshot};
 use style::stylesheets::{Stylesheet, UrlExtraData};
+use style::values::computed::Overflow;
 use style_traits::CSSPixel;
 use webrender_api::units::{DeviceIntSize, LayoutPoint, LayoutVector2D};
 use webrender_api::{ExternalScrollId, ImageKey};
@@ -240,12 +241,9 @@ pub trait Layout {
     /// resolve font metrics.
     fn device(&self) -> &Device;
 
-    /// The currently laid out Epoch that this Layout has finished.
-    fn current_epoch(&self) -> Epoch;
-
     /// Load all fonts from the given stylesheet, returning the number of fonts that
     /// need to be loaded.
-    fn load_web_fonts_from_stylesheet(&self, stylesheet: ServoArc<Stylesheet>);
+    fn load_web_fonts_from_stylesheet(&self, stylesheet: &ServoArc<Stylesheet>);
 
     /// Add a stylesheet to this Layout. This will add it to the Layout's `Stylist` as well as
     /// loading all web fonts defined in the stylesheet. The second stylesheet is the insertion
@@ -305,10 +303,12 @@ pub trait Layout {
     fn query_client_rect(&self, node: TrustedNodeAddress) -> Rect<i32>;
     fn query_element_inner_outer_text(&self, node: TrustedNodeAddress) -> String;
     fn query_offset_parent(&self, node: TrustedNodeAddress) -> OffsetParentResponse;
+    /// Query the scroll container for the given node. If node is `None`, the scroll container for
+    /// the viewport is returned.
     fn query_scroll_container(
         &self,
-        node: TrustedNodeAddress,
-        query_type: ScrollContainerQueryType,
+        node: Option<TrustedNodeAddress>,
+        flags: ScrollContainerQueryFlags,
     ) -> Option<ScrollContainerResponse>;
     fn query_resolved_style(
         &self,
@@ -366,16 +366,53 @@ pub struct OffsetParentResponse {
     pub rect: Rect<Au>,
 }
 
-#[derive(PartialEq)]
-pub enum ScrollContainerQueryType {
-    ForScrollParent,
-    ForScrollIntoView,
+bitflags! {
+    #[derive(PartialEq)]
+    pub struct ScrollContainerQueryFlags: u8 {
+        /// Whether or not this query is for the purposes of a `scrollParent` layout query.
+        const ForScrollParent = 1 << 0;
+        /// Whether or not to consider the original element's scroll box for the return value.
+        const Inclusive = 1 << 1;
+    }
+}
+
+#[derive(Clone, Copy, Debug, MallocSizeOf)]
+pub struct AxesOverflow {
+    pub x: Overflow,
+    pub y: Overflow,
+}
+
+impl Default for AxesOverflow {
+    fn default() -> Self {
+        Self {
+            x: Overflow::Visible,
+            y: Overflow::Visible,
+        }
+    }
+}
+
+impl From<&ComputedValues> for AxesOverflow {
+    fn from(style: &ComputedValues) -> Self {
+        Self {
+            x: style.clone_overflow_x(),
+            y: style.clone_overflow_y(),
+        }
+    }
+}
+
+impl AxesOverflow {
+    pub fn to_scrollable(&self) -> Self {
+        Self {
+            x: self.x.to_scrollable(),
+            y: self.y.to_scrollable(),
+        }
+    }
 }
 
 #[derive(Clone)]
 pub enum ScrollContainerResponse {
-    Viewport,
-    Element(UntrustedNodeAddress),
+    Viewport(AxesOverflow),
+    Element(UntrustedNodeAddress, AxesOverflow),
 }
 
 #[derive(Debug, PartialEq)]
@@ -479,14 +516,17 @@ bitflags! {
         const BuiltStackingContextTree = 1 << 2;
         const BuiltDisplayList = 1 << 3;
         const UpdatedScrollNodeOffset = 1 << 4;
-        const UpdatedCanvasContents = 1 << 5;
+        /// Image data for a WebRender image key has been updated, without necessarily
+        /// updating style or layout. This is used when updating canvas contents and
+        /// progressing to a new animated image frame.
+        const UpdatedImageData = 1 << 5;
     }
 }
 
 impl ReflowPhasesRun {
     pub fn needs_frame(&self) -> bool {
         self.intersects(
-            Self::BuiltDisplayList | Self::UpdatedScrollNodeOffset | Self::UpdatedCanvasContents,
+            Self::BuiltDisplayList | Self::UpdatedScrollNodeOffset | Self::UpdatedImageData,
         )
     }
 }
@@ -510,6 +550,8 @@ pub struct ReflowRequestRestyle {
 pub struct ReflowRequest {
     /// The document node.
     pub document: TrustedNodeAddress,
+    /// The current layout [`Epoch`] managed by the script thread.
+    pub epoch: Epoch,
     /// If a restyle is necessary, all of the informatio needed to do that restyle.
     pub restyle: Option<ReflowRequestRestyle>,
     /// The current [`ViewportDetails`] to use for this reflow.
@@ -524,8 +566,8 @@ pub struct ReflowRequest {
     pub animation_timeline_value: f64,
     /// The set of animations for this document.
     pub animations: DocumentAnimationSet,
-    /// The set of image animations.
-    pub node_to_animating_image_map: Arc<RwLock<FxHashMap<OpaqueNode, ImageAnimationState>>>,
+    /// An [`AnimatingImages`] struct used to track images that are animating.
+    pub animating_images: Arc<RwLock<AnimatingImages>>,
     /// The theme for the window
     pub theme: Theme,
     /// The node highlighted by the devtools, if any
@@ -613,7 +655,7 @@ pub fn node_id_from_scroll_id(id: usize) -> Option<usize> {
 
 #[derive(Clone, Debug, MallocSizeOf)]
 pub struct ImageAnimationState {
-    #[ignore_malloc_size_of = "Arc is hard"]
+    #[ignore_malloc_size_of = "RasterImage"]
     pub image: Arc<RasterImage>,
     pub active_frame: usize,
     frame_start_time: f64,
@@ -702,6 +744,52 @@ bitflags! {
         /// Whether or not to find all of the items for a hit test or stop at the
         /// first hit.
         const FindAll = 0b00000001;
+    }
+}
+
+#[derive(Debug, Default, MallocSizeOf)]
+pub struct AnimatingImages {
+    /// A map from the [`OpaqueNode`] to the state of an animating image. This is used
+    /// to update frames in script and to track newly animating nodes.
+    pub node_to_state_map: FxHashMap<OpaqueNode, ImageAnimationState>,
+    /// Whether or not this map has changed during a layout. This is used by script to
+    /// trigger future animation updates.
+    pub dirty: bool,
+}
+
+impl AnimatingImages {
+    pub fn maybe_insert_or_update(
+        &mut self,
+        node: OpaqueNode,
+        image: Arc<RasterImage>,
+        current_timeline_value: f64,
+    ) {
+        let entry = self.node_to_state_map.entry(node).or_insert_with(|| {
+            self.dirty = true;
+            ImageAnimationState::new(image.clone(), current_timeline_value)
+        });
+
+        // If the entry exists, but it is for a different image id, replace it as the image
+        // has changed during this layout.
+        if entry.image.id != image.id {
+            self.dirty = true;
+            *entry = ImageAnimationState::new(image.clone(), current_timeline_value);
+        }
+    }
+
+    pub fn remove(&mut self, node: OpaqueNode) {
+        if self.node_to_state_map.remove(&node).is_some() {
+            self.dirty = true;
+        }
+    }
+
+    /// Clear the dirty bit on this [`AnimatingImages`] and return the previous value.
+    pub fn clear_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.node_to_state_map.is_empty()
     }
 }
 
