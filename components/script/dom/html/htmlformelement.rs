@@ -18,6 +18,7 @@ use net_traits::http_percent_encode;
 use net_traits::request::Referrer;
 use rand::random;
 use rustc_hash::FxBuildHasher;
+use script_bindings::codegen::GenericBindings::HTMLDialogElementBinding::HTMLDialogElementMethods;
 use script_bindings::match_domstring_ascii;
 use style::attr::AttrValue;
 use style::str::split_html_space_chars;
@@ -80,7 +81,7 @@ use crate::dom::node::{
 use crate::dom::nodelist::{NodeList, RadioListMode};
 use crate::dom::radionodelist::RadioNodeList;
 use crate::dom::submitevent::SubmitEvent;
-use crate::dom::types::HTMLIFrameElement;
+use crate::dom::types::{HTMLDialogElement, HTMLIFrameElement};
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::dom::window::Window;
 use crate::links::{LinkRelations, get_element_target};
@@ -757,21 +758,21 @@ impl HTMLFormElement {
         }
 
         let base = doc.base_url();
-        // TODO: Handle browsing contexts (Step 5)
-        // Step 6
+        // Step 5
         if submit_method_flag == SubmittedFrom::NotFromForm {
-            // Step 6.1
+            // Step 5.1
             if self.firing_submission_events.get() {
                 return;
             }
-            // Step 6.2
+            // Step 5.2
             self.firing_submission_events.set(true);
-            // Step 6.3
+            // TODO: Step 5.3
+            // Step 5.4
             if !submitter.no_validate(self) && self.interactive_validation(can_gc).is_err() {
                 self.firing_submission_events.set(false);
                 return;
             }
-            // Step 6.4
+            // Step 5.5
             // spec calls this "submitterButton" but it doesn't have to be a button,
             // just not be the form itself
             let submitter_button = match submitter {
@@ -786,7 +787,7 @@ impl HTMLFormElement {
                 FormSubmitterElement::Button(b) => Some(b.upcast::<HTMLElement>()),
             };
 
-            // Step 6.5
+            // Step 5.6
             let event = SubmitEvent::new(
                 self.global().as_window(),
                 atom!("submit"),
@@ -798,22 +799,23 @@ impl HTMLFormElement {
             let event = event.upcast::<Event>();
             event.fire(self.upcast::<EventTarget>(), can_gc);
 
-            // Step 6.6
+            // Step 5.7
             self.firing_submission_events.set(false);
-            // Step 6.7
+            // Step 5.8
             if event.DefaultPrevented() {
                 return;
             }
-            // Step 6.8
+            // Step 5.9
             if self.upcast::<Element>().cannot_navigate() {
                 return;
             }
         }
 
-        // Step 7
+        // Step 6
         let encoding = self.pick_encoding();
 
-        // Step 8
+        // Step 7-8
+        // We return instead of asserting
         let mut form_data = match self.get_form_dataset(Some(submitter), Some(encoding), can_gc) {
             Some(form_data) => form_data,
             None => return,
@@ -825,21 +827,48 @@ impl HTMLFormElement {
         }
 
         // Step 10
+        let method = submitter.method();
+        // Step 11
+        if method == FormMethod::Dialog {
+            // 11.1-11.2
+            if let Some(subject) = self.upcast::<Node>()
+                .ancestors()
+                .filter_map(DomRoot::downcast::<HTMLDialogElement>)
+                .next() {
+                    // 11.3
+                    let mut result: Option<DOMString> = None;
+                    // TODO: 11.4
+                    // 11.5
+                    if submitter.is_submit_button() {
+                        let element = &subject.upcast::<Element>();
+                        let value_attr = &local_name!("value");
+                        if element.has_attribute(value_attr) {
+                            result = Some(element.get_string_attribute(value_attr));
+                        }
+                    };
+                    // 11.6
+                    subject.Close(result, can_gc);
+
+            } else {
+                return
+            }
+        }
+
+        // Step 12
         let mut action = submitter.action();
 
-        // Step 11
+        // Step 13
         if action.is_empty() {
             action = DOMString::from(base.as_str());
         }
-        // Step 12-13
+        // Step 14-15
         let action_components = match base.join(&action.str()) {
             Ok(url) => url,
             Err(_) => return,
         };
-        // Step 14-16
+        // Step 16-17
         let scheme = action_components.scheme().to_owned();
         let enctype = submitter.enctype();
-        let method = submitter.method();
 
         // Step 17
         let target_attribute_value =
@@ -871,7 +900,7 @@ impl HTMLFormElement {
             Some(doc) => doc,
             None => return,
         };
-        // Step 21
+        // TODO: Step 21-25, no compliance with the navigable?
         let target_window = target_document.window();
         let mut load_data = LoadData::new(
             LoadOrigin::Script(doc.origin().immutable().clone()),
@@ -885,7 +914,7 @@ impl HTMLFormElement {
             target_document.creation_sandboxing_flag_set_considering_parent_iframe(),
         );
 
-        // Step 22
+        // Step 26
         match (&*scheme, method) {
             (_, FormMethod::Dialog) => {
                 // TODO: Submit dialog
@@ -1459,7 +1488,7 @@ pub(crate) enum FormEncType {
     MultipartFormData,
 }
 
-#[derive(Clone, Copy, MallocSizeOf)]
+#[derive(Clone, Copy, PartialEq, MallocSizeOf)]
 pub(crate) enum FormMethod {
     Get,
     Post,
