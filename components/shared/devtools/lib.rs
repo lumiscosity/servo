@@ -190,10 +190,12 @@ pub struct NodeInfo {
     pub node_type: u16,
     pub node_name: String,
     pub node_value: Option<String>,
+    pub display_name: String,
     pub num_children: usize,
     pub attrs: Vec<AttrInfo>,
     pub is_top_level_document: bool,
     pub shadow_root_mode: Option<ShadowRootMode>,
+    pub is_pseudo_element: bool,
     pub is_shadow_host: bool,
     pub display: Option<String>,
     /// Whether this node is currently displayed.

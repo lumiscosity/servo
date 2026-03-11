@@ -16,6 +16,7 @@ use std::{cmp, fmt, iter};
 use app_units::Au;
 use base::id::{BrowsingContextId, PipelineId};
 use bitflags::bitflags;
+use cssparser::ToCss;
 use devtools_traits::NodeInfo;
 use dom_struct::dom_struct;
 use embedder_traits::UntrustedNodeAddress;
@@ -1711,6 +1712,18 @@ impl Node {
         let host = maybe_shadow_root
             .map(ShadowRoot::Host)
             .map(|host| host.upcast::<Node>().unique_id(pipeline));
+        let potential_pseudo = self.implemented_pseudo_element();
+        let is_pseudo_element = potential_pseudo.is_some();
+        let display_name = if is_pseudo_element {
+            let mut buf = String::new();
+            if potential_pseudo.unwrap().to_css(&mut buf).is_ok() {
+                buf
+            } else {
+                String::from(self.NodeName())
+            }
+        } else {
+            String::from(self.NodeName())
+        };
         let is_shadow_host = self.downcast::<Element>().is_some_and(|potential_host| {
             let Some(root) = potential_host.shadow_root() else {
                 return false;
@@ -1742,8 +1755,10 @@ impl Node {
             is_top_level_document: node_type == NodeConstants::DOCUMENT_NODE,
             node_name: String::from(self.NodeName()),
             node_value: self.GetNodeValue().map(|v| v.into()),
+            display_name,
             num_children,
             attrs: self.downcast().map(Element::summarize).unwrap_or(vec![]),
+            is_pseudo_element,
             is_shadow_host,
             shadow_root_mode,
             display,

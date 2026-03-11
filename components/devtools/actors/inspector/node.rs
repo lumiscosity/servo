@@ -85,9 +85,7 @@ pub(crate) struct NodeActorMsg {
     display_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     inline_text_child: Option<Box<NodeActorMsg>>,
-    is_after_pseudo_element: bool,
     is_anonymous: bool,
-    is_before_pseudo_element: bool,
     is_direct_shadow_host_child: Option<bool>,
     /// Whether or not this node is displayed.
     ///
@@ -95,7 +93,7 @@ pub(crate) struct NodeActorMsg {
     is_displayed: bool,
     #[serde(rename = "isInHTMLDocument")]
     is_in_html_document: Option<bool>,
-    is_marker_pseudo_element: bool,
+    is_pseudo_element: bool,
     is_native_anonymous: bool,
     is_scrollable: bool,
     is_shadow_host: bool,
@@ -342,16 +340,14 @@ impl NodeInfoToProtocol for NodeInfo {
             base_uri: self.base_uri,
             causes_overflow: false,
             container_type: None,
-            display_name: self.node_name.clone().to_lowercase(),
+            display_name: self.display_name,
             display_type: self.display,
             inline_text_child,
-            is_after_pseudo_element: false,
             is_anonymous: false,
-            is_before_pseudo_element: false,
             is_direct_shadow_host_child: None,
             is_displayed: self.is_displayed,
             is_in_html_document: Some(true),
-            is_marker_pseudo_element: false,
+            is_pseudo_element: self.is_pseudo_element,
             is_native_anonymous: false,
             is_scrollable: false,
             is_shadow_host: self.is_shadow_host,
