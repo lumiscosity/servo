@@ -8,33 +8,33 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use app_units::Au;
-use base::generic_channel::GenericSender;
-use base::{Epoch, generic_channel};
-use canvas_traits::canvas::{
-    Canvas2dMsg, CanvasFont, CanvasId, CanvasMsg, CompositionOptions, CompositionOrBlending,
-    FillOrStrokeStyle, FillRule, GlyphAndPosition, LineCapStyle, LineJoinStyle, LineOptions,
-    LinearGradientStyle, Path, RadialGradientStyle, RepetitionStyle, ShadowOptions, TextRun,
-};
-use constellation_traits::ScriptToConstellationMessage;
 use cssparser::color::clamp_unit_f32;
 use cssparser::{Parser, ParserInput};
 use euclid::default::{Point2D, Rect, Size2D, Transform2D};
 use euclid::{Vector2D, vec2};
 use fonts::{
-    FontBaseline, FontContext, FontGroup, FontIdentifier, FontMetrics, FontRef,
-    LAST_RESORT_GLYPH_ADVANCE, ShapingFlags, ShapingOptions,
+    FontBaseline, FontContext, FontGroup, FontIdentifier, FontMetrics, FontRef, ShapingFlags,
+    ShapingOptions,
 };
+use icu_locid::subtags::Language;
 use js::context::JSContext;
 use net_traits::image_cache::{ImageCache, ImageResponse};
 use net_traits::request::CorsSettings;
 use pixels::{Snapshot, SnapshotAlphaMode, SnapshotPixelFormat};
 use servo_arc::Arc as ServoArc;
+use servo_base::generic_channel::GenericSender;
+use servo_base::{Epoch, generic_channel};
+use servo_canvas_traits::canvas::{
+    Canvas2dMsg, CanvasFont, CanvasId, CanvasMsg, CompositionOptions, CompositionOrBlending,
+    FillOrStrokeStyle, FillRule, GlyphAndPosition, LineCapStyle, LineJoinStyle, LineOptions,
+    LinearGradientStyle, Path, RadialGradientStyle, RepetitionStyle, ShadowOptions, TextRun,
+};
+use servo_constellation_traits::ScriptToConstellationMessage;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use style::color::{AbsoluteColor, ColorFlags, ColorSpace};
 use style::properties::longhands::font_variant_caps::computed_value::T as FontVariantCaps;
 use style::properties::style_structs::Font;
 use style::stylesheets::CssRuleType;
-use style::values::computed::XLang;
 use style::values::computed::font::FontStyle;
 use style::values::specified::color::Color;
 use style_traits::values::ToCss;
@@ -699,6 +699,37 @@ impl CanvasState {
                         self.state.borrow().transform,
                     ));
                 },
+                OffscreenRenderingContext::WebGL(ref context) => {
+                    let Some(snapshot) = context.get_image_data() else {
+                        return Ok(());
+                    };
+
+                    self.send_canvas_2d_msg(Canvas2dMsg::DrawImage(
+                        snapshot.to_shared(),
+                        dest_rect,
+                        source_rect,
+                        smoothing_enabled,
+                        self.state.borrow().shadow_options(),
+                        self.state.borrow().composition_options(),
+                        self.state.borrow().transform,
+                    ));
+                },
+
+                OffscreenRenderingContext::WebGL2(ref context) => {
+                    let Some(snapshot) = context.get_image_data() else {
+                        return Ok(());
+                    };
+
+                    self.send_canvas_2d_msg(Canvas2dMsg::DrawImage(
+                        snapshot.to_shared(),
+                        dest_rect,
+                        source_rect,
+                        smoothing_enabled,
+                        self.state.borrow().shadow_options(),
+                        self.state.borrow().composition_options(),
+                        self.state.borrow().transform,
+                    ));
+                },
                 OffscreenRenderingContext::Detached => return Err(Error::InvalidState(None)),
             }
         } else {
@@ -794,6 +825,37 @@ impl CanvasState {
                                 self.state.borrow().transform,
                             )),
                         OffscreenRenderingContext::BitmapRenderer(ref context) => {
+                            let Some(snapshot) = context.get_image_data() else {
+                                return Ok(());
+                            };
+
+                            self.send_canvas_2d_msg(Canvas2dMsg::DrawImage(
+                                snapshot.to_shared(),
+                                dest_rect,
+                                source_rect,
+                                smoothing_enabled,
+                                self.state.borrow().shadow_options(),
+                                self.state.borrow().composition_options(),
+                                self.state.borrow().transform,
+                            ));
+                        },
+                        OffscreenRenderingContext::WebGL(ref context) => {
+                            let Some(snapshot) = context.get_image_data() else {
+                                return Ok(());
+                            };
+
+                            self.send_canvas_2d_msg(Canvas2dMsg::DrawImage(
+                                snapshot.to_shared(),
+                                dest_rect,
+                                source_rect,
+                                smoothing_enabled,
+                                self.state.borrow().shadow_options(),
+                                self.state.borrow().composition_options(),
+                                self.state.borrow().transform,
+                            ));
+                        },
+
+                        OffscreenRenderingContext::WebGL2(ref context) => {
                             let Some(snapshot) = context.get_image_data() else {
                                 return Ok(());
                             };
@@ -1492,7 +1554,7 @@ impl CanvasState {
         };
 
         let font_style = self.font_style();
-        let font_group = font_context.font_group(font_style.clone());
+        let font_group = font_context.font_group(font_style);
         let font = font_group.first(font_context).expect("couldn't find font");
         let ascent = font.metrics.ascent.to_f64_px();
         let descent = font.metrics.descent.to_f64_px();
@@ -2343,38 +2405,54 @@ impl CanvasState {
         font_group: &FontGroup,
     ) -> Vec<UnshapedTextRun<'text>> {
         let mut runs = Vec::new();
-        let mut current_text_run = UnshapedTextRun::default();
+        // TODO: canvas also has experimental `lang` attribute (https://developer.mozilla.org/en-US/docs/Web/API/CanvasRenderingContext2D/lang),
+        // which Servo doesn't support yet. When this attribute is supported, some changes may be needed here.
+        let x_language = self.font_style()._x_lang.clone();
+        let language = x_language.0.parse().unwrap_or(Language::UND);
+        let mut current_text_run = UnshapedTextRun::new(language);
         let mut current_text_run_start_index = 0;
 
-        for (index, character) in text.char_indices() {
-            // TODO: This should ultimately handle emoji variation selectors, but raqote does not yet
-            // have support for color glyphs.
-            let script = Script::from(character);
-            let font = font_group.find_by_codepoint(
-                font_context,
-                character,
-                None,
-                XLang::get_initial_value(),
-            );
+        // Variation Selectors (U+FE00–U+FE0F) and Variation Selectors Supplement (U+E0100–U+E01EF)
+        // are used to select specific glyph variants (e.g., text vs. emoji presentation).
+        // They must be attached to the preceding base character and do not start new runs.
+        // - VS1–VS16 (U+FE00..U+FE0F) in the Variation Selectors block.
+        // - VS17–VS256 (U+E0100..U+E01EF) in the Variation Selectors Supplement block.
+        fn is_variation_selector(c: char) -> bool {
+            matches!(c as u32, 0xFE00..=0xFE0F | 0xE0100..=0xE01EF)
+        }
 
-            if !current_text_run.script_and_font_compatible(script, &font) {
+        for (index, character) in text.char_indices() {
+            let next_char = text[index + character.len_utf8()..].chars().next();
+
+            let script = Script::from(character);
+
+            let font = font_group.find_by_codepoint(font_context, character, next_char, language);
+
+            if !is_variation_selector(character) &&
+                !current_text_run.script_and_font_compatible(script, &font)
+            {
                 let previous_text_run = std::mem::replace(
                     &mut current_text_run,
                     UnshapedTextRun {
                         font: font.clone(),
                         script,
-                        ..Default::default()
+                        string: Default::default(),
+                        language,
                     },
                 );
                 current_text_run_start_index = index;
-                runs.push(previous_text_run)
+                if !previous_text_run.string.is_empty() && previous_text_run.font.is_some() {
+                    runs.push(previous_text_run);
+                }
             }
 
             current_text_run.string =
                 &text[current_text_run_start_index..index + character.len_utf8()];
         }
 
-        runs.push(current_text_run);
+        if !current_text_run.string.is_empty() && current_text_run.font.is_some() {
+            runs.push(current_text_run);
+        }
         runs
     }
 
@@ -2432,14 +2510,23 @@ impl Drop for CanvasState {
     }
 }
 
-#[derive(Default)]
 struct UnshapedTextRun<'a> {
     font: Option<FontRef>,
     script: Script,
     string: &'a str,
+    language: Language,
 }
 
 impl UnshapedTextRun<'_> {
+    fn new(language: Language) -> Self {
+        Self {
+            font: Default::default(),
+            script: Default::default(),
+            string: Default::default(),
+            language,
+        }
+    }
+
     fn script_and_font_compatible(&self, script: Script, other_font: &Option<FontRef>) -> bool {
         if self.script != script {
             return false;
@@ -2453,20 +2540,14 @@ impl UnshapedTextRun<'_> {
     }
 
     fn into_shaped_text_run(self, previous_advance: f32) -> Option<TextRun> {
+        debug_assert!(!self.string.is_empty() && self.font.is_some());
         let font = self.font?;
-        if self.string.is_empty() {
-            return None;
-        }
 
-        let word_spacing = Au::from_f64_px(
-            font.glyph_index(' ')
-                .map(|glyph_id| font.glyph_h_advance(glyph_id))
-                .unwrap_or(LAST_RESORT_GLYPH_ADVANCE),
-        );
         let options = ShapingOptions {
             letter_spacing: None,
-            word_spacing,
+            word_spacing: None,
             script: self.script,
+            language: self.language,
             flags: ShapingFlags::empty(),
         };
 
@@ -2497,7 +2578,9 @@ impl UnshapedTextRun<'_> {
         let identifier = font.identifier();
         let font_data = match &identifier {
             FontIdentifier::Local(_) => None,
-            FontIdentifier::Web(_) => Some(font.font_data_and_index().ok()?),
+            FontIdentifier::Web(_) | FontIdentifier::ArrayBuffer(_) => {
+                Some(font.font_data_and_index().ok()?)
+            },
         }
         .cloned();
         let canvas_font = CanvasFont {

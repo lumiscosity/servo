@@ -10,23 +10,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::{slice, thread};
 
-use base::Epoch;
-use base::generic_channel::{GenericReceiver, GenericSender, GenericSharedMemory, RoutedReceiver};
-use base::id::PainterId;
 use bitflags::bitflags;
 use byteorder::{ByteOrder, NativeEndian, WriteBytesExt};
-use canvas_traits::webgl;
-#[cfg(feature = "webxr")]
-use canvas_traits::webgl::WebXRCommand;
-use canvas_traits::webgl::{
-    ActiveAttribInfo, ActiveUniformBlockInfo, ActiveUniformInfo, AlphaTreatment,
-    GLContextAttributes, GLLimits, GlType, InternalFormatIntVec, ProgramLinkInfo, TexDataType,
-    TexFormat, WebGLBufferId, WebGLChan, WebGLCommand, WebGLCommandBacktrace, WebGLContextId,
-    WebGLCreateContextResult, WebGLFramebufferBindingRequest, WebGLFramebufferId, WebGLMsg,
-    WebGLMsgSender, WebGLProgramId, WebGLQueryId, WebGLRenderbufferId, WebGLSLVersion,
-    WebGLSamplerId, WebGLShaderId, WebGLSyncId, WebGLTextureId, WebGLVersion, WebGLVertexArrayId,
-    YAxisTreatment,
-};
 use euclid::default::Size2D;
 use glow::{
     self as gl, ActiveTransformFeedback, Context as Gl, HasContext, NativeTransformFeedback,
@@ -43,6 +28,23 @@ use paint_api::{
 use parking_lot::RwLock;
 use pixels::{self, PixelFormat, SnapshotAlphaMode, unmultiply_inplace};
 use rustc_hash::FxHashMap;
+use servo_base::Epoch;
+use servo_base::generic_channel::{
+    GenericReceiver, GenericSender, GenericSharedMemory, RoutedReceiver,
+};
+use servo_base::id::PainterId;
+use servo_canvas_traits::webgl;
+#[cfg(feature = "webxr")]
+use servo_canvas_traits::webgl::WebXRCommand;
+use servo_canvas_traits::webgl::{
+    ActiveAttribInfo, ActiveUniformBlockInfo, ActiveUniformInfo, AlphaTreatment,
+    GLContextAttributes, GLLimits, GlType, InternalFormatIntVec, ProgramLinkInfo, TexDataType,
+    TexFormat, WebGLBufferId, WebGLChan, WebGLCommand, WebGLCommandBacktrace, WebGLContextId,
+    WebGLCreateContextResult, WebGLFramebufferBindingRequest, WebGLFramebufferId, WebGLMsg,
+    WebGLMsgSender, WebGLProgramId, WebGLQueryId, WebGLRenderbufferId, WebGLSLVersion,
+    WebGLSamplerId, WebGLShaderId, WebGLSyncId, WebGLTextureId, WebGLVersion, WebGLVertexArrayId,
+    YAxisTreatment,
+};
 use surfman::chains::{PreserveBuffer, SwapChains, SwapChainsAPI};
 use surfman::{
     self, Context, ContextAttributeFlags, ContextAttributes, Device, GLVersion, SurfaceAccess,

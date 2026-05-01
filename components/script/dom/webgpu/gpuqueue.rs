@@ -4,8 +4,8 @@
 
 use std::rc::Rc;
 
-use base::generic_channel::GenericSharedMemory;
 use dom_struct::dom_struct;
+use servo_base::generic_channel::GenericSharedMemory;
 use webgpu_traits::{WebGPU, WebGPUQueue, WebGPURequest};
 
 use crate::conversions::{Convert, TryConvert};
@@ -217,7 +217,12 @@ impl GPUQueueMethods<crate::DomTypeHolder> for GPUQueue {
 }
 
 impl RoutedPromiseListener<()> for GPUQueue {
-    fn handle_response(&self, _response: (), promise: &Rc<Promise>, can_gc: CanGc) {
-        promise.resolve_native(&(), can_gc);
+    fn handle_response(
+        &self,
+        cx: &mut js::context::JSContext,
+        _response: (),
+        promise: &Rc<Promise>,
+    ) {
+        promise.resolve_native(&(), CanGc::from_cx(cx));
     }
 }

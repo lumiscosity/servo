@@ -82,14 +82,15 @@ def set_breakpoint(devtools, source_url, line, column):
     )
 
 
-# Wait for the debugger to pause and return the data of that paused location
-def wait_for_pause(client, thread_actor, timeout=3):
+# Call a trigger and wait for the debugger to pause and return the data of that paused location
+def wait_for_pause(client, thread_actor, trigger, timeout=3):
     future = Future()
 
     def on_paused(data):
         future.set_result(data)
 
     client.add_event_listener(thread_actor, "paused", on_paused)
+    trigger()
     return future.result(timeout)
 
 
@@ -234,6 +235,13 @@ class DevtoolsTests(unittest.IsolatedAsyncioTestCase):
             response2 = devtools.watcher.get_breakpoint_list_actor()
             self.assertEqual(response1["breakpointList"]["actor"], response2["breakpointList"]["actor"])
 
+    def test_watcher_returns_same_blackboxing_actor_every_time(self):
+        self.run_servoshell(url="data:text/html,")
+        with Devtools.connect() as devtools:
+            response1 = devtools.watcher.get_blackboxing_actor()
+            response2 = devtools.watcher.get_blackboxing_actor()
+            self.assertEqual(response1["blackboxing"]["actor"], response2["blackboxing"]["actor"])
+
     def test_breakpoint_pause(self):
         self.run_servoshell(url=f"{self.base_urls[0]}/debugger/loop.html")
         with Devtools.connect() as devtools:
@@ -247,9 +255,10 @@ class DevtoolsTests(unittest.IsolatedAsyncioTestCase):
             line_str = min(positions.keys(), key=int)
             line, column = int(line_str), positions[line_str][0]
 
-            set_breakpoint(devtools, f"{self.base_urls[0]}/debugger/loop.html", line, column)
+            def trigger():
+                set_breakpoint(devtools, f"{self.base_urls[0]}/debugger/loop.html", line, column)
 
-            paused_data = wait_for_pause(devtools.client, thread_actor)
+            paused_data = wait_for_pause(devtools.client, thread_actor, trigger)
             self.assertEqual(paused_data.get("type"), "paused")
             self.assertEqual(paused_data.get("why", {}).get("type"), "breakpoint")
 
@@ -259,9 +268,10 @@ class DevtoolsTests(unittest.IsolatedAsyncioTestCase):
             thread_actor = attach_thread(devtools)
             console_actor = devtools.targets[0]["consoleActor"]
 
-            devtools.client.send_receive({"to": thread_actor, "type": "interrupt", "when": "onNext"})
+            def trigger():
+                devtools.client.send_receive({"to": thread_actor, "type": "interrupt", "when": "onNext"})
 
-            paused_data = wait_for_pause(devtools.client, thread_actor)
+            paused_data = wait_for_pause(devtools.client, thread_actor, trigger)
             frame_actor = paused_data.get("frame", {}).get("actor")
             self.assertIsNotNone(frame_actor)
 
@@ -306,9 +316,10 @@ class DevtoolsTests(unittest.IsolatedAsyncioTestCase):
         with Devtools.connect() as devtools:
             thread_actor = attach_thread(devtools)
 
-            devtools.client.send_receive({"to": thread_actor, "type": "interrupt", "when": "onNext"})
+            def trigger():
+                devtools.client.send_receive({"to": thread_actor, "type": "interrupt", "when": "onNext"})
 
-            paused_data = wait_for_pause(devtools.client, thread_actor)
+            paused_data = wait_for_pause(devtools.client, thread_actor, trigger)
             self.assertEqual(paused_data.get("type"), "paused")
             why = paused_data.get("why", {})
             self.assertEqual(why.get("type"), "interrupted")
@@ -330,10 +341,11 @@ class DevtoolsTests(unittest.IsolatedAsyncioTestCase):
             line, column = 10, positions["10"][0]
 
             # Set breakpoint at the end() call
-            set_breakpoint(devtools, f"{self.base_urls[0]}/debugger/stepping.html", line, column)
+            def trigger():
+                set_breakpoint(devtools, f"{self.base_urls[0]}/debugger/stepping.html", line, column)
 
             # Pause and breakpoint hit, this is necessary for stepping hooks
-            paused_data = wait_for_pause(devtools.client, thread_actor)
+            paused_data = wait_for_pause(devtools.client, thread_actor, trigger)
             self.assertEqual(paused_data.get("type"), "paused")
             self.assertEqual(paused_data.get("why", {}).get("type"), "breakpoint")
 
@@ -978,6 +990,63 @@ class DevtoolsTests(unittest.IsolatedAsyncioTestCase):
         result = self.evaluate_and_capture_console_log_output("log_booleans();")
         self.assertEquals(result["arguments"], [True, False, True, False])
 
+    def test_console_log_numbers(self):
+        script_tag = "<script>let log_numbers = () => console.log(1/0, -1/0, 0/0, -0, 1);</script>"
+        self.run_servoshell(url=f"data:text/html,{script_tag}")
+
+        result = self.evaluate_and_capture_console_log_output("log_numbers();")
+
+        self.assertEquals(
+            result["arguments"], [{"type": "Infinity"}, {"type": "-Infinity"}, {"type": "NaN"}, {"type": "-0"}, 1.0]
+        )
+
+    def test_console_log_array(self):
+        script_tag = "<script>let log_array = () => console.log([1, 2, 3]);</script>"
+        self.run_servoshell(url=f"data:text/html,{script_tag}")
+
+        result = self.evaluate_and_capture_console_log_output("log_array();")
+        object = result["arguments"][0]
+        self.assertEquals(object["class"], "Array")
+        preview = object["preview"]
+        self.assertEquals(preview["kind"], "ArrayLike")
+        self.assertEquals(preview["length"], 3)
+        self.assertEquals(preview["items"], [1, 2, 3])
+
+    def test_console_log_function(self):
+        script_tag = "<script>function test_function() { }let log_function = () => console.log(test_function);</script>"
+        self.run_servoshell(url=f"data:text/html,{script_tag}")
+
+        result = self.evaluate_and_capture_console_log_output("log_function();")
+        function = result["arguments"][0]
+        self.assertEquals(function["class"], "Function")
+        self.assertEquals(function["name"], "test_function")
+        self.assertEquals(function["displayName"], "test_function")
+        preview = function["preview"]
+        self.assertEquals(preview["kind"], "Object")
+
+    @unittest.expectedFailure
+    def test_console_log_function_arguments(self):
+        script_tag = (
+            "<script>function test_arguments(a, b) { return a + b; }"
+            "let log_arguments = () => console.log(test_arguments);"
+            "</script>"
+        )
+        self.run_servoshell(url=f"data:text/html,{script_tag}")
+
+        result = self.evaluate_and_capture_console_log_output("log_arguments();")
+        self.assertEquals(result["arguments"][0]["parameterNames"], ["a", "b"])
+
+    def test_console_log_sprintf_substitutions(self):
+        script_tag = (
+            "<script>let log_sprintf = () => "
+            "console.log('String %s Int %d Int %i Float %f', 'string', 32, 46, Math.PI);"
+            "</script>"
+        )
+        self.run_servoshell(url=f"data:text/html,{script_tag}")
+
+        result = self.evaluate_and_capture_console_log_output("log_sprintf();")
+        self.assertEquals(result["arguments"], ["String string Int 32 Int 46 Float 3.141592653589793"])
+
     def test_inspector_event_listeners(self):
         self.run_servoshell(url=f"{self.base_urls[0]}/inspector/event_listeners.html")
         with Devtools.connect() as devtools:
@@ -1122,6 +1191,46 @@ class DevtoolsTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(did_see_new_mutations)
             self.assertEquals(walker.get_mutations(False), [])
 
+    def test_walker_observes_new_dom_after_nav(self):
+        # This tests that the walker actor can correctly recognize a new DOM across distinct
+        # pipelines and script threads. It does not exercise the full exchange of messages required
+        # for the Firefox toolbox to successfully refresh its inspector panel.
+
+        self.run_servoshell(url=f"{self.base_urls[0]}/tab/page1.html")
+        with Devtools.connect() as devtools:
+            nav_done = Future()
+
+            def on_tab_navigated(data):
+                if data.get("state") == "stop" and data.get("url").endswith("/tab/page2.html"):
+                    nav_done.set_result(None)
+                    return
+
+            devtools.client.add_event_listener(
+                devtools.targets[0]["actor"],
+                "tabNavigated",
+                on_tab_navigated,
+            )
+            devtools.client.send_receive(
+                {
+                    "to": devtools.tab.actor_id,
+                    "type": "navigateTo",
+                    # Use a different base URL to test walker across script threads.
+                    "url": f"{self.base_urls[1]}/tab/page2.html",
+                },
+            )
+            # Wait for navigation to complete.
+            nav_done.result(1)
+
+            inspector = InspectorActor(devtools.client, devtools.targets[0]["inspectorActor"])
+            walker_info = inspector.get_walker()
+            walker = WalkerActor(devtools.client, walker_info["actor"])
+            root_node = walker_info["root"]["actor"]
+
+            title_node = walker.query_selector(root_node, "title")
+            self.assertIsNotNone(title_node.get("node"))
+            self.assertIsNotNone(title_node["node"].get("inlineTextChild"))
+            self.assertEquals(title_node["node"]["inlineTextChild"].get("nodeValue"), "Page 2")
+
     def test_navigation(self):
         self.run_servoshell(url=f"{self.base_urls[0]}/tab/page1.html")
         with Devtools.connect() as devtools:
@@ -1133,7 +1242,7 @@ class DevtoolsTests(unittest.IsolatedAsyncioTestCase):
                 done = Future()
 
                 def on_tab_navigated(data):
-                    if data.get("url").endswith(target_path):
+                    if data.get("state") == "stop" and data.get("url").endswith(target_path):
                         done.set_result(None)
                         return
 
@@ -1145,10 +1254,91 @@ class DevtoolsTests(unittest.IsolatedAsyncioTestCase):
                 devtools.client.send_receive({"to": devtools.tab.actor_id, **message_data})
 
                 done.result(1)
-                # History may momentarily report stale state when navigating
-                # rapidly. The code under test does not seem to be responsible,
-                # so wait it out.
-                time.sleep(0.1)
+
+    def test_stylesheet_inline(self):
+        self.run_servoshell(url=f"{self.base_urls[0]}/stylesheets/inline_style.html")
+        with Devtools.connect() as devtools:
+            done = Future()
+            stylesheets_data = []
+
+            def on_resource(data):
+                for [resource_type, resources] in data["array"]:
+                    if resource_type == "stylesheet":
+                        stylesheets_data.extend(resources)
+                        done.set_result(None)
+
+            devtools.client.add_event_listener(
+                devtools.targets[0]["actor"],
+                Events.Watcher.RESOURCES_AVAILABLE_ARRAY,
+                on_resource,
+            )
+            devtools.watcher.watch_resources([Resources.STYLESHEET])
+            done.result(1)
+
+            # Inline sheets won't have href.
+            inline_sheet = stylesheets_data[0]
+            self.assertIsNone(inline_sheet.get("href"))
+            self.assertEqual(inline_sheet["ruleCount"], 2)
+            self.assertFalse(inline_sheet["system"])
+            self.assertFalse(inline_sheet["disabled"])
+
+    def test_stylesheet_linked(self):
+        self.run_servoshell(url=f"{self.base_urls[0]}/stylesheets/linked_style.html")
+        with Devtools.connect() as devtools:
+            done = Future()
+            stylesheets_data = []
+
+            def on_resource(data):
+                for [resource_type, resources] in data["array"]:
+                    if resource_type == "stylesheet":
+                        stylesheets_data.extend(resources)
+                        done.set_result(None)
+
+            devtools.client.add_event_listener(
+                devtools.targets[0]["actor"],
+                Events.Watcher.RESOURCES_AVAILABLE_ARRAY,
+                on_resource,
+            )
+            devtools.watcher.watch_resources([Resources.STYLESHEET])
+            done.result(1)
+
+            # Linked sheets have linked css as href.
+            linked_sheet = stylesheets_data[0]
+            self.assertEqual(f"{self.base_urls[0]}/stylesheets/styles.css", linked_sheet["href"])
+            self.assertFalse(linked_sheet["system"])
+            self.assertEqual(linked_sheet["ruleCount"], 1)
+            self.assertFalse(linked_sheet["disabled"])
+
+    def test_stylesheet_content(self):
+        self.run_servoshell(url=f"{self.base_urls[0]}/stylesheets/linked_style.html")
+        with Devtools.connect() as devtools:
+            founded_resources = []
+            done = Future()
+
+            def on_resource(data):
+                for [resource_type, resources] in data["array"]:
+                    if resource_type == "stylesheet":
+                        founded_resources.extend(resources)
+                        done.set_result(None)
+
+            devtools.client.add_event_listener(
+                devtools.targets[0]["actor"],
+                Events.Watcher.RESOURCES_AVAILABLE_ARRAY,
+                on_resource,
+            )
+            devtools.watcher.watch_resources([Resources.STYLESHEET])
+            done.result(1)
+
+            # Test getText by sending the resource id.
+            reply = devtools.client.send_receive(
+                {
+                    "to": devtools.targets[0]["styleSheetsActor"],
+                    "type": "getText",
+                    "resourceId": founded_resources[0]["resourceId"],
+                }
+            )
+            style_text = reply["text"]["initial"]
+            self.assertIn("body { background: green; font-size: small; }", style_text)
 
     # Sets `base_url` and `web_server` and `web_server_thread`.
     @classmethod

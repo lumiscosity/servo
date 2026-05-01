@@ -12,7 +12,6 @@ use std::str::FromStr;
 use std::sync::LazyLock;
 use std::{fmt, slice, str};
 
-use base::text::{Utf8CodeUnitLength, Utf16CodeUnitLength};
 use html5ever::{LocalName, Namespace};
 use js::conversions::{ToJSValConvertible, jsstr_to_string};
 use js::gc::MutableHandleValue;
@@ -22,6 +21,7 @@ use js::rust::{Runtime, Trace};
 use malloc_size_of::MallocSizeOfOps;
 use num_traits::{ToPrimitive, Zero};
 use regex::Regex;
+use servo_base::text::{Utf8CodeUnitLength, Utf16CodeUnitLength};
 use style::Atom;
 use style::str::HTML_SPACE_CHARACTERS;
 
@@ -390,7 +390,12 @@ impl DOMString {
     }
 
     pub fn clear(&mut self) {
-        *self.0.borrow_mut() = DOMStringType::Rust(String::new())
+        let mut inner = self.0.borrow_mut();
+        let DOMStringType::Rust(string) = &mut *inner else {
+            *inner = DOMStringType::Rust(String::new());
+            return;
+        };
+        string.clear();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -437,6 +442,7 @@ impl DOMString {
             .push_str(string_to_push);
     }
 
+    /// <https://infra.spec.whatwg.org/#strip-leading-and-trailing-ascii-whitespace>
     pub fn strip_leading_and_trailing_ascii_whitespace(&mut self) {
         if self.is_empty() {
             return;
@@ -458,7 +464,7 @@ impl DOMString {
         string.replace_range(0..first_non_whitespace, "");
     }
 
-    /// This is a dom spec
+    /// <https://html.spec.whatwg.org/multipage/#valid-floating-point-number>
     pub fn is_valid_floating_point_number_string(&self) -> bool {
         static RE: LazyLock<Regex> = LazyLock::new(|| {
             Regex::new(r"^-?(?:\d+\.\d+|\d+|\.\d+)(?:(e|E)(\+|\-)?\d+)?$").unwrap()
@@ -534,6 +540,10 @@ impl DOMString {
 
     pub fn starts_with_str(&self, needle: &str) -> bool {
         self.str().starts_with(needle)
+    }
+
+    pub fn ends_with_str(&self, needle: &str) -> bool {
+        self.str().ends_with(needle)
     }
 
     pub fn contains(&self, needle: &str) -> bool {
@@ -908,6 +918,9 @@ macro_rules! match_domstring_ascii_inner {
 /// );
 /// assert_eq!(value, 3);
 /// ```
+///
+/// The `RefCell` inside `DOMString` is borrowed for the duration of the `match`,
+/// so the string cannot be accessed again inside a `match` arm.
 #[macro_export]
 macro_rules! match_domstring_ascii {
     ($input:expr, $($tail:tt)*) => {

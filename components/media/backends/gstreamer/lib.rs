@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 use std::thread;
 use std::vec::Vec;
 
@@ -30,7 +30,6 @@ use ipc_channel::ipc::IpcSender;
 use log::warn;
 use media_stream::GStreamerMediaStream;
 use mime::Mime;
-use once_cell::sync::{Lazy, OnceCell};
 use registry_scanner::GSTREAMER_REGISTRY_SCANNER;
 use servo_media::{Backend, BackendDeInit, BackendInit, MediaInstanceError, SupportsMediaType};
 use servo_media_audio::context::{AudioContext, AudioContextOptions};
@@ -48,10 +47,10 @@ use servo_media_streams::{MediaOutput, MediaSocket, MediaStreamType};
 use servo_media_traits::{BackendMsg, ClientContextId, MediaInstance};
 use servo_media_webrtc::{WebRtcBackend, WebRtcController, WebRtcSignaller};
 
-static BACKEND_BASE_TIME: Lazy<gstreamer::ClockTime> =
-    Lazy::new(|| gstreamer::SystemClock::obtain().time());
+static BACKEND_BASE_TIME: LazyLock<gstreamer::ClockTime> =
+    LazyLock::new(|| gstreamer::SystemClock::obtain().time());
 
-static BACKEND_THREAD: OnceCell<bool> = OnceCell::new();
+static BACKEND_THREAD: OnceLock<bool> = OnceLock::new();
 
 pub type WeakMediaInstance = Weak<Mutex<dyn MediaInstance>>;
 pub type WeakMediaInstanceHashMap = HashMap<ClientContextId, Vec<(usize, WeakMediaInstance)>>;
@@ -66,13 +65,13 @@ pub struct GStreamerBackend {
 
 #[derive(Debug)]
 #[allow(dead_code)]
-pub struct ErrorLoadingPlugins(Vec<&'static str>);
+pub struct ErrorLoadingPlugins<'a>(Vec<&'a str>);
 
 impl GStreamerBackend {
-    pub fn init_with_plugins(
+    pub fn init_with_plugins<'a, T: AsRef<str>>(
         plugin_dir: PathBuf,
-        plugins: &[&'static str],
-    ) -> Result<Box<dyn Backend>, ErrorLoadingPlugins> {
+        plugins: &'a [T],
+    ) -> Result<Box<dyn Backend>, ErrorLoadingPlugins<'a>> {
         gstreamer::init().unwrap();
 
         // GStreamer between 1.19.1 and 1.22.7 will not send messages like "end of stream"
@@ -94,14 +93,14 @@ impl GStreamerBackend {
         let mut errors = vec![];
         for plugin in plugins {
             let mut path = plugin_dir.clone();
-            path.push(plugin);
+            path.push(plugin.as_ref());
             let registry = gstreamer::Registry::get();
             if gstreamer::Plugin::load_file(&path)
                 .is_ok_and(|plugin| registry.add_plugin(&plugin).is_ok())
             {
                 continue;
             }
-            errors.push(*plugin);
+            errors.push(plugin.as_ref());
         }
 
         if !errors.is_empty() {
@@ -169,6 +168,7 @@ impl GStreamerBackend {
 }
 
 impl Backend for GStreamerBackend {
+    #[expect(clippy::redundant_clone, reason = "False positive")]
     fn create_player(
         &self,
         context_id: &ClientContextId,
@@ -195,6 +195,7 @@ impl Backend for GStreamerBackend {
         player
     }
 
+    #[expect(clippy::redundant_clone, reason = "False positive")]
     fn create_audio_context(
         &self,
         client_context_id: &ClientContextId,
@@ -334,7 +335,7 @@ impl WebRtcBackend for GStreamerBackend {
 
 impl BackendInit for GStreamerBackend {
     fn init() -> Box<dyn Backend> {
-        Self::init_with_plugins(PathBuf::new(), &[]).unwrap()
+        Self::init_with_plugins::<&str>(PathBuf::new(), &[]).unwrap()
     }
 }
 

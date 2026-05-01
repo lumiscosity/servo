@@ -8,7 +8,7 @@ on:
     inputs:
       profile:
         required: false
-        default: "release"
+        default: "checked-release"
         type: string
       bencher:
         required: false
@@ -19,9 +19,9 @@ on:
     inputs:
       profile:
         required: false
-        default: "release"
+        default: "checked-release"
         type: choice
-        options: ["release", "debug", "production"]
+        options: ["checked-release", "release", "debug", "production"]
       bencher:
         required: false
         default: false
@@ -70,7 +70,7 @@ jobs:
         timeout-minutes: 30
         run: sudo apt update && ./mach bootstrap --yes --skip-lints --skip-nextest
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           java-version: '17'
           distribution: 'temurin'

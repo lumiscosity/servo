@@ -49,24 +49,24 @@ impl HTMLOutputElement {
     }
 
     pub(crate) fn new(
+        cx: &mut js::context::JSContext,
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
     ) -> DomRoot<HTMLOutputElement> {
         Node::reflect_node_with_proto(
+            cx,
             Box::new(HTMLOutputElement::new_inherited(
                 local_name, prefix, document,
             )),
             document,
             proto,
-            can_gc,
         )
     }
 
-    pub(crate) fn reset(&self, can_gc: CanGc) {
-        Node::string_replace_all(self.DefaultValue(), self.upcast::<Node>(), can_gc);
+    pub(crate) fn reset(&self, cx: &mut JSContext) {
+        Node::string_replace_all(cx, self.DefaultValue(), self.upcast::<Node>());
         *self.default_value_override.borrow_mut() = None;
     }
 }
@@ -91,10 +91,10 @@ impl HTMLOutputElementMethods<crate::DomTypeHolder> for HTMLOutputElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-output-defaultvalue>
-    fn SetDefaultValue(&self, value: DOMString, can_gc: CanGc) {
+    fn SetDefaultValue(&self, cx: &mut JSContext, value: DOMString) {
         if self.default_value_override.borrow().is_none() {
             // Step 1 ("and return")
-            Node::string_replace_all(value.clone(), self.upcast::<Node>(), can_gc);
+            Node::string_replace_all(cx, value, self.upcast::<Node>());
         } else {
             // Step 2, if not returned from step 1
             *self.default_value_override.borrow_mut() = Some(value);
@@ -107,9 +107,9 @@ impl HTMLOutputElementMethods<crate::DomTypeHolder> for HTMLOutputElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-output-value>
-    fn SetValue(&self, value: DOMString, can_gc: CanGc) {
+    fn SetValue(&self, cx: &mut JSContext, value: DOMString) {
         *self.default_value_override.borrow_mut() = Some(self.DefaultValue());
-        Node::string_replace_all(value, self.upcast::<Node>(), can_gc);
+        Node::string_replace_all(cx, value, self.upcast::<Node>());
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-output-type>
@@ -159,12 +159,17 @@ impl VirtualMethods for HTMLOutputElement {
         Some(self.upcast::<HTMLElement>() as &dyn VirtualMethods)
     }
 
-    fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation, can_gc: CanGc) {
+    fn attribute_mutated(
+        &self,
+        cx: &mut js::context::JSContext,
+        attr: &Attr,
+        mutation: AttributeMutation,
+    ) {
         self.super_type()
             .unwrap()
-            .attribute_mutated(attr, mutation, can_gc);
+            .attribute_mutated(cx, attr, mutation);
         if attr.local_name() == &local_name!("form") {
-            self.form_attribute_mutated(mutation, can_gc);
+            self.form_attribute_mutated(mutation, CanGc::from_cx(cx));
         }
     }
 }

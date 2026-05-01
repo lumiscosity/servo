@@ -25,7 +25,6 @@ use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot};
-use crate::dom::bindings::str::DOMString;
 use crate::dom::console::Console;
 use crate::dom::eventtarget::EventTarget;
 
@@ -76,7 +75,7 @@ impl AudioNode {
             const MESSAGE: &str =
                 "Failed to create an AudioNode backend. The constructed AudioNode will be inert.";
             warn!("{MESSAGE}");
-            Console::internal_warn(&context.global(), DOMString::from(MESSAGE));
+            Console::internal_warn(&context.global(), MESSAGE.to_string());
         }
 
         Ok(AudioNode::new_inherited_for_id(
@@ -304,17 +303,13 @@ impl AudioNodeMethods<crate::DomTypeHolder> for AudioNode {
                     return Err(Error::IndexSize(None));
                 }
             },
-            EventTargetTypeId::AudioNode(AudioNodeTypeId::PannerNode) => {
-                if value > 2 {
-                    return Err(Error::NotSupported(None));
-                }
+            EventTargetTypeId::AudioNode(AudioNodeTypeId::PannerNode) if value > 2 => {
+                return Err(Error::NotSupported(None));
             },
             EventTargetTypeId::AudioNode(AudioNodeTypeId::AudioScheduledSourceNode(
                 AudioScheduledSourceNodeTypeId::StereoPannerNode,
-            )) => {
-                if value > 2 {
-                    return Err(Error::NotSupported(None));
-                }
+            )) if value > 2 => {
+                return Err(Error::NotSupported(None));
             },
             EventTargetTypeId::AudioNode(AudioNodeTypeId::ChannelMergerNode) => {
                 return Err(Error::InvalidState(None));
@@ -350,10 +345,10 @@ impl AudioNodeMethods<crate::DomTypeHolder> for AudioNode {
         }
 
         match self.upcast::<EventTarget>().type_id() {
-            EventTargetTypeId::AudioNode(AudioNodeTypeId::AudioDestinationNode) => {
-                if self.context.is_offline() {
-                    return Err(Error::InvalidState(None));
-                }
+            EventTargetTypeId::AudioNode(AudioNodeTypeId::AudioDestinationNode)
+                if self.context.is_offline() =>
+            {
+                return Err(Error::InvalidState(None));
             },
             EventTargetTypeId::AudioNode(AudioNodeTypeId::PannerNode) => {
                 if value == ChannelCountMode::Max {
@@ -362,10 +357,8 @@ impl AudioNodeMethods<crate::DomTypeHolder> for AudioNode {
             },
             EventTargetTypeId::AudioNode(AudioNodeTypeId::AudioScheduledSourceNode(
                 AudioScheduledSourceNodeTypeId::StereoPannerNode,
-            )) => {
-                if value == ChannelCountMode::Max {
-                    return Err(Error::NotSupported(None));
-                }
+            )) if value == ChannelCountMode::Max => {
+                return Err(Error::NotSupported(None));
             },
             EventTargetTypeId::AudioNode(AudioNodeTypeId::ChannelMergerNode) => {
                 return Err(Error::InvalidState(None));

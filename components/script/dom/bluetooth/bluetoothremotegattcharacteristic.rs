@@ -4,11 +4,11 @@
 
 use std::rc::Rc;
 
-use base::generic_channel::GenericSender;
-use bluetooth_traits::blocklist::{Blocklist, uuid_is_blocklisted};
-use bluetooth_traits::{BluetoothRequest, BluetoothResponse, GATTType};
 use dom_struct::dom_struct;
 use js::realm::CurrentRealm;
+use servo_base::generic_channel::GenericSender;
+use servo_bluetooth_traits::blocklist::{Blocklist, uuid_is_blocklisted};
+use servo_bluetooth_traits::{BluetoothRequest, BluetoothResponse, GATTType};
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::BluetoothCharacteristicPropertiesBinding::BluetoothCharacteristicPropertiesMethods;
@@ -343,7 +343,7 @@ impl AsyncBluetoothListener for BluetoothRemoteGATTCharacteristic {
 
                 // Step 5.5.3.
                 self.upcast::<EventTarget>()
-                    .fire_bubbling_event(atom!("characteristicvaluechanged"), CanGc::from_cx(cx));
+                    .fire_bubbling_event(cx, atom!("characteristicvaluechanged"));
 
                 // Step 5.5.4.
                 promise.resolve_native(&value, CanGc::from_cx(cx));

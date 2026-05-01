@@ -4,15 +4,29 @@
 
 // This interface is entirely internal to Servo, and should not be accessible to
 // web pages.
+[Exposed=DebuggerGlobalScope]
+interface DebuggerGetEnvironmentEvent : Event {
+    readonly attribute DOMString frameActorId;
+};
+
 partial interface DebuggerGlobalScope {
     DOMString? registerEnvironmentActor(
         EnvironmentInfo result,
         DOMString? parent
     );
+    undefined getEnvironmentResult(
+        DOMString environmentActorId
+    );
+};
+
+dictionary EnvironmentVariable {
+    required PropertyDescriptor property;
+    ObjectPreview preview;
 };
 
 dictionary EnvironmentInfo {
     DOMString type_;
     DOMString scopeKind;
     DOMString functionDisplayName;
+    sequence<EnvironmentVariable> bindingVariables;
 };

@@ -13,36 +13,62 @@ promise_test(async () => {
   assert_equals(typeof result, 'string');
 }, 'Simple LanguageModel.prompt() call');
 
+promise_test(async () => {
+  await ensureLanguageModel();
+  const session = await createLanguageModel();
+  assert_equals(session.contextUsage, 0);
+  const promptUsage = await session.measureContextUsage(kTestPrompt);
+  assert_greater_than(promptUsage, 0);
+  const result = await session.prompt(kTestPrompt);
+  assert_equals(typeof result, 'string');
+  // The response is also appended to the session context, increasing usage.
+  const resultUsage = await session.measureContextUsage(result);
+  assert_equals(session.contextUsage, promptUsage + resultUsage);
+}, 'Check contextUsage increases from a simple LanguageModel.prompt() call');
+
 promise_test(async (t) => {
   await ensureLanguageModel();
   const session = await createLanguageModel();
-  assert_true(!!(await session.prompt([])));
   // Invalid input should be stringified.
   assert_regexp_match(await session.prompt({}), /\[object Object\]/);
-}, 'Check empty input');
+}, 'Check empty Object input');
+
+promise_test(async (t) => {
+  await ensureLanguageModel();
+  const model = await createLanguageModel();
+
+  // null, undefined, and objects are coerced to strings.
+  assert_regexp_match(await model.prompt(null), /null/);
+  assert_regexp_match(await model.prompt(undefined), /undefined/);
+  assert_equals(typeof await model.prompt({}), 'string');
+  assert_equals(typeof await model.prompt(''), 'string');
+  assert_equals(typeof await model.prompt([]), 'string');
+  assert_equals(
+      typeof await model.prompt([{role: 'user', content: []}]), 'string');
+  assert_equals(
+      typeof await model.prompt(
+          [{role: 'user', content: [{type: 'text', value: ''}]}]),
+      'string');
+}, 'LanguageModel.prompt() allows empty and coerced inputs');
 
 promise_test(async (t) => {
   await ensureLanguageModel();
   const session = await createLanguageModel();
   assert_regexp_match(await session.prompt('What is the capital of France?'), /paris/i);
-  assert_regexp_match(
-      await session.prompt([{role: 'user', content: 'What is the capital of France?'}]),
-      /paris/i);
 }, 'Check capital of France');
 
 promise_test(async () => {
   const options = {
     initialPrompts:
-        [{role: 'system', content: [{type: 'text', value: 'The word of the day is regurgitation.'}]}]
+        [{role: 'system', content: 'The word of the day is regurgitation.'}]
   };
   await ensureLanguageModel(options);
   const session = await LanguageModel.create(options);
-  const tokenLength = await session.measureContextUsage(options.initialPrompts);
-  assert_greater_than(tokenLength, 0);
-  assert_greater_than_equal(tokenLength, session.contextUsage);
+  const usage = await session.measureContextUsage(options.initialPrompts);
+  assert_greater_than(usage, 0);
+  assert_equals(session.contextUsage, usage);
   assert_regexp_match(
-      await session.prompt([{role: 'user', content: 'What is the word of the day?'}]),
-      /regurgitation/i);
+      await session.prompt('What is the word of the day?'), /regurgitation/i);
 }, 'Test that initialPrompt counts towards session contextUsage');
 
 promise_test(async () => {
@@ -68,7 +94,28 @@ promise_test(async t => {
   await ensureLanguageModel();
   const session = await createLanguageModel();
   const promptString = kTestPrompt.repeat(session.contextWindow);
-  const requested = await session.measureContextUsage(promptString);
+  const usage = await session.measureContextUsage(promptString);
   await promise_rejects_quotaexceedederror(
-      t, session.prompt(promptString), requested, session.contextWindow);
+      t, session.prompt(promptString), usage, session.contextWindow);
 }, 'Test that prompt input exceeding the total context window rejects');
+
+promise_test(async t => {
+  await ensureLanguageModel();
+  const session = await createLanguageModel();
+  const result1 = session.prompt([
+    {role: 'user', content: 'foo'},
+    {role: 'system', content: 'bar'},
+  ]);
+  await promise_rejects_js(t, TypeError, result1);
+
+  const result2 = session.prompt([
+    {role: 'system', content: 'foo'},
+    {role: 'system', content: 'bar'},
+  ]);
+  await promise_rejects_js(t, TypeError, result2);
+
+  const result3 = session.prompt({role: 'system', content: 'foo'});
+  await promise_rejects_js(
+      t, TypeError, session.prompt([{role: 'system', content: 'bar'}]));
+  await result3;
+}, 'prompt() should reject system role messages after other messages');

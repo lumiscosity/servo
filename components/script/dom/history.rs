@@ -5,18 +5,18 @@
 use std::cell::Cell;
 use std::cmp::Ordering;
 
-use base::generic_channel::GenericSend;
-use base::id::HistoryStateId;
-use constellation_traits::{
-    ScriptToConstellationMessage, StructuredSerializedData, TraversalDirection,
-};
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::jsapi::Heap;
 use js::jsval::{JSVal, NullValue, UndefinedValue};
 use js::rust::{HandleValue, MutableHandleValue};
 use net_traits::CoreResourceMsg;
-use profile_traits::{generic_channel, ipc};
+use profile_traits::generic_channel;
+use servo_base::generic_channel::GenericSend;
+use servo_base::id::HistoryStateId;
+use servo_constellation_traits::{
+    ScriptToConstellationMessage, StructuredSerializedData, TraversalDirection,
+};
 use servo_url::ServoUrl;
 
 use crate::dom::bindings::codegen::Bindings::HistoryBinding::HistoryMethods;
@@ -87,13 +87,13 @@ impl History {
     /// Steps 5-16
     pub(crate) fn activate_state(
         &self,
+        cx: &mut JSContext,
         state_id: Option<HistoryStateId>,
         url: ServoUrl,
-        can_gc: CanGc,
     ) {
         // Steps 5
         let document = self.window.Document();
-        let old_url = document.url().clone();
+        let old_url = document.url();
         document.set_url(url.clone());
 
         // Step 6
@@ -101,7 +101,7 @@ impl History {
 
         // Step 8
         if let Some(fragment) = url.fragment() {
-            document.scroll_to_the_fragment(fragment);
+            document.scroll_to_the_fragment(cx, fragment);
         }
 
         // Step 11
@@ -109,7 +109,8 @@ impl History {
         self.state_id.set(state_id);
         let serialized_data = match state_id {
             Some(state_id) => {
-                let (tx, rx) = ipc::channel(self.global().time_profiler_chan().clone()).unwrap();
+                let (tx, rx) =
+                    generic_channel::channel(self.global().time_profiler_chan().clone()).unwrap();
                 let _ = self
                     .window
                     .as_global_scope()
@@ -131,7 +132,7 @@ impl History {
                     self.window.as_global_scope(),
                     data,
                     state.handle_mut(),
-                    can_gc,
+                    CanGc::from_cx(cx),
                 )
                 .is_err()
                 {
@@ -151,7 +152,7 @@ impl History {
                 self.window.upcast::<EventTarget>(),
                 &self.window,
                 self.state.as_handle_value(),
-                can_gc,
+                CanGc::from_cx(cx),
             );
         }
 
@@ -164,11 +165,11 @@ impl History {
                 false,
                 old_url.into_string(),
                 url.into_string(),
-                can_gc,
+                CanGc::from_cx(cx),
             );
             event
                 .upcast::<Event>()
-                .fire(self.window.upcast::<EventTarget>(), can_gc);
+                .fire(self.window.upcast::<EventTarget>(), CanGc::from_cx(cx));
         }
     }
 
@@ -368,7 +369,7 @@ impl HistoryMethods<crate::DomTypeHolder> for History {
         let direction = match delta.cmp(&0) {
             Ordering::Greater => TraversalDirection::Forward(delta as usize),
             Ordering::Less => TraversalDirection::Back(-delta as usize),
-            Ordering::Equal => return self.window.Location().Reload(CanGc::from_cx(cx)),
+            Ordering::Equal => return self.window.Location(cx).Reload(cx),
         };
 
         self.traverse_history(direction)

@@ -199,7 +199,7 @@ impl AbortSignal {
                 rooted!(&in(cx) let mut reason = UndefinedValue());
                 reason.set(self.abort_reason.get());
                 if let Some(fetch_context) = &mut *fetch_context.lock().unwrap() {
-                    fetch_context.abort_fetch(reason.handle(), cx.into(), CanGc::from_cx(cx));
+                    fetch_context.abort_fetch(reason.handle(), cx);
                 }
             },
             AbortAlgorithm::FetchLater(deferred_fetch_record_id) => {
@@ -227,8 +227,7 @@ impl AbortSignal {
         self.abort_algorithms.borrow_mut().clear();
 
         // Step 3. Fire an event named abort at signal.
-        self.upcast::<EventTarget>()
-            .fire_event(atom!("abort"), CanGc::from_cx(cx));
+        self.upcast::<EventTarget>().fire_event(cx, atom!("abort"));
     }
 
     /// <https://dom.spec.whatwg.org/#abortsignal-aborted>

@@ -61,8 +61,8 @@ pub(crate) struct Range {
 }
 
 pub(crate) struct ContainedChildren {
-    first_partially_contained_child: Option<DomRoot<Node>>,
-    last_partially_contained_child: Option<DomRoot<Node>>,
+    pub(crate) first_partially_contained_child: Option<DomRoot<Node>>,
+    pub(crate) last_partially_contained_child: Option<DomRoot<Node>>,
     pub(crate) contained_children: Vec<DomRoot<Node>>,
 }
 
@@ -142,7 +142,7 @@ impl Range {
     }
 
     /// <https://dom.spec.whatwg.org/#contained>
-    fn contains(&self, node: &Node) -> bool {
+    pub(crate) fn contains(&self, node: &Node) -> bool {
         // > A node node is contained in a live range range if node’s root is range’s root,
         // > and (node, 0) is after range’s start, and (node, node’s length) is before range’s end.
         matches!(
@@ -530,7 +530,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
     }
 
     /// <https://dom.spec.whatwg.org/#dom-range-clonerange>
-    fn CloneRange(&self, can_gc: CanGc) -> DomRoot<Range> {
+    fn CloneRange(&self, cx: &mut JSContext) -> DomRoot<Range> {
         let start_node = self.start_container();
         let owner_doc = start_node.owner_doc();
         Range::new(
@@ -539,7 +539,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
             self.start_offset(),
             &self.end_container(),
             self.end_offset(),
-            can_gc,
+            CanGc::from_cx(cx),
         )
     }
 
@@ -609,7 +609,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
         let end_offset = self.end_offset();
 
         // Step 1.
-        let fragment = DocumentFragment::new(&start_node.owner_doc(), CanGc::from_cx(cx));
+        let fragment = DocumentFragment::new(cx, &start_node.owner_doc());
 
         // Step 2.
         if self.start() == self.end() {
@@ -622,12 +622,9 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
                 let data = cdata
                     .SubstringData(start_offset, end_offset - start_offset)
                     .unwrap();
-                let clone =
-                    cdata.clone_with_data(data, &start_node.owner_doc(), CanGc::from_cx(cx));
+                let clone = cdata.clone_with_data(cx, data, &start_node.owner_doc());
                 // Step 4.3.
-                fragment
-                    .upcast::<Node>()
-                    .AppendChild(&clone, CanGc::from_cx(cx))?;
+                fragment.upcast::<Node>().AppendChild(cx, &clone)?;
                 // Step 4.4
                 return Ok(fragment);
             }
@@ -648,19 +645,14 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
                 let data = cdata
                     .SubstringData(start_offset, start_node.len() - start_offset)
                     .unwrap();
-                let clone =
-                    cdata.clone_with_data(data, &start_node.owner_doc(), CanGc::from_cx(cx));
+                let clone = cdata.clone_with_data(cx, data, &start_node.owner_doc());
                 // Step 13.3.
-                fragment
-                    .upcast::<Node>()
-                    .AppendChild(&clone, CanGc::from_cx(cx))?;
+                fragment.upcast::<Node>().AppendChild(cx, &clone)?;
             } else {
                 // Step 14.1.
                 let clone = child.CloneNode(cx, /* deep */ false)?;
                 // Step 14.2.
-                fragment
-                    .upcast::<Node>()
-                    .AppendChild(&clone, CanGc::from_cx(cx))?;
+                fragment.upcast::<Node>().AppendChild(cx, &clone)?;
                 // Step 14.3.
                 let subrange = Range::new(
                     &clone.owner_doc(),
@@ -673,7 +665,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
                 // Step 14.4.
                 let subfragment = subrange.CloneContents(cx)?;
                 // Step 14.5.
-                clone.AppendChild(subfragment.upcast(), CanGc::from_cx(cx))?;
+                clone.AppendChild(cx, subfragment.upcast())?;
             }
         }
 
@@ -682,9 +674,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
             // Step 15.1.
             let clone = child.CloneNode(cx, /* deep */ true)?;
             // Step 15.2.
-            fragment
-                .upcast::<Node>()
-                .AppendChild(&clone, CanGc::from_cx(cx))?;
+            fragment.upcast::<Node>().AppendChild(cx, &clone)?;
         }
 
         if let Some(child) = last_partially_contained_child {
@@ -693,19 +683,14 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
                 assert!(child == end_node);
                 // Steps 16.1-2.
                 let data = cdata.SubstringData(0, end_offset).unwrap();
-                let clone =
-                    cdata.clone_with_data(data, &start_node.owner_doc(), CanGc::from_cx(cx));
+                let clone = cdata.clone_with_data(cx, data, &start_node.owner_doc());
                 // Step 16.3.
-                fragment
-                    .upcast::<Node>()
-                    .AppendChild(&clone, CanGc::from_cx(cx))?;
+                fragment.upcast::<Node>().AppendChild(cx, &clone)?;
             } else {
                 // Step 17.1.
                 let clone = child.CloneNode(cx, /* deep */ false)?;
                 // Step 17.2.
-                fragment
-                    .upcast::<Node>()
-                    .AppendChild(&clone, CanGc::from_cx(cx))?;
+                fragment.upcast::<Node>().AppendChild(cx, &clone)?;
                 // Step 17.3.
                 let subrange = Range::new(
                     &clone.owner_doc(),
@@ -718,7 +703,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
                 // Step 17.4.
                 let subfragment = subrange.CloneContents(cx)?;
                 // Step 17.5.
-                clone.AppendChild(subfragment.upcast(), CanGc::from_cx(cx))?;
+                clone.AppendChild(cx, subfragment.upcast())?;
             }
         }
 
@@ -736,7 +721,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
         let end_offset = self.end_offset();
 
         // Step 1.
-        let fragment = DocumentFragment::new(&start_node.owner_doc(), CanGc::from_cx(cx));
+        let fragment = DocumentFragment::new(cx, &start_node.owner_doc());
 
         // Step 2.
         if self.collapsed() {
@@ -754,9 +739,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
                     .unwrap()
                     .SetData(text.unwrap());
                 // Step 4.3.
-                fragment
-                    .upcast::<Node>()
-                    .AppendChild(&clone, CanGc::from_cx(cx))?;
+                fragment.upcast::<Node>().AppendChild(cx, &clone)?;
                 // Step 4.4.
                 end_data.ReplaceData(start_offset, end_offset - start_offset, DOMString::new())?;
                 // Step 4.5.
@@ -800,9 +783,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
                     .unwrap()
                     .SetData(text.unwrap());
                 // Step 15.3.
-                fragment
-                    .upcast::<Node>()
-                    .AppendChild(&clone, CanGc::from_cx(cx))?;
+                fragment.upcast::<Node>().AppendChild(cx, &clone)?;
                 // Step 15.4.
                 start_data.ReplaceData(
                     start_offset,
@@ -813,9 +794,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
                 // Step 16.1.
                 let clone = child.CloneNode(cx, /* deep */ false)?;
                 // Step 16.2.
-                fragment
-                    .upcast::<Node>()
-                    .AppendChild(&clone, CanGc::from_cx(cx))?;
+                fragment.upcast::<Node>().AppendChild(cx, &clone)?;
                 // Step 16.3.
                 let subrange = Range::new(
                     &clone.owner_doc(),
@@ -828,15 +807,13 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
                 // Step 16.4.
                 let subfragment = subrange.ExtractContents(cx)?;
                 // Step 16.5.
-                clone.AppendChild(subfragment.upcast(), CanGc::from_cx(cx))?;
+                clone.AppendChild(cx, subfragment.upcast())?;
             }
         }
 
         // Step 17.
         for child in contained_children {
-            fragment
-                .upcast::<Node>()
-                .AppendChild(&child, CanGc::from_cx(cx))?;
+            fragment.upcast::<Node>().AppendChild(cx, &child)?;
         }
 
         if let Some(child) = last_partially_contained_child {
@@ -851,18 +828,14 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
                     .unwrap()
                     .SetData(text.unwrap());
                 // Step 18.3.
-                fragment
-                    .upcast::<Node>()
-                    .AppendChild(&clone, CanGc::from_cx(cx))?;
+                fragment.upcast::<Node>().AppendChild(cx, &clone)?;
                 // Step 18.4.
                 end_data.ReplaceData(0, end_offset, DOMString::new())?;
             } else {
                 // Step 19.1.
                 let clone = child.CloneNode(cx, /* deep */ false)?;
                 // Step 19.2.
-                fragment
-                    .upcast::<Node>()
-                    .AppendChild(&clone, CanGc::from_cx(cx))?;
+                fragment.upcast::<Node>().AppendChild(cx, &clone)?;
                 // Step 19.3.
                 let subrange = Range::new(
                     &clone.owner_doc(),
@@ -875,7 +848,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
                 // Step 19.4.
                 let subfragment = subrange.ExtractContents(cx)?;
                 // Step 19.5.
-                clone.AppendChild(subfragment.upcast(), CanGc::from_cx(cx))?;
+                clone.AppendChild(cx, subfragment.upcast())?;
             }
         }
 
@@ -894,7 +867,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
 
     /// <https://dom.spec.whatwg.org/#dom-range-insertnode>
     /// <https://dom.spec.whatwg.org/#concept-range-insert>
-    fn InsertNode(&self, node: &Node, can_gc: CanGc) -> ErrorResult {
+    fn InsertNode(&self, cx: &mut JSContext, node: &Node) -> ErrorResult {
         let start_node = self.start_container();
         let start_offset = self.start_offset();
 
@@ -923,19 +896,19 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
             },
             _ => {
                 // Steps 4-5.
-                let child = start_node.ChildNodes(can_gc).Item(start_offset);
+                let child = start_node.ChildNodes(cx).Item(start_offset);
                 (child, DomRoot::from_ref(&*start_node))
             },
         };
 
         // Step 6.
-        Node::ensure_pre_insertion_validity(node, &parent, reference_node.as_deref())?;
+        Node::ensure_pre_insertion_validity(cx.no_gc(), node, &parent, reference_node.as_deref())?;
 
         // Step 7.
         let split_text;
         let reference_node = match start_node.downcast::<Text>() {
             Some(text) => {
-                split_text = text.SplitText(start_offset, can_gc)?;
+                split_text = text.SplitText(cx, start_offset)?;
                 let new_reference = DomRoot::upcast::<Node>(split_text);
                 assert!(new_reference.GetParentNode().as_deref() == Some(&parent));
                 Some(new_reference)
@@ -951,7 +924,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
         };
 
         // Step 9.
-        node.remove_self(can_gc);
+        node.remove_self(cx);
 
         // Step 10.
         let new_offset = reference_node
@@ -967,7 +940,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
             };
 
         // Step 12.
-        Node::pre_insert(node, &parent, reference_node.as_deref(), can_gc)?;
+        Node::pre_insert(cx, node, &parent, reference_node.as_deref())?;
 
         // Step 13.
         if self.collapsed() {
@@ -978,7 +951,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
     }
 
     /// <https://dom.spec.whatwg.org/#dom-range-deletecontents>
-    fn DeleteContents(&self) -> ErrorResult {
+    fn DeleteContents(&self, cx: &mut JSContext) -> ErrorResult {
         // Step 1.
         if self.collapsed() {
             return Ok(());
@@ -1047,7 +1020,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
 
         // Step 8.
         for child in &*contained_children {
-            child.remove_self(CanGc::note());
+            child.remove_self(cx);
         }
 
         // Step 9.
@@ -1090,13 +1063,13 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
         let fragment = self.ExtractContents(cx)?;
 
         // Step 4.
-        Node::replace_all(None, new_parent, CanGc::from_cx(cx));
+        Node::replace_all(cx, None, new_parent);
 
         // Step 5.
-        self.InsertNode(new_parent, CanGc::from_cx(cx))?;
+        self.InsertNode(cx, new_parent)?;
 
         // Step 6.
-        new_parent.AppendChild(fragment.upcast(), CanGc::from_cx(cx))?;
+        new_parent.AppendChild(cx, fragment.upcast())?;
 
         // Step 7.
         self.SelectNode(new_parent)
@@ -1174,11 +1147,11 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
         // Step 1. Let compliantString be the result of invoking the
         // Get Trusted Type compliant string algorithm with TrustedHTML,
         // this's relevant global object, string, "Range createContextualFragment", and "script".
-        let fragment = TrustedHTML::get_trusted_script_compliant_string(
+        let fragment = TrustedHTML::get_trusted_type_compliant_string(
+            cx,
             node.owner_window().upcast(),
             fragment,
             "Range createContextualFragment",
-            CanGc::from_cx(cx),
         )?;
 
         let owner_doc = node.owner_doc();
@@ -1217,7 +1190,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
     }
 
     /// <https://drafts.csswg.org/cssom-view/#dom-range-getclientrects>
-    fn GetClientRects(&self, can_gc: CanGc) -> DomRoot<DOMRectList> {
+    fn GetClientRects(&self, cx: &mut JSContext) -> DomRoot<DOMRectList> {
         let start = self.start_container();
         let window = start.owner_window();
 
@@ -1230,16 +1203,16 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
                     rect.origin.y.to_f64_px(),
                     rect.size.width.to_f64_px(),
                     rect.size.height.to_f64_px(),
-                    can_gc,
+                    CanGc::from_cx(cx),
                 )
             })
             .collect();
 
-        DOMRectList::new(&window, client_rects, can_gc)
+        DOMRectList::new(&window, client_rects, CanGc::from_cx(cx))
     }
 
     /// <https://drafts.csswg.org/cssom-view/#dom-range-getboundingclientrect>
-    fn GetBoundingClientRect(&self, can_gc: CanGc) -> DomRoot<DOMRect> {
+    fn GetBoundingClientRect(&self, cx: &mut JSContext) -> DomRoot<DOMRect> {
         let window = self.start_container().owner_window();
 
         // Step 1. Let list be the result of invoking getClientRects() on the same range this method was invoked on.
@@ -1257,7 +1230,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
             bounding_rect.origin.y.to_f64_px(),
             bounding_rect.size.width.to_f64_px(),
             bounding_rect.size.height.to_f64_px(),
-            can_gc,
+            CanGc::from_cx(cx),
         )
     }
 }

@@ -5,20 +5,19 @@
 use std::any::{Any, type_name};
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use atomic_refcell::AtomicRefCell;
-use base::id::PipelineId;
 use log::{debug, warn};
 use malloc_size_of::MallocSizeOf;
 use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
+use servo_base::id::PipelineId;
 
 use crate::StreamId;
-use crate::protocol::{ClientRequest, JsonPacketStream};
+use crate::protocol::{ClientRequest, DevtoolsConnection, JsonPacketStream};
 
 /// Error replies.
 ///
@@ -50,7 +49,6 @@ impl ActorError {
 
 /// A common trait for all devtools actors that encompasses an immutable name
 /// and the ability to process messages that are directed to particular actors.
-/// TODO: ensure the name is immutable
 pub(crate) trait Actor: Any + ActorAsAny + Send + Sync + MallocSizeOf {
     fn handle_message(
         &self,
@@ -158,11 +156,19 @@ impl ActorRegistry {
     }
 
     /// Create a unique name based on a monotonically increasing suffix
-    /// TODO: Merge this with `register/register_later` and don't allow to
+    /// TODO: Merge this with `register` and don't allow to
     /// create new names without registering an actor.
     pub fn new_name<T: Actor>(&self) -> String {
         let suffix = self.next.fetch_add(1, Ordering::Relaxed);
-        format!("{}{}", Self::base_name::<T>(), suffix)
+        let base = Self::base_name::<T>();
+
+        // Firefox DevTools client requires "/workerTarget" in actor name to recognize workers
+        // <https://searchfox.org/firefox-main/source/devtools/client/fronts/watcher.js#65>
+        if base.contains("WorkerTarget") {
+            format!("/workerTarget{}", suffix)
+        } else {
+            format!("{}{}", base, suffix)
+        }
     }
 
     /// Add an actor to the registry of known actors that can receive messages.
@@ -198,7 +204,7 @@ impl ActorRegistry {
     pub(crate) fn handle_message(
         &self,
         msg: &Map<String, Value>,
-        stream: &mut TcpStream,
+        stream: &mut DevtoolsConnection,
         stream_id: StreamId,
     ) -> Result<(), ()> {
         let to = match msg.get("to") {
@@ -221,7 +227,7 @@ impl ActorRegistry {
             },
             Some(actor) => {
                 let msg_type = msg.get("type").unwrap().as_str().unwrap();
-                if let Err(error) = ClientRequest::handle(stream, to, |req| {
+                if let Err(error) = ClientRequest::handle(stream.clone(), to, |req| {
                     actor.handle_message(req, self, msg_type, msg, stream_id)
                 }) {
                     // <https://firefox-source-docs.mozilla.org/devtools/backend/protocol.html#error-packets>

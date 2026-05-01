@@ -7,13 +7,15 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
 
-use base::generic_channel::GenericSender;
 use malloc_size_of_derive::MallocSizeOf;
 use profile_traits::generic_callback::GenericCallback;
 use profile_traits::mem::ReportsChan;
 use serde::{Deserialize, Serialize};
+use servo_base::generic_channel::GenericSender;
 use servo_url::origin::ImmutableOrigin;
 use uuid::Uuid;
+
+use crate::client_storage::StorageProxyMap;
 
 // TODO Box<dyn Error> is not serializable, fix needs to be found
 pub type DbError = String;
@@ -206,7 +208,7 @@ impl IndexedDBKeyRange {
             lower: Some(key),
             upper: None,
             lower_open: open,
-            upper_open: false,
+            upper_open: true,
         }
     }
 
@@ -214,7 +216,7 @@ impl IndexedDBKeyRange {
         IndexedDBKeyRange {
             lower: None,
             upper: Some(key),
-            lower_open: false,
+            lower_open: true,
             upper_open: open,
         }
     }
@@ -425,7 +427,7 @@ pub enum ConnectionMsg {
         version: u64,
         old_version: u64,
     },
-    /// A backend error related to the database occured.
+    /// A backend error related to the database occurred.
     DatabaseError {
         name: String,
         id: Uuid,
@@ -577,13 +579,18 @@ pub enum SyncOperation {
         Option<u64>,
         // The id of the request.
         Uuid,
+        // The Storage proxy map.
+        StorageProxyMap,
     ),
 
     /// Deletes the database
     DeleteDatabase(
         GenericCallback<BackendResult<u64>>,
         ImmutableOrigin,
-        String, // Database
+        // Database name.
+        String,
+        // The Storage proxy map.
+        StorageProxyMap,
         Uuid,
     ),
 
@@ -598,13 +605,7 @@ pub enum SyncOperation {
     AbortPendingUpgrades {
         pending_upgrades: HashMap<String, HashSet<Uuid>>,
         origin: ImmutableOrigin,
-    },
-
-    /// Abort the current pending upgrade.
-    AbortPendingUpgrade {
-        name: String,
-        id: Uuid,
-        origin: ImmutableOrigin,
+        proxy_map: StorageProxyMap,
     },
 
     NotifyEndOfVersionChange {

@@ -46,7 +46,7 @@ mod from_embedder {
         };
     }
 
-    impl LogTarget for constellation_traits::EmbedderToConstellationMessage {
+    impl LogTarget for servo_constellation_traits::EmbedderToConstellationMessage {
         fn log_target(&self) -> &'static str {
             match self {
                 Self::Exit => target!("Exit"),
@@ -120,7 +120,7 @@ mod from_script {
         };
     }
 
-    impl LogTarget for constellation_traits::ScriptToConstellationMessage {
+    impl LogTarget for servo_constellation_traits::ScriptToConstellationMessage {
         fn log_target(&self) -> &'static str {
             match self {
                 Self::CompleteMessagePortTransfer(..) => target!("CompleteMessagePortTransfer"),
@@ -141,13 +141,18 @@ mod from_script {
                     target!("RemoveBroadcastChannelNameInRouter")
                 },
                 Self::ScheduleBroadcast(..) => target!("ScheduleBroadcast"),
+                Self::RegisterInterest(..) => target!("RegisterInterest"),
+                Self::UnregisterInterest(..) => target!("UnregisterInterest"),
                 Self::BroadcastStorageEvent(..) => target!("BroadcastStorageEvent"),
                 Self::ChangeRunningAnimationsState(..) => target!("ChangeRunningAnimationsState"),
                 Self::CreateCanvasPaintThread(..) => target!("CreateCanvasPaintThread"),
-                Self::Focus(..) => target!("Focus"),
-                Self::FocusRemoteDocument(..) => target!("FocusRemoteDocument"),
+                Self::FocusAncestorBrowsingContextsForFocusingSteps(..) => {
+                    target!("FocusAncestorBrowsingContextsForFocusingSteps")
+                },
+                Self::FocusRemoteBrowsingContext(..) => target!("FocusRemoteBrowsingContext"),
                 Self::GetTopForBrowsingContext(..) => target!("GetTopForBrowsingContext"),
                 Self::GetBrowsingContextInfo(..) => target!("GetBrowsingContextInfo"),
+                Self::GetDocumentOrigin(..) => target!("GetDocumentOrigin"),
                 Self::GetChildBrowsingContextId(..) => target!("GetChildBrowsingContextId"),
                 Self::LoadComplete => target!("LoadComplete"),
                 Self::LoadUrl(..) => target!("LoadUrl"),
@@ -186,6 +191,8 @@ mod from_script {
                     target!("RespondToScreenshotReadinessRequest")
                 },
                 Self::TriggerGarbageCollection => target!("TriggerGarbageCollection"),
+                Self::AcquireWakeLock(..) => target!("AcquireWakeLock"),
+                Self::ReleaseWakeLock(..) => target!("ReleaseWakeLock"),
             }
         }
     }

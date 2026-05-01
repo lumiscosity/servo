@@ -283,6 +283,11 @@ async function createProofreader(options = {}) {
   return await Proofreader.create(options);
 }
 
+async function createClassifier(options = {}) {
+  await test_driver.bless();
+  return await Classifier.create(options);
+}
+
 async function ensureLanguageModel(options = {}) {
   assert_true(!!LanguageModel);
   const availability = await LanguageModel.availability(options);
@@ -319,13 +324,6 @@ async function testCreateAbort(t, createMethod, options, instanceMethods) {
   for (const promise of promises) {
     await promise_rejects_exactly(t, error, promise);
   }
-}
-
-// Helper function to check that 'actual' is within 'expected +/- delta'.
-function isValueInRange(actual, expected, delta = 5) {
-  const lowerBound = expected - delta;
-  const upperBound = expected + delta;
-  return actual >= lowerBound && actual <= upperBound;
 }
 
 function consumeTransientUserActivation() {

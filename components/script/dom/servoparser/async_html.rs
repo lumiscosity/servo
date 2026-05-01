@@ -79,6 +79,7 @@ enum ParseOperation {
         name: QualName,
         attrs: Vec<Attribute>,
         current_line: u64,
+        had_duplicate_attributes: bool,
     },
     CreateComment {
         text: String,
@@ -405,7 +406,12 @@ impl Tokenizer {
         })
     }
 
-    fn append_before_sibling(&self, sibling: ParseNodeId, node: NodeOrText, can_gc: CanGc) {
+    fn append_before_sibling(
+        &self,
+        cx: &mut js::context::JSContext,
+        sibling: ParseNodeId,
+        node: NodeOrText,
+    ) {
         let node = match node {
             NodeOrText::Node(n) => {
                 HtmlNodeOrText::AppendNode(Dom::from_ref(&**self.get_node(&n.id)))
@@ -418,16 +424,16 @@ impl Tokenizer {
             .expect("append_before_sibling called on node without parent");
 
         super::insert(
+            cx,
             parent,
             Some(sibling),
             node,
             self.parsing_algorithm,
             &self.custom_element_reaction_stack,
-            can_gc,
         );
     }
 
-    fn append(&self, parent: ParseNodeId, node: NodeOrText, can_gc: CanGc) {
+    fn append(&self, cx: &mut js::context::JSContext, parent: ParseNodeId, node: NodeOrText) {
         let node = match node {
             NodeOrText::Node(n) => {
                 HtmlNodeOrText::AppendNode(Dom::from_ref(&**self.get_node(&n.id)))
@@ -437,12 +443,12 @@ impl Tokenizer {
 
         let parent = &**self.get_node(&parent);
         super::insert(
+            cx,
             parent,
             None,
             node,
             self.parsing_algorithm,
             &self.custom_element_reaction_stack,
-            can_gc,
         );
     }
 
@@ -470,16 +476,14 @@ impl Tokenizer {
                 let template = target
                     .downcast::<HTMLTemplateElement>()
                     .expect("Tried to extract contents from non-template element while parsing");
-                self.insert_node(
-                    contents,
-                    Dom::from_ref(template.Content(CanGc::from_cx(cx)).upcast()),
-                );
+                self.insert_node(contents, Dom::from_ref(template.Content(cx).upcast()));
             },
             ParseOperation::CreateElement {
                 node,
                 name,
                 attrs,
                 current_line,
+                had_duplicate_attributes,
             } => {
                 self.current_line.set(current_line);
                 let attrs = attrs
@@ -493,20 +497,20 @@ impl Tokenizer {
                     ElementCreator::ParserCreated(current_line),
                     ParsingAlgorithm::Normal,
                     &self.custom_element_reaction_stack,
+                    had_duplicate_attributes,
                     cx,
                 );
                 self.insert_node(node, Dom::from_ref(element.upcast()));
             },
             ParseOperation::CreateComment { text, node } => {
-                let comment =
-                    Comment::new(DOMString::from(text), document, None, CanGc::from_cx(cx));
+                let comment = Comment::new(cx, DOMString::from(text), document, None);
                 self.insert_node(node, Dom::from_ref(comment.upcast()));
             },
             ParseOperation::AppendBeforeSibling { sibling, node } => {
-                self.append_before_sibling(sibling, node, CanGc::from_cx(cx));
+                self.append_before_sibling(cx, sibling, node);
             },
             ParseOperation::Append { parent, node } => {
-                self.append(parent, node, CanGc::from_cx(cx));
+                self.append(cx, parent, node);
             },
             ParseOperation::AppendBasedOnParentNode {
                 element,
@@ -514,9 +518,9 @@ impl Tokenizer {
                 node,
             } => {
                 if self.has_parent_node(element) {
-                    self.append_before_sibling(element, node, CanGc::from_cx(cx));
+                    self.append_before_sibling(cx, element, node);
                 } else {
-                    self.append(prev_element, node, CanGc::from_cx(cx));
+                    self.append(cx, prev_element, node);
                 }
             },
             ParseOperation::AppendDoctypeToDocument {
@@ -525,16 +529,16 @@ impl Tokenizer {
                 system_id,
             } => {
                 let doctype = DocumentType::new(
+                    cx,
                     DOMString::from(name),
                     Some(DOMString::from(public_id)),
                     Some(DOMString::from(system_id)),
                     document,
-                    CanGc::from_cx(cx),
                 );
 
                 document
                     .upcast::<Node>()
-                    .AppendChild(doctype.upcast(), CanGc::from_cx(cx))
+                    .AppendChild(cx, doctype.upcast())
                     .expect("Appending failed");
             },
             ParseOperation::AddAttrsIfMissing { target, attrs } => {
@@ -553,9 +557,7 @@ impl Tokenizer {
             },
             ParseOperation::RemoveFromParent { target } => {
                 if let Some(ref parent) = self.get_node(&target).GetParentNode() {
-                    parent
-                        .RemoveChild(&self.get_node(&target), CanGc::from_cx(cx))
-                        .unwrap();
+                    parent.RemoveChild(cx, &self.get_node(&target)).unwrap();
                 }
             },
             ParseOperation::MarkScriptAlreadyStarted { node } => {
@@ -569,7 +571,7 @@ impl Tokenizer {
                 let parent = self.get_node(&parent);
                 let new_parent = self.get_node(&new_parent);
                 while let Some(child) = parent.GetFirstChild() {
-                    new_parent.AppendChild(&child, CanGc::from_cx(cx)).unwrap();
+                    new_parent.AppendChild(cx, &child).unwrap();
                 }
             },
             ParseOperation::AssociateWithForm {
@@ -606,10 +608,10 @@ impl Tokenizer {
             },
             ParseOperation::CreatePI { node, target, data } => {
                 let pi = ProcessingInstruction::new(
+                    cx,
                     DOMString::from(target),
                     DOMString::from(data),
                     document,
-                    CanGc::from_cx(cx),
                 );
                 self.insert_node(node, Dom::from_ref(pi.upcast()));
             },
@@ -633,7 +635,7 @@ impl Tokenizer {
                     .collect();
 
                 let did_succeed =
-                    attach_declarative_shadow_inner(&location, &template, &attributes);
+                    attach_declarative_shadow_inner(cx, &location, &template, &attributes);
                 sender.send(did_succeed).unwrap();
             },
         }
@@ -833,7 +835,7 @@ impl TreeSink for Sink {
         &self,
         name: QualName,
         html_attrs: Vec<HtmlAttribute>,
-        _flags: ElementFlags,
+        flags: ElementFlags,
     ) -> Self::Handle {
         let mut node = self.new_parse_node();
         node.qual_name = Some(name.clone());
@@ -859,6 +861,7 @@ impl TreeSink for Sink {
             name,
             attrs,
             current_line: self.current_line.get(),
+            had_duplicate_attributes: flags.had_duplicate_attributes,
         });
         node
     }

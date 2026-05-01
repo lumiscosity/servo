@@ -37,19 +37,19 @@ impl HTMLAudioElement {
     }
 
     pub(crate) fn new(
+        cx: &mut js::context::JSContext,
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
     ) -> DomRoot<HTMLAudioElement> {
         Node::reflect_node_with_proto(
+            cx,
             Box::new(HTMLAudioElement::new_inherited(
                 local_name, prefix, document,
             )),
             document,
             proto,
-            can_gc,
         )
     }
 }
@@ -68,13 +68,13 @@ impl HTMLAudioElementMethods<crate::DomTypeHolder> for HTMLAudioElement {
         // Step 2. Let audio be the result of creating an element given document, "audio", and the
         // HTML namespace.
         let audio = Element::create(
+            cx,
             QualName::new(None, ns!(html), local_name!("audio")),
             None,
             &document,
             ElementCreator::ScriptCreated,
             CustomElementCreationMode::Synchronous,
             proto,
-            CanGc::from_cx(cx),
         );
 
         // Step 3. Set an attribute value for audio using "preload" and "auto".

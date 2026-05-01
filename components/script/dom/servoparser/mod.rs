@@ -7,8 +7,6 @@ use std::cell::{Cell, RefCell};
 use std::mem;
 use std::rc::Rc;
 
-use base::cross_process_instant::CrossProcessInstant;
-use base::id::{PipelineId, WebViewId};
 use base64::Engine as _;
 use base64::engine::general_purpose;
 use content_security_policy::sandboxing_directive::SandboxingFlagSet;
@@ -35,8 +33,11 @@ use profile_traits::time::{
 use profile_traits::time_profile;
 use script_bindings::script_runtime::temp_cx;
 use script_traits::DocumentActivity;
+use servo_base::cross_process_instant::CrossProcessInstant;
+use servo_base::id::{PipelineId, WebViewId};
 use servo_config::pref;
-use servo_url::ServoUrl;
+use servo_constellation_traits::{LoadOrigin, TargetSnapshotParams};
+use servo_url::{MutableOrigin, ServoUrl};
 use style::context::QuirksMode as ServoQuirksMode;
 use tendril::stream::LossyDecoder;
 use tendril::{ByteTendril, TendrilSink};
@@ -61,7 +62,7 @@ use crate::dom::bindings::settings_stack::is_execution_stack_empty;
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::characterdata::CharacterData;
 use crate::dom::comment::Comment;
-use crate::dom::csp::{GlobalCspReporting, Violation, parse_csp_list_from_metadata};
+use crate::dom::csp::{Violation, parse_csp_list_from_metadata};
 use crate::dom::customelementregistry::CustomElementReactionStack;
 use crate::dom::document::{Document, DocumentSource, HasBrowsingContext, IsHTMLDocument};
 use crate::dom::documentfragment::DocumentFragment;
@@ -79,11 +80,14 @@ use crate::dom::processinginstruction::ProcessingInstruction;
 use crate::dom::processingoptions::{
     LinkHeader, LinkProcessingPhase, extract_links_from_headers, process_link_headers,
 };
-use crate::dom::reportingendpoint::ReportingEndpoint;
+use crate::dom::reporting::reportingendpoint::ReportingEndpoint;
+use crate::dom::security::csp::CspReporting;
+use crate::dom::security::xframeoptions::check_a_navigation_response_adherence_to_x_frame_options;
 use crate::dom::shadowroot::IsUserAgentWidget;
 use crate::dom::text::Text;
 use crate::dom::types::{HTMLElement, HTMLMediaElement, HTMLOptionElement};
 use crate::dom::virtualmethods::vtable_for;
+use crate::navigation::determine_the_origin;
 use crate::network_listener::FetchResponseListener;
 use crate::realms::{enter_auto_realm, enter_realm};
 use crate::script_runtime::{CanGc, IntroductionType};
@@ -322,7 +326,7 @@ impl ServoParser {
             ParserKind::ScriptCreated,
             None,
             None,
-            CanGc::note(),
+            CanGc::deprecated_note(),
         );
         document.set_current_parser(Some(&parser));
     }
@@ -391,7 +395,7 @@ impl ServoParser {
         assert_eq!(script_nesting_level, 0);
 
         self.script_nesting_level.set(script_nesting_level + 1);
-        script.execute(result, CanGc::from_cx(cx));
+        script.execute(cx, result);
         self.script_nesting_level.set(script_nesting_level);
 
         if !self.suspended.get() && !self.aborted.get() {
@@ -482,7 +486,7 @@ impl ServoParser {
 
         // Step 2.
         self.document
-            .set_ready_state(DocumentReadyState::Interactive, CanGc::from_cx(cx));
+            .set_ready_state(cx, DocumentReadyState::Interactive);
 
         // Step 3.
         self.tokenizer.end(cx);
@@ -490,7 +494,7 @@ impl ServoParser {
 
         // Step 4.
         self.document
-            .set_ready_state(DocumentReadyState::Complete, CanGc::from_cx(cx));
+            .set_ready_state(cx, DocumentReadyState::Complete);
     }
 
     // https://html.spec.whatwg.org/multipage/#active-parser
@@ -729,7 +733,7 @@ impl ServoParser {
             script.set_initial_script_text();
             let introduction_type_override =
                 (script_nesting_level > 0).then_some(IntroductionType::INJECTED_SCRIPT);
-            script.prepare(introduction_type_override, CanGc::from_cx(cx));
+            script.prepare(cx, introduction_type_override);
             self.script_nesting_level.set(script_nesting_level);
 
             if self.document.has_pending_parsing_blocking_script() {
@@ -752,7 +756,7 @@ impl ServoParser {
 
         // Step 1.
         self.document
-            .set_ready_state(DocumentReadyState::Interactive, CanGc::from_cx(cx));
+            .set_ready_state(cx, DocumentReadyState::Interactive);
 
         // Step 2.
         self.tokenizer.end(cx);
@@ -792,9 +796,13 @@ where
 {
     type Item = DomRoot<Node>;
 
+    #[expect(unsafe_code)]
     fn next(&mut self) -> Option<DomRoot<Node>> {
+        let mut cx = unsafe { script_bindings::script_runtime::temp_cx() };
+        let cx = &mut cx;
+
         let next = self.inner.next()?;
-        next.remove_self(CanGc::note());
+        next.remove_self(cx);
         Some(next)
     }
 
@@ -917,6 +925,10 @@ pub(crate) struct ParserContext {
     pushed_entry_index: Option<usize>,
     /// params required in document load algorithms
     navigation_params: NavigationParams,
+    /// To report CSP violations to the global that initiated the navigation
+    parent_info: Option<PipelineId>,
+    target_snapshot_params: TargetSnapshotParams,
+    load_origin: LoadOrigin,
 }
 
 impl ParserContext {
@@ -925,6 +937,9 @@ impl ParserContext {
         pipeline_id: PipelineId,
         url: ServoUrl,
         creation_sandboxing_flag_set: SandboxingFlagSet,
+        parent_info: Option<PipelineId>,
+        target_snapshot_params: TargetSnapshotParams,
+        load_origin: LoadOrigin,
     ) -> ParserContext {
         ParserContext {
             parser: None,
@@ -933,6 +948,7 @@ impl ParserContext {
             webview_id,
             pipeline_id,
             url,
+            parent_info,
             pushed_entry_index: None,
             navigation_params: NavigationParams {
                 policy_container: Default::default(),
@@ -942,6 +958,8 @@ impl ParserContext {
                 resource_header: vec![],
                 about_base_url: Default::default(),
             },
+            target_snapshot_params,
+            load_origin,
         }
     }
 
@@ -960,6 +978,10 @@ impl ParserContext {
         self.parser
             .as_ref()
             .map(|parser| parser.root().document.as_rooted())
+    }
+
+    pub(crate) fn parent_info(&self) -> Option<PipelineId> {
+        self.parent_info
     }
 
     /// <https://html.spec.whatwg.org/multipage/#creating-a-policy-container-from-a-fetch-response>
@@ -1042,9 +1064,11 @@ impl ParserContext {
             // Return the result of loading an XML document given navigationParams and type.
             MediaType::Xml => self.load_xml_document(parser),
             // Return the result of loading a text document given navigationParams and type.
-            MediaType::JavaScript | MediaType::Json | MediaType::Text | MediaType::Css => {
+            MediaType::JavaScript | MediaType::Text | MediaType::Css => {
                 self.load_text_document(parser, cx)
             },
+            // Return the result of loading a json document given navigationParams and type.
+            MediaType::Json => self.load_json_document(parser, cx),
             // Return the result of loading a media document given navigationParams and type.
             MediaType::Image | MediaType::AudioVideo => {
                 self.load_media_document(parser, media_type, &mime_type, cx);
@@ -1125,6 +1149,7 @@ impl ParserContext {
         self.initialize_document_object(&parser.document);
         // Step 8. Act as if the user agent had stopped parsing document.
         self.is_synthesized_document = true;
+        parser.last_chunk_received.set(true);
         // Step 3. Populate with html/head/body given document.
         let page = "<html><body></body></html>".into();
         parser.push_string_input_chunk(page);
@@ -1135,57 +1160,64 @@ impl ParserContext {
         // to the address of the image, video, or audio resource.
         let node = if media_type == MediaType::Image {
             let img = Element::create(
+                cx,
                 QualName::new(None, ns!(html), local_name!("img")),
                 None,
                 doc,
                 ElementCreator::ParserCreated(1),
                 CustomElementCreationMode::Asynchronous,
                 None,
-                CanGc::from_cx(cx),
             );
             let img = DomRoot::downcast::<HTMLImageElement>(img).unwrap();
-            img.SetSrc(USVString(self.url.to_string()));
+            img.SetSrc(cx, USVString(self.url.to_string()));
             DomRoot::upcast::<Node>(img)
         } else if mime_type.type_() == mime::AUDIO {
             let audio = Element::create(
+                cx,
                 QualName::new(None, ns!(html), local_name!("audio")),
                 None,
                 doc,
                 ElementCreator::ParserCreated(1),
                 CustomElementCreationMode::Asynchronous,
                 None,
-                CanGc::from_cx(cx),
             );
             let audio = DomRoot::downcast::<HTMLMediaElement>(audio).unwrap();
-            audio.SetControls(true);
-            audio.SetSrc(USVString(self.url.to_string()));
+            audio.SetControls(cx, true);
+            audio.SetSrc(cx, USVString(self.url.to_string()));
             DomRoot::upcast::<Node>(audio)
         } else {
             let video = Element::create(
+                cx,
                 QualName::new(None, ns!(html), local_name!("video")),
                 None,
                 doc,
                 ElementCreator::ParserCreated(1),
                 CustomElementCreationMode::Asynchronous,
                 None,
-                CanGc::from_cx(cx),
             );
             let video = DomRoot::downcast::<HTMLMediaElement>(video).unwrap();
-            video.SetControls(true);
-            video.SetSrc(USVString(self.url.to_string()));
+            video.SetControls(cx, true);
+            video.SetSrc(cx, USVString(self.url.to_string()));
             DomRoot::upcast::<Node>(video)
         };
         // Step 4. Append an element host element for the media, as described below, to the body element.
         let doc_body = DomRoot::upcast::<Node>(doc.GetBody().unwrap());
-        doc_body
-            .AppendChild(&node, CanGc::from_cx(cx))
-            .expect("Appending failed");
+        doc_body.AppendChild(cx, &node).expect("Appending failed");
         // Step 7. Process link headers given document, navigationParams's response, and "media".
         let link_headers = std::mem::take(&mut self.navigation_params.link_headers);
         process_link_headers(&link_headers, doc, LinkProcessingPhase::Media);
     }
 
-    /// <https://html.spec.whatwg.org/multipage/#read-ua-inline>
+    /// Load a JSON document with a pretty-printing, interactive viewer.
+    fn load_json_document(&mut self, parser: &ServoParser, cx: &mut js::context::JSContext) {
+        self.initialize_document_object(&parser.document);
+        parser.push_string_input_chunk(resources::read_string(Resource::JsonViewerHTML));
+        parser.parse_sync(cx);
+        parser.tokenizer.set_plaintext_state();
+        self.process_link_headers_in_media_phase_with_task(&parser.document);
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#navigate-ua-inline>
     fn load_inline_unknown_content(
         &mut self,
         parser: &ServoParser,
@@ -1193,7 +1225,10 @@ impl ParserContext {
         cx: &mut js::context::JSContext,
     ) {
         self.is_synthesized_document = true;
+        parser.document.mark_as_internal();
         parser.push_string_input_chunk(page);
+        // Step 7. Act as if the user agent had stopped parsing document.
+        parser.last_chunk_received.set(true);
         parser.parse_sync(cx);
     }
 
@@ -1214,7 +1249,7 @@ impl ParserContext {
             &document.global(),
             CrossProcessInstant::now(),
             document,
-            CanGc::note(),
+            CanGc::deprecated_note(),
         );
         self.pushed_entry_index = document
             .global()
@@ -1226,14 +1261,15 @@ impl ParserContext {
 impl FetchResponseListener for ParserContext {
     fn process_request_body(&mut self, _: RequestId) {}
 
-    fn process_request_eof(&mut self, _: RequestId) {}
-
-    #[expect(unsafe_code)]
-    fn process_response(&mut self, _: RequestId, meta_result: Result<FetchMetadata, NetworkError>) {
-        // TODO: https://github.com/servo/servo/issues/42840
-        let mut cx = unsafe { temp_cx() };
-        let cx = &mut cx;
-        let (metadata, error) = match meta_result {
+    /// Implements parts of
+    /// <https://html.spec.whatwg.org/multipage/#attempt-to-populate-the-history-entry's-document>
+    fn process_response(
+        &mut self,
+        cx: &mut js::context::JSContext,
+        _: RequestId,
+        meta_result: Result<FetchMetadata, NetworkError>,
+    ) {
+        let (metadata, mut error) = match meta_result {
             Ok(meta) => (
                 Some(match meta {
                     FetchMetadata::Unfiltered(m) => m,
@@ -1263,6 +1299,10 @@ impl FetchResponseListener for ParserContext {
             .map(Serde::into_inner)
             .map(Into::into);
 
+        // <https://html.spec.whatwg.org/multipage/#create-navigation-params-by-fetching>
+        // Step 21.9. Set responsePolicyContainer to the result of creating a
+        // policy container from a fetch response given response and request's
+        // reserved client.
         let (policy_container, endpoints_list, link_headers) = match metadata.as_ref() {
             None => (PolicyContainer::default(), None, vec![]),
             Some(metadata) => (
@@ -1275,10 +1315,36 @@ impl FetchResponseListener for ParserContext {
             ),
         };
 
+        // Step 21.10. Set finalSandboxFlags to the union of targetSnapshotParams's
+        // sandboxing flags and responsePolicyContainer's CSP list's CSP-derived
+        // sandboxing flags.
+        let final_sandboxing_flag_set = policy_container
+            .csp_list
+            .as_ref()
+            .and_then(|csp| csp.get_sandboxing_flag_set_for_document())
+            .unwrap_or(SandboxingFlagSet::empty())
+            .union(self.target_snapshot_params.sandboxing_flags);
+
+        // Step 21.11. Set responseOrigin to the result of determining the origin
+        // given response's URL, finalSandboxFlags, and entry's document state's
+        // initiator origin.
+        let source_origin = match self.load_origin {
+            LoadOrigin::Script(ref snapshot) => {
+                Some(MutableOrigin::from_snapshot(snapshot.clone()))
+            },
+            _ => None,
+        };
+        let origin = determine_the_origin(
+            metadata.as_ref().map(|metadata| &metadata.final_url),
+            final_sandboxing_flag_set,
+            source_origin,
+        );
+
         let parser = match ScriptThread::page_headers_available(
             self.webview_id,
             self.pipeline_id,
-            metadata,
+            metadata.as_ref(),
+            origin.clone(),
             cx,
         ) {
             Some(parser) => parser,
@@ -1290,20 +1356,49 @@ impl FetchResponseListener for ParserContext {
 
         let mut realm = enter_auto_realm(cx, &*parser.document);
         let cx = &mut realm;
-        let window = parser.document.window();
+        let document = &parser.document;
+        let window = document.window();
 
-        // From Step 23.8.3 of https://html.spec.whatwg.org/multipage/#navigate
-        // Let finalSandboxFlags be the union of targetSnapshotParams's sandboxing flags and
-        // policyContainer's CSP list's CSP-derived sandboxing flags.
-        //
-        // TODO: This deviates a bit from the specification, because there isn't a `targetSnapshotParam`
-        // concept yet.
-        let final_sandboxing_flag_set = policy_container
-            .csp_list
-            .as_ref()
-            .and_then(|csp| csp.get_sandboxing_flag_set_for_document())
-            .unwrap_or(SandboxingFlagSet::empty())
-            .union(parser.document.creation_sandboxing_flag_set());
+        // https://html.spec.whatwg.org/multipage/#attempt-to-populate-the-history-entry%27s-document
+        // Step 4. Otherwise, if any of the following are true:
+        if
+        // navigationParams is null;
+        // TODO
+        // the result of should navigation response to navigation request of
+        // type in target be blocked by Content Security Policy? given
+        // navigationParams's request, navigationParams's response, navigationParams's policy container's CSP list,
+        // cspNavigationType, and navigable is "Blocked";
+        policy_container.csp_list.should_navigation_response_to_navigation_request_be_blocked(
+            window,
+            self.url.clone().into_url(),
+            &origin.immutable().clone().into_url_origin(),
+        )
+        // navigationParams's reserved environment is non-null and the result of
+        // checking a navigation response's adherence to its embedder policy given navigationParams's response,
+        // navigable, and navigationParams's policy container's embedder policy is false; or
+        // TODO
+        // the result of checking a navigation response's adherence to `X-Frame-Options`
+        // given navigationParams's response, navigable, navigationParams's policy container's CSP list,
+        // and navigationParams's origin is false,
+        || !check_a_navigation_response_adherence_to_x_frame_options(
+            window,
+            policy_container.csp_list.as_ref(),
+            &origin,
+            metadata
+                .as_ref()
+                .and_then(|metadata| metadata.headers.as_ref()),
+        ) {
+            // Step 4.1. Set entry's document state's document to the result of creating a document for inline content
+            // that doesn't have a DOM, given navigable, null, navTimingType, and userInvolvement.
+            // The inline content should indicate to the user the sort of error that occurred.
+            error = Some(NetworkError::ContentSecurityPolicy);
+            // Step 4.2. Make document unsalvageable given entry's document state's document and "navigation-failure".
+            document.make_document_unsalvageable();
+            // Step 4.3. Set saveExtraDocumentState to false.
+            // TODO
+            // Step 4.4. If navigationParams is not null, then:
+            // TODO
+        }
 
         if let Some(endpoints) = endpoints_list {
             window.set_endpoints_list(endpoints);
@@ -1314,7 +1409,7 @@ impl FetchResponseListener for ParserContext {
             content_type,
             final_sandboxing_flag_set,
             link_headers,
-            about_base_url: parser.document.about_base_url(),
+            about_base_url: document.about_base_url(),
             resource_header: vec![],
         };
         self.submit_resource_timing();
@@ -1383,11 +1478,12 @@ impl FetchResponseListener for ParserContext {
         }
     }
 
-    #[expect(unsafe_code)]
-    fn process_response_chunk(&mut self, _: RequestId, payload: Vec<u8>) {
-        // TODO: https://github.com/servo/servo/issues/42841
-        let mut cx = unsafe { temp_cx() };
-        let cx = &mut cx;
+    fn process_response_chunk(
+        &mut self,
+        cx: &mut js::context::JSContext,
+        _: RequestId,
+        payload: Vec<u8>,
+    ) {
         if self.is_synthesized_document {
             return;
         }
@@ -1425,7 +1521,7 @@ impl FetchResponseListener for ParserContext {
             Some(parser) => parser.root(),
             None => return,
         };
-        if parser.aborted.get() {
+        if parser.aborted.get() || self.is_synthesized_document {
             return;
         }
 
@@ -1470,15 +1566,8 @@ impl FetchResponseListener for ParserContext {
         }
     }
 
-    fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<Violation>) {
-        let parser = match self.parser.as_ref() {
-            Some(parser) => parser.root(),
-            None => return,
-        };
-        let document = &parser.document;
-        let global = &document.global();
-        // TODO(https://github.com/w3c/webappsec-csp/issues/687): Update after spec is resolved
-        global.report_csp_violations(violations, None, None);
+    fn process_csp_violations(&mut self, _: RequestId, _: Vec<Violation>) {
+        unreachable!("Script_thread should handle reporting violations for parser contexts");
     }
 }
 
@@ -1490,12 +1579,12 @@ pub(crate) struct FragmentContext<'a> {
 
 #[cfg_attr(crown, expect(crown::unrooted_must_root))]
 fn insert(
+    cx: &mut js::context::JSContext,
     parent: &Node,
     reference_child: Option<&Node>,
     child: NodeOrText<Dom<Node>>,
     parsing_algorithm: ParsingAlgorithm,
     custom_element_reaction_stack: &CustomElementReactionStack,
-    can_gc: CanGc,
 ) {
     match child {
         NodeOrText::AppendNode(n) => {
@@ -1507,9 +1596,9 @@ fn insert(
             if element_in_non_fragment {
                 custom_element_reaction_stack.push_new_element_queue();
             }
-            parent.InsertBefore(&n, reference_child, can_gc).unwrap();
+            parent.InsertBefore(cx, &n, reference_child).unwrap();
             if element_in_non_fragment {
-                custom_element_reaction_stack.pop_current_element_queue(can_gc);
+                custom_element_reaction_stack.pop_current_element_queue(cx);
             }
         },
         NodeOrText::AppendText(t) => {
@@ -1522,9 +1611,9 @@ fn insert(
             if let Some(text) = text {
                 text.upcast::<CharacterData>().append_data(&t);
             } else {
-                let text = Text::new(String::from(t).into(), &parent.owner_doc(), can_gc);
+                let text = Text::new(cx, String::from(t).into(), &parent.owner_doc());
                 parent
-                    .InsertBefore(text.upcast(), reference_child, can_gc)
+                    .InsertBefore(cx, text.upcast(), reference_child)
                     .unwrap();
             }
         },
@@ -1559,6 +1648,7 @@ impl Sink {
 
 impl TreeSink for Sink {
     type Output = Self;
+
     #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     fn finish(self) -> Self {
         self
@@ -1570,17 +1660,19 @@ impl TreeSink for Sink {
     where
         Self: 'a;
 
-    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     fn get_document(&self) -> Dom<Node> {
         Dom::from_ref(self.document.upcast())
     }
 
-    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
+    #[expect(unsafe_code)]
     fn get_template_contents(&self, target: &Dom<Node>) -> Dom<Node> {
+        // TODO: https://github.com/servo/servo/issues/42839
+        let mut cx = unsafe { temp_cx() };
+        let cx = &mut cx;
         let template = target
             .downcast::<HTMLTemplateElement>()
             .expect("tried to get template contents of non-HTMLTemplateElement in HTML parsing");
-        Dom::from_ref(template.Content(CanGc::note()).upcast())
+        Dom::from_ref(template.Content(cx).upcast())
     }
 
     fn same_node(&self, x: &Dom<Node>, y: &Dom<Node>) -> bool {
@@ -1598,7 +1690,6 @@ impl TreeSink for Sink {
     }
 
     #[expect(unsafe_code)]
-    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     fn create_element(
         &self,
         name: QualName,
@@ -1624,30 +1715,37 @@ impl TreeSink for Sink {
             ElementCreator::ParserCreated(self.current_line.get()),
             parsing_algorithm,
             &self.custom_element_reaction_stack,
+            flags.had_duplicate_attributes,
             cx,
         );
         Dom::from_ref(element.upcast())
     }
 
-    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
+    #[expect(unsafe_code)]
     fn create_comment(&self, text: StrTendril) -> Dom<Node> {
+        // TODO: https://github.com/servo/servo/issues/42839
+        let mut cx = unsafe { temp_cx() };
+        let cx = &mut cx;
         let comment = Comment::new(
+            cx,
             DOMString::from(String::from(text)),
             &self.document,
             None,
-            CanGc::note(),
         );
         Dom::from_ref(comment.upcast())
     }
 
-    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
+    #[expect(unsafe_code)]
     fn create_pi(&self, target: StrTendril, data: StrTendril) -> Dom<Node> {
+        // TODO: https://github.com/servo/servo/issues/42839
+        let mut cx = unsafe { temp_cx() };
+        let cx = &mut cx;
         let doc = &*self.document;
         let pi = ProcessingInstruction::new(
+            cx,
             DOMString::from(String::from(target)),
             DOMString::from(String::from(data)),
             doc,
-            CanGc::note(),
         );
         Dom::from_ref(pi.upcast())
     }
@@ -1678,23 +1776,28 @@ impl TreeSink for Sink {
         let control = elem.and_then(|e| e.as_maybe_form_control());
 
         if let Some(control) = control {
-            control.set_form_owner_from_parser(&form, CanGc::note());
+            control.set_form_owner_from_parser(&form, CanGc::deprecated_note());
         }
     }
 
+    #[expect(unsafe_code)]
     #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     fn append_before_sibling(&self, sibling: &Dom<Node>, new_node: NodeOrText<Dom<Node>>) {
+        // TODO: https://github.com/servo/servo/issues/42839
+        let mut cx = unsafe { temp_cx() };
+        let cx = &mut cx;
+
         let parent = sibling
             .GetParentNode()
             .expect("append_before_sibling called on node without parent");
 
         insert(
+            cx,
             &parent,
             Some(sibling),
             new_node,
             self.parsing_algorithm,
             &self.custom_element_reaction_stack,
-            CanGc::note(),
         );
     }
 
@@ -1711,15 +1814,20 @@ impl TreeSink for Sink {
         self.document.set_quirks_mode(mode);
     }
 
+    #[expect(unsafe_code)]
     #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     fn append(&self, parent: &Dom<Node>, child: NodeOrText<Dom<Node>>) {
+        // TODO: https://github.com/servo/servo/issues/42839
+        let mut cx = unsafe { temp_cx() };
+        let cx = &mut cx;
+
         insert(
+            cx,
             parent,
             None,
             child,
             self.parsing_algorithm,
             &self.custom_element_reaction_stack,
-            CanGc::note(),
         );
     }
 
@@ -1737,22 +1845,27 @@ impl TreeSink for Sink {
         }
     }
 
+    #[expect(unsafe_code)]
     fn append_doctype_to_document(
         &self,
         name: StrTendril,
         public_id: StrTendril,
         system_id: StrTendril,
     ) {
+        // TODO: https://github.com/servo/servo/issues/42839
+        let mut cx = unsafe { temp_cx() };
+        let cx = &mut cx;
+
         let doc = &*self.document;
         let doctype = DocumentType::new(
+            cx,
             DOMString::from(String::from(name)),
             Some(DOMString::from(String::from(public_id))),
             Some(DOMString::from(String::from(system_id))),
             doc,
-            CanGc::note(),
         );
         doc.upcast::<Node>()
-            .AppendChild(doctype.upcast(), CanGc::note())
+            .AppendChild(cx, doctype.upcast())
             .expect("Appending failed");
     }
 
@@ -1765,14 +1878,19 @@ impl TreeSink for Sink {
                 attr.name,
                 DOMString::from(String::from(attr.value)),
                 None,
-                CanGc::note(),
+                CanGc::deprecated_note(),
             );
         }
     }
 
+    #[expect(unsafe_code)]
     fn remove_from_parent(&self, target: &Dom<Node>) {
+        // TODO: https://github.com/servo/servo/issues/42839
+        let mut cx = unsafe { temp_cx() };
+        let cx = &mut cx;
+
         if let Some(ref parent) = target.GetParentNode() {
-            parent.RemoveChild(target, CanGc::note()).unwrap();
+            parent.RemoveChild(cx, target).unwrap();
         }
     }
 
@@ -1783,9 +1901,14 @@ impl TreeSink for Sink {
         }
     }
 
+    #[expect(unsafe_code)]
     fn reparent_children(&self, node: &Dom<Node>, new_parent: &Dom<Node>) {
+        // TODO: https://github.com/servo/servo/issues/42839
+        let mut cx = unsafe { temp_cx() };
+        let cx = &mut cx;
+
         while let Some(ref child) = node.GetFirstChild() {
-            new_parent.AppendChild(child, CanGc::note()).unwrap();
+            new_parent.AppendChild(cx, child).unwrap();
         }
     }
 
@@ -1816,13 +1939,18 @@ impl TreeSink for Sink {
     /// <https://html.spec.whatwg.org/multipage/#parsing-main-inhead>
     /// A start tag whose tag name is "template"
     /// Attach shadow path
+    #[expect(unsafe_code)]
     fn attach_declarative_shadow(
         &self,
         host: &Dom<Node>,
         template: &Dom<Node>,
         attributes: &[Attribute],
     ) -> bool {
-        attach_declarative_shadow_inner(host, template, attributes)
+        // TODO: https://github.com/servo/servo/issues/42839
+        let mut cx = unsafe { temp_cx() };
+        let cx = &mut cx;
+
+        attach_declarative_shadow_inner(cx, host, template, attributes)
     }
 
     #[expect(unsafe_code)]
@@ -1846,6 +1974,7 @@ impl TreeSink for Sink {
 }
 
 /// <https://html.spec.whatwg.org/multipage/#create-an-element-for-the-token>
+#[expect(clippy::too_many_arguments)]
 fn create_element_for_token(
     name: QualName,
     attrs: Vec<ElementAttribute>,
@@ -1853,6 +1982,7 @@ fn create_element_for_token(
     creator: ElementCreator,
     parsing_algorithm: ParsingAlgorithm,
     custom_element_reaction_stack: &CustomElementReactionStack,
+    had_duplicate_attributes: bool,
     cx: &mut js::context::JSContext,
 ) -> DomRoot<Element> {
     // Step 1. If the active speculative HTML parser is not null, then return the result
@@ -1910,19 +2040,17 @@ fn create_element_for_token(
     } else {
         CustomElementCreationMode::Asynchronous
     };
-    let element = Element::create(
-        name,
-        is,
-        document,
-        creator,
-        creation_mode,
-        None,
-        CanGc::from_cx(cx),
-    );
+    let element = Element::create(cx, name, is, document, creator, creation_mode, None);
 
     // Step 11. Append each attribute in the given token to element.
     for attr in attrs {
         element.set_attribute_from_parser(attr.name, attr.value, None, CanGc::from_cx(cx));
+    }
+
+    // Record if the tokenizer saw duplicate attributes on this element,
+    // used for CSP nonce validation (step 3 of "is element nonceable").
+    if had_duplicate_attributes {
+        element.set_had_duplicate_attributes();
     }
 
     // Step 12. If willExecuteScript is true:
@@ -1931,7 +2059,7 @@ fn create_element_for_token(
         // custom element reactions stack. (This will be the same element queue as was
         // pushed above.)
         // Step 12.2 Invoke custom element reactions in queue.
-        custom_element_reaction_stack.pop_current_element_queue(CanGc::from_cx(cx));
+        custom_element_reaction_stack.pop_current_element_queue(cx);
         // Step 12.3. Decrement document's throw-on-dynamic-markup-insertion counter.
         document.decrement_throw_on_dynamic_markup_insertion_counter();
     }
@@ -1963,7 +2091,12 @@ fn create_element_for_token(
     element
 }
 
-fn attach_declarative_shadow_inner(host: &Node, template: &Node, attributes: &[Attribute]) -> bool {
+fn attach_declarative_shadow_inner(
+    cx: &mut js::context::JSContext,
+    host: &Node,
+    template: &Node,
+    attributes: &[Attribute],
+) -> bool {
     let host_element = host.downcast::<Element>().unwrap();
 
     if host_element.shadow_root().is_some() {
@@ -1972,34 +2105,28 @@ fn attach_declarative_shadow_inner(host: &Node, template: &Node, attributes: &[A
 
     let template_element = template.downcast::<HTMLTemplateElement>().unwrap();
 
-    // Step 3. Let mode be template start tag's shadowrootmode attribute's value.
-    // Step 4. Let clonable be true if template start tag has a shadowrootclonable attribute; otherwise false.
-    // Step 5. Let delegatesfocus be true if template start tag
-    // has a shadowrootdelegatesfocus attribute; otherwise false.
-    // Step 6. Let serializable be true if template start tag
-    // has a shadowrootserializable attribute; otherwise false.
+    // Step 3. Let mode be templateStartTag's shadowrootmode attribute's value.
+    // Step 4. Let slotAssignment be "named".
+    // Step 5. If templateStartTag's shadowrootslotassignment attribute is in
+    // the Manual state, then set slotAssignment to "manual".
+    // Step 6. Let clonable be true if templateStartTag has a shadowrootclonable attribute; otherwise false.
+    // Step 7. Let serializable be true if templateStartTag has a shadowrootserializable
+    // attribute; otherwise false.
+    // Step 8. Let delegatesFocus be true if templateStartTag has a shadowrootdelegatesfocus
+    // attribute; otherwise false.
     let mut shadow_root_mode = ShadowRootMode::Open;
+    let mut slot_assignment_mode = SlotAssignmentMode::Named;
     let mut clonable = false;
     let mut delegatesfocus = false;
     let mut serializable = false;
 
-    let attributes: Vec<ElementAttribute> = attributes
-        .iter()
-        .map(|attr| {
-            ElementAttribute::new(
-                attr.name.clone(),
-                DOMString::from(String::from(attr.value.clone())),
-            )
-        })
-        .collect();
-
     attributes
         .iter()
-        .for_each(|attr: &ElementAttribute| match attr.name.local {
+        .for_each(|attr: &Attribute| match attr.name.local {
             local_name!("shadowrootmode") => {
-                if attr.value.str().eq_ignore_ascii_case("open") {
+                if attr.value.eq_ignore_ascii_case("open") {
                     shadow_root_mode = ShadowRootMode::Open;
-                } else if attr.value.str().eq_ignore_ascii_case("closed") {
+                } else if attr.value.eq_ignore_ascii_case("closed") {
                     shadow_root_mode = ShadowRootMode::Closed;
                 } else {
                     unreachable!("shadowrootmode value is not open nor closed");
@@ -2014,19 +2141,24 @@ fn attach_declarative_shadow_inner(host: &Node, template: &Node, attributes: &[A
             local_name!("shadowrootserializable") => {
                 serializable = true;
             },
+            local_name!("shadowrootslotassignment") => {
+                if attr.value.eq_ignore_ascii_case("manual") {
+                    slot_assignment_mode = SlotAssignmentMode::Manual;
+                }
+            },
             _ => {},
         });
 
     // Step 8.1. Attach a shadow root with declarative shadow host element,
     // mode, clonable, serializable, delegatesFocus, and "named".
     match host_element.attach_shadow(
+        cx,
         IsUserAgentWidget::No,
         shadow_root_mode,
         clonable,
         serializable,
         delegatesfocus,
-        SlotAssignmentMode::Named,
-        CanGc::note(),
+        slot_assignment_mode,
     ) {
         Ok(shadow_root) => {
             // Step 8.3. Set shadow's declarative to true.

@@ -238,7 +238,7 @@ h6 { margin-top: 2.33em; margin-bottom: 2.33em; font-size: 0.67em; font-weight: 
 
 
 dir, dd, dl, dt, menu, ol, ul { display: block; }
-li { display: list-item; }
+li { display: list-item; text-align: match-parent; }
 
 dir, dl, menu, ol, ul { margin-top: 1em; margin-bottom: 1em; }
 
@@ -417,8 +417,19 @@ iframe:fullscreen {
 *::marker {
   text-align: end;
   text-align-last: end;
+  text-indent: 0;
   text-transform: none;
   unicode-bidi: isolate;
   font-variant-numeric: tabular-nums;
   white-space: pre;
+}
+
+/* https://html.spec.whatwg.org/multipage/#the-marquee-element-2 */
+marquee {
+  display: inline-block;
+  text-align: initial;
+  overflow: hidden !important;
+  inline-size: stretch;
+  vertical-align: text-bottom;
+  white-space: nowrap;
 }

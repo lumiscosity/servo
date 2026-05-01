@@ -2,8 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! Configuration options for a single run of the servo application. Created
-//! from command line arguments.
+//! Options are global configuration options that are initialized once and cannot be changed at
+//! runtime.
 
 use std::default::Default;
 use std::path::PathBuf;
@@ -11,27 +11,20 @@ use std::process;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
-use servo_url::ServoUrl;
 
-/// Global flags for Servo, currently set on the command line.
+/// The set of global options supported by Servo. The values for these can be configured during
+/// initialization of Servo and cannot be changed later at runtime.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Opts {
-    /// `None` to disable the time profiler or `Some` to enable it with:
+    /// `None` to disable the time profiler or `Some` to enable it with either:
     ///
     ///  - an interval in seconds to cause it to produce output on that interval.
-    ///    (`i.e. -p 5`).
     ///  - a file path to write profiling info to a TSV file upon Servo's termination.
-    ///    (`i.e. -p out.tsv`).
     pub time_profiling: Option<OutputOptions>,
 
     /// When the profiler is enabled, this is an optional path to dump a self-contained HTML file
     /// visualizing the traces as a timeline.
     pub time_profiler_trace_path: Option<String>,
-
-    /// True to turn off incremental layout.
-    pub nonincremental_layout: bool,
-
-    pub user_stylesheets: Vec<(Vec<u8>, ServoUrl)>,
 
     /// True to exit on thread failure instead of displaying about:failure.
     pub hard_fail: bool,
@@ -67,6 +60,9 @@ pub struct Opts {
     /// Directory for a default config directory
     pub config_dir: Option<PathBuf>,
 
+    /// Use temporary storage (data on disk will not persist across restarts).
+    pub temporary_storage: bool,
+
     /// Path to PEM encoded SSL CA certificate store.
     pub certificate_path: Option<String>,
 
@@ -83,15 +79,12 @@ pub struct Opts {
 
     /// Unminify Css.
     pub unminify_css: bool,
-
-    /// Print Progressive Web Metrics to console.
-    pub print_pwm: bool,
 }
 
-/// Debug options for Servo, currently set on the command line with -Z
+/// Debug options for Servo.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct DiagnosticsLogging {
-    /// List all the debug options.
+    /// Print all the debug options supported by Servo to the standard output.
     pub help: bool,
 
     /// Print the DOM after each restyle.
@@ -127,6 +120,9 @@ pub struct DiagnosticsLogging {
 
     /// Log garbage collection passes and their durations.
     pub gc_profile: bool,
+
+    /// Log Progressive Web Metrics.
+    pub progressive_web_metrics: bool,
 }
 
 impl DiagnosticsLogging {
@@ -174,6 +170,7 @@ impl DiagnosticsLogging {
         print_option("relayout-event", "Log when relayout occurs");
         print_option("profile-script-events", "Log script event processing time");
         print_option("gc-profile", "Log garbage collection statistics");
+        print_option("progressive-web-metrics", "Log Progressive Web Metrics");
         println!();
 
         process::exit(0);
@@ -197,6 +194,7 @@ impl DiagnosticsLogging {
                 "gc-profile" => self.gc_profile = true,
                 "profile-script-events" => self.profile_script_events = true,
                 "relayout-event" => self.relayout_event = true,
+                "progressive-web-metrics" => self.progressive_web_metrics = true,
                 "" => {},
                 _ => return Err(format!("Unknown diagnostic option: {option}")),
             };
@@ -206,9 +204,9 @@ impl DiagnosticsLogging {
     }
 }
 
+/// The destination for the time profiler reports.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum OutputOptions {
-    /// Database connection config (hostname, name, user, pass)
     FileName(String),
     Stdout(f64),
 }
@@ -218,8 +216,6 @@ impl Default for Opts {
         Self {
             time_profiling: None,
             time_profiler_trace_path: None,
-            nonincremental_layout: false,
-            user_stylesheets: Vec::new(),
             hard_fail: true,
             multiprocess: false,
             force_ipc: false,
@@ -229,13 +225,13 @@ impl Default for Opts {
             sandbox: false,
             debug: Default::default(),
             config_dir: None,
+            temporary_storage: false,
             shaders_path: None,
             certificate_path: None,
             ignore_certificate_errors: false,
             unminify_js: false,
             local_script_source: None,
             unminify_css: false,
-            print_pwm: false,
         }
     }
 }
@@ -248,16 +244,16 @@ static OPTIONS: OnceLock<Opts> = OnceLock::new();
 /// Initialize options.
 ///
 /// Should only be called once at process startup.
-/// Must be called before the first call to [get].
+/// Must be called before the first call to [`get`].
 pub fn initialize_options(opts: Opts) {
     OPTIONS.set(opts).expect("Already initialized");
 }
 
 /// Get the servo options
 ///
-/// If the servo options have not been initialized by calling [initialize_options], then the
-/// options will be initialized to default values. Outside of tests the options should
-/// be explicitly initialized.
+/// If the servo options have not been initialized by calling [`initialize_options`], then the
+/// options will be initialized to default values. Outside of tests the options should be
+/// explicitly initialized.
 #[inline]
 pub fn get() -> &'static Opts {
     // In unit-tests using default options reduces boilerplate.

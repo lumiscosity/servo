@@ -4,13 +4,14 @@
 use std::fmt;
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use js::jsapi::CompilationType;
 use js::rust::HandleValue;
 
 use crate::dom::bindings::codegen::Bindings::TrustedScriptBinding::TrustedScriptMethods;
 use crate::dom::bindings::codegen::UnionTypes::TrustedScriptOrString;
 use crate::dom::bindings::error::Fallible;
-use crate::dom::bindings::reflector::{Reflector, reflect_dom_object};
+use crate::dom::bindings::reflector::{Reflector, reflect_dom_object_with_cx};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::csp::CspReporting;
@@ -19,7 +20,6 @@ use crate::dom::trustedtypes::trustedtypepolicy::TrustedType;
 use crate::dom::trustedtypes::trustedtypepolicyfactory::{
     DEFAULT_SCRIPT_SINK_GROUP, TrustedTypePolicyFactory,
 };
-use crate::script_runtime::{CanGc, JSContext};
 
 #[dom_struct]
 pub struct TrustedScript {
@@ -36,25 +36,25 @@ impl TrustedScript {
         }
     }
 
-    pub(crate) fn new(data: DOMString, global: &GlobalScope, can_gc: CanGc) -> DomRoot<Self> {
-        reflect_dom_object(Box::new(Self::new_inherited(data)), global, can_gc)
+    pub(crate) fn new(cx: &mut JSContext, data: DOMString, global: &GlobalScope) -> DomRoot<Self> {
+        reflect_dom_object_with_cx(Box::new(Self::new_inherited(data)), global, cx)
     }
 
-    pub(crate) fn get_trusted_script_compliant_string(
+    pub(crate) fn get_trusted_type_compliant_string(
+        cx: &mut JSContext,
         global: &GlobalScope,
         value: TrustedScriptOrString,
         sink: &str,
-        can_gc: CanGc,
     ) -> Fallible<DOMString> {
         match value {
             TrustedScriptOrString::String(value) => {
                 TrustedTypePolicyFactory::get_trusted_type_compliant_string(
+                    cx,
                     TrustedType::TrustedScript,
                     global,
                     value,
                     sink,
                     DEFAULT_SCRIPT_SINK_GROUP,
-                    can_gc,
                 )
             },
 
@@ -69,7 +69,7 @@ impl TrustedScript {
     /// <https://www.w3.org/TR/CSP/#can-compile-strings>
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn can_compile_string_with_trusted_type(
-        cx: JSContext,
+        cx: &mut JSContext,
         global: &GlobalScope,
         code_string: DOMString,
         compilation_type: CompilationType,
@@ -77,7 +77,6 @@ impl TrustedScript {
         body_string: DOMString,
         parameter_args: Vec<TrustedScriptOrString>,
         body_arg: HandleValue,
-        can_gc: CanGc,
     ) -> bool {
         // Step 2.1. Let compilationSink be "Function" if compilationType is "FUNCTION",
         // and "eval" otherwise.
@@ -88,7 +87,8 @@ impl TrustedScript {
         };
         // Step 2.2. Let isTrusted be true if bodyArg implements TrustedScript,
         // and false otherwise.
-        let mut is_trusted = match TrustedTypePolicyFactory::is_trusted_script(cx, body_arg) {
+        let mut is_trusted = match TrustedTypePolicyFactory::is_trusted_script(cx.into(), body_arg)
+        {
             // Step 2.3. If isTrusted is true then:
             Ok(trusted_script) => {
                 // Step 2.3.1. If bodyString is not equal to bodyArg’s data, set isTrusted to false.
@@ -130,11 +130,11 @@ impl TrustedScript {
             // Step 2.6. Let sourceString be the result of executing the
             // Get Trusted Type compliant string algorithm, with TrustedScript, realm,
             // sourceToValidate, compilationSink, and 'script'.
-            match TrustedScript::get_trusted_script_compliant_string(
+            match TrustedScript::get_trusted_type_compliant_string(
+                cx,
                 global,
                 TrustedScriptOrString::String(code_string.clone()),
                 compilation_sink,
-                can_gc,
             ) {
                 // Step 2.7. If the algorithm throws an error, throw an EvalError.
                 Err(_) => {

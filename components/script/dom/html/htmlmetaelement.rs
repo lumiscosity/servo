@@ -7,6 +7,7 @@ use std::str::FromStr;
 use content_security_policy::{Policy, PolicyDisposition, PolicySource};
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Prefix, local_name};
+use js::context::JSContext;
 use js::rust::HandleObject;
 use net_traits::ReferrerPolicy;
 use paint_api::viewport_description::ViewportDescription;
@@ -25,7 +26,6 @@ use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::html::htmlheadelement::HTMLHeadElement;
 use crate::dom::node::{BindContext, Node, NodeTraits, UnbindContext};
 use crate::dom::virtualmethods::VirtualMethods;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct HTMLMetaElement {
@@ -44,17 +44,17 @@ impl HTMLMetaElement {
     }
 
     pub(crate) fn new(
+        cx: &mut js::context::JSContext,
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
     ) -> DomRoot<HTMLMetaElement> {
         Node::reflect_node_with_proto(
+            cx,
             Box::new(HTMLMetaElement::new_inherited(local_name, prefix, document)),
             document,
             proto,
-            can_gc,
         )
     }
 
@@ -233,9 +233,9 @@ impl VirtualMethods for HTMLMetaElement {
         Some(self.upcast::<HTMLElement>() as &dyn VirtualMethods)
     }
 
-    fn bind_to_tree(&self, context: &BindContext, can_gc: CanGc) {
+    fn bind_to_tree(&self, cx: &mut JSContext, context: &BindContext) {
         if let Some(s) = self.super_type() {
-            s.bind_to_tree(context, can_gc);
+            s.bind_to_tree(cx, context);
         }
 
         if context.tree_connected {
@@ -243,17 +243,22 @@ impl VirtualMethods for HTMLMetaElement {
         }
     }
 
-    fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation, can_gc: CanGc) {
+    fn attribute_mutated(
+        &self,
+        cx: &mut js::context::JSContext,
+        attr: &Attr,
+        mutation: AttributeMutation,
+    ) {
         if let Some(s) = self.super_type() {
-            s.attribute_mutated(attr, mutation, can_gc);
+            s.attribute_mutated(cx, attr, mutation);
         }
 
         self.process_referrer_attribute();
     }
 
-    fn unbind_from_tree(&self, context: &UnbindContext, can_gc: CanGc) {
+    fn unbind_from_tree(&self, cx: &mut js::context::JSContext, context: &UnbindContext) {
         if let Some(s) = self.super_type() {
-            s.unbind_from_tree(context, can_gc);
+            s.unbind_from_tree(cx, context);
         }
 
         if context.tree_connected {

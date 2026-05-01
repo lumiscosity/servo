@@ -5,8 +5,8 @@
 use std::borrow::{Borrow, ToOwned};
 use std::cell::Cell;
 use std::default::Default;
+use std::str::FromStr;
 
-use base::generic_channel::GenericSharedMemory;
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Prefix, local_name};
 use js::context::JSContext;
@@ -15,13 +15,14 @@ use net_traits::image_cache::{
     Image, ImageCache, ImageCacheResponseCallback, ImageCacheResult, ImageLoadListener,
     ImageOrMetadataAvailable, ImageResponse, PendingImageId,
 };
-use net_traits::request::{Destination, Initiator, RequestBuilder, RequestId};
+use net_traits::request::{Destination, Initiator, ParserMetadata, RequestBuilder, RequestId};
 use net_traits::{
     FetchMetadata, FetchResponseMsg, NetworkError, ReferrerPolicy, ResourceFetchTiming,
 };
 use pixels::PixelFormat;
 use script_bindings::root::Dom;
 use servo_arc::Arc;
+use servo_base::generic_channel::GenericSharedMemory;
 use servo_url::ServoUrl;
 use style::attr::AttrValue;
 use style::media_queries::MediaList as StyleMediaList;
@@ -46,8 +47,8 @@ use crate::dom::documentorshadowroot::StylesheetSource;
 use crate::dom::domtokenlist::DOMTokenList;
 use crate::dom::element::{
     AttributeMutation, Element, ElementCreator, cors_setting_for_element,
-    referrer_policy_for_element, reflect_cross_origin_attribute, reflect_referrer_policy_attribute,
-    set_cross_origin_attribute,
+    cors_settings_attribute_credential_mode, referrer_policy_for_element,
+    reflect_cross_origin_attribute, reflect_referrer_policy_attribute, set_cross_origin_attribute,
 };
 use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::medialist::MediaList;
@@ -60,6 +61,7 @@ use crate::dom::types::{EventTarget, GlobalScope};
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::links::LinkRelations;
 use crate::network_listener::{FetchResponseListener, ResourceTimingListener, submit_timing};
+use crate::script_module::{ScriptFetchOptions, fetch_a_modulepreload_module};
 use crate::script_runtime::CanGc;
 use crate::stylesheet_loader::{ElementStylesheetLoader, StylesheetContextSource, StylesheetOwner};
 
@@ -138,20 +140,20 @@ impl HTMLLinkElement {
     }
 
     pub(crate) fn new(
+        cx: &mut js::context::JSContext,
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
         creator: ElementCreator,
-        can_gc: CanGc,
     ) -> DomRoot<HTMLLinkElement> {
         Node::reflect_node_with_proto(
+            cx,
             Box::new(HTMLLinkElement::new_inherited(
                 local_name, prefix, document, creator,
             )),
             document,
             proto,
-            can_gc,
         )
     }
 
@@ -242,19 +244,37 @@ impl VirtualMethods for HTMLLinkElement {
         Some(self.upcast::<HTMLElement>() as &dyn VirtualMethods)
     }
 
-    fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation, can_gc: CanGc) {
+    fn attribute_mutated(
+        &self,
+        cx: &mut js::context::JSContext,
+        attr: &Attr,
+        mutation: AttributeMutation,
+    ) {
         self.super_type()
             .unwrap()
-            .attribute_mutated(attr, mutation, can_gc);
+            .attribute_mutated(cx, attr, mutation);
 
         let local_name = attr.local_name();
         let is_removal = mutation.is_removal();
-        if *local_name == local_name!("disabled") {
-            self.handle_disabled_attribute_change(is_removal);
-            return;
-        }
-        let node = self.upcast::<Node>();
+        match *local_name {
+            local_name!("disabled") => {
+                self.handle_disabled_attribute_change(is_removal);
+                return;
+            },
+            local_name!("rel") | local_name!("rev") => {
+                let previous_relations = self.relations.get();
+                self.relations
+                    .set(LinkRelations::for_element(self.upcast()));
 
+                // If relations haven't changed, we shouldn't do anything
+                if previous_relations == self.relations.get() {
+                    return;
+                }
+            },
+            _ => {},
+        }
+
+        let node = self.upcast::<Node>();
         if !node.is_connected() {
             return;
         }
@@ -271,21 +291,16 @@ impl VirtualMethods for HTMLLinkElement {
 
         match *local_name {
             local_name!("rel") | local_name!("rev") => {
-                let previous_relations = self.relations.get();
-                self.relations
-                    .set(LinkRelations::for_element(self.upcast()));
-
-                // If relations haven't changed, we shouldn't do anything
-                if previous_relations == self.relations.get() {
-                    return;
-                }
-
                 // https://html.spec.whatwg.org/multipage/#link-type-stylesheet:fetch-and-process-the-linked-resource
                 // > When the external resource link is created on a link element that is already browsing-context connected.
                 if self.relations.get().contains(LinkRelations::STYLESHEET) {
                     self.handle_stylesheet_url();
                 } else {
                     self.remove_stylesheet();
+                }
+
+                if self.relations.get().contains(LinkRelations::MODULE_PRELOAD) {
+                    self.fetch_and_process_modulepreload(cx);
                 }
             },
             local_name!("href") => {
@@ -320,6 +335,11 @@ impl VirtualMethods for HTMLLinkElement {
                 // that is already browsing-context connected is changed.
                 if self.relations.get().contains(LinkRelations::PRELOAD) {
                     self.handle_preload_url();
+                }
+
+                // https://html.spec.whatwg.org/multipage/#link-type-modulepreload
+                if self.relations.get().contains(LinkRelations::MODULE_PRELOAD) {
+                    self.fetch_and_process_modulepreload(cx);
                 }
             },
             local_name!("sizes") if self.relations.get().contains(LinkRelations::ICON) => {
@@ -423,13 +443,10 @@ impl VirtualMethods for HTMLLinkElement {
         }
     }
 
-    fn bind_to_tree(&self, context: &BindContext, can_gc: CanGc) {
+    fn bind_to_tree(&self, cx: &mut JSContext, context: &BindContext) {
         if let Some(s) = self.super_type() {
-            s.bind_to_tree(context, can_gc);
+            s.bind_to_tree(cx, context);
         }
-
-        self.relations
-            .set(LinkRelations::for_element(self.upcast()));
 
         if context.tree_connected {
             let element = self.upcast();
@@ -453,13 +470,23 @@ impl VirtualMethods for HTMLLinkElement {
                 if relations.contains(LinkRelations::PRELOAD) {
                     self.handle_preload_url();
                 }
+
+                // https://html.spec.whatwg.org/multipage/#link-type-modulepreload
+                if relations.contains(LinkRelations::MODULE_PRELOAD) {
+                    let link = DomRoot::from_ref(self);
+                    self.owner_document().add_delayed_task(
+                        task!(FetchModulePreload: |cx, link: DomRoot<HTMLLinkElement>| {
+                            link.fetch_and_process_modulepreload(cx);
+                        }),
+                    );
+                }
             }
         }
     }
 
-    fn unbind_from_tree(&self, context: &UnbindContext, can_gc: CanGc) {
+    fn unbind_from_tree(&self, cx: &mut js::context::JSContext, context: &UnbindContext) {
         if let Some(s) = self.super_type() {
-            s.unbind_from_tree(context, can_gc);
+            s.unbind_from_tree(cx, context);
         }
 
         self.remove_stylesheet();
@@ -613,7 +640,7 @@ impl HTMLLinkElement {
             // Step 5. If request is null, then return.
             return;
         };
-        let url = request.url.clone();
+        let url = request.url.url();
 
         // Step 6. Set request's initiator to "prefetch".
         let request = request.initiator(Initiator::Prefetch);
@@ -908,18 +935,126 @@ impl HTMLLinkElement {
     /// <https://html.spec.whatwg.org/multipage/#link-type-preload:fetch-and-process-the-linked-resource-2>
     pub(crate) fn fire_event_after_response(
         &self,
+        cx: &mut JSContext,
         response: Result<(), NetworkError>,
-        can_gc: CanGc,
     ) {
         // Step 3.1 If response is a network error, fire an event named error at el.
         // Otherwise, fire an event named load at el.
         if response.is_err() {
-            self.upcast::<EventTarget>()
-                .fire_event(atom!("error"), can_gc);
+            self.upcast::<EventTarget>().fire_event(cx, atom!("error"));
         } else {
-            self.upcast::<EventTarget>()
-                .fire_event(atom!("load"), can_gc);
+            self.upcast::<EventTarget>().fire_event(cx, atom!("load"));
         }
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#link-type-modulepreload:fetch-and-process-the-linked-resource-2>
+    fn fetch_and_process_modulepreload(&self, cx: &mut JSContext) {
+        let el = self.upcast::<Element>();
+        let href_attribute_value = el.get_string_attribute(&local_name!("href"));
+
+        // Step 1. If el's href attribute's value is the empty string, then return.
+        if href_attribute_value.is_empty() {
+            return;
+        }
+
+        // Step 2. Let destination be the current state of el's as attribute (a destination), or "script" if it is in no state.
+        let destination = el
+            .get_attribute(&local_name!("as"))
+            .map(|attr| attr.value().to_ascii_lowercase())
+            .and_then(|value| match value.as_str() {
+                // `Destination::from_str` will map an empty string to `Destination::None`
+                "" => None,
+                // "fetch" is a valid preload destination, but not for modules
+                "fetch" => Some(Destination::None),
+                _ => Destination::from_str(&value).ok(),
+            })
+            .unwrap_or(Destination::Script);
+
+        let document = self.owner_document();
+        let global = document.global();
+
+        // A module preload destination is "json", "style", or a script-like destination.
+        let is_a_modulepreload_destination = match destination {
+            Destination::Json | Destination::Style => true,
+            // https://fetch.spec.whatwg.org/#ref-for-request-destination-script-like
+            // While "xslt" can cause script execution, it is not relevant here.
+            Destination::Xslt => false,
+            d => d.is_script_like(),
+        };
+
+        // Step 3. If destination is not a module preload destination, then queue an element task on the
+        // networking task source given el to fire an event named error at el, and return.
+        if !is_a_modulepreload_destination {
+            return global
+                .task_manager()
+                .networking_task_source()
+                .queue_simple_event(self.upcast(), atom!("error"));
+        }
+
+        // Step 4. Let url be the result of encoding-parsing a URL given el's href attribute's value, relative to el's node document.
+        // Step 5. If url is failure, then return.
+        let Ok(url) = document.encoding_parse_a_url(&href_attribute_value.str()) else {
+            return;
+        };
+
+        // Step 6. Let settings object be el's node document's relevant settings object.
+
+        // Step 7. Let credentials mode be the CORS settings attribute credentials mode for el's crossorigin attribute.
+        let credentials_mode = cors_settings_attribute_credential_mode(el);
+
+        // Step 8. Let cryptographic nonce be el.[[CryptographicNonce]].
+        let cryptographic_nonce = el.nonce_value();
+
+        // Step 9. Let integrity metadata be the value of el's integrity attribute, if it is specified, or the empty string otherwise.
+        let integrity_attribute = el.get_attribute(&local_name!("integrity"));
+        let integrity_value = integrity_attribute.as_ref().map(|attr| attr.value());
+        let integrity_metadata = match integrity_value {
+            Some(ref value) => (***value).to_owned(),
+            // Step 10. If el does not have an integrity attribute, then set integrity metadata to
+            // the result of resolving a module integrity metadata with url and settings object.
+            None => global
+                .import_map()
+                .resolve_a_module_integrity_metadata(&url),
+        };
+
+        // Step 11. Let referrer policy be the current state of el's referrerpolicy attribute.
+        let referrer_policy = referrer_policy_for_element(el);
+
+        // TODO Step 12. Let fetch priority be the current state of el's fetchpriority attribute.
+
+        // Step 13. Let options be a script fetch options whose cryptographic nonce is cryptographic nonce,
+        // integrity metadata is integrity metadata, parser metadata is "not-parser-inserted",
+        // credentials mode is credentials mode, referrer policy is referrer policy, and fetch priority is fetch priority.
+        let options = ScriptFetchOptions {
+            cryptographic_nonce,
+            integrity_metadata,
+            parser_metadata: ParserMetadata::NotParserInserted,
+            credentials_mode,
+            referrer_policy,
+            render_blocking: false,
+        };
+
+        let link = DomRoot::from_ref(self);
+
+        // Step 14. Fetch a modulepreload module script graph given url, destination, settings object, options,
+        // and with the following steps given result:
+        fetch_a_modulepreload_module(
+            cx,
+            url,
+            destination,
+            &global,
+            options,
+            move |cx, fetch_failed| {
+                // Step 1. If result is null, then fire an event named error at el, and return.
+                // Step 2. Fire an event named load at el.
+                let event = match fetch_failed {
+                    true => atom!("error"),
+                    false => atom!("load"),
+                };
+
+                link.upcast::<EventTarget>().fire_event(cx, event);
+            },
+        );
     }
 }
 
@@ -963,7 +1098,10 @@ impl StylesheetOwner for HTMLLinkElement {
     }
 
     fn referrer_policy(&self) -> ReferrerPolicy {
-        if self.RelList(CanGc::note()).Contains("noreferrer".into()) {
+        if self
+            .RelList(CanGc::deprecated_note())
+            .Contains("noreferrer".into())
+        {
             return ReferrerPolicy::NoReferrer;
         }
 
@@ -971,7 +1109,7 @@ impl StylesheetOwner for HTMLLinkElement {
     }
 
     fn set_origin_clean(&self, origin_clean: bool) {
-        if let Some(stylesheet) = self.get_cssom_stylesheet(CanGc::note()) {
+        if let Some(stylesheet) = self.get_cssom_stylesheet(CanGc::deprecated_note()) {
             stylesheet.set_origin_clean(origin_clean);
         }
     }
@@ -988,9 +1126,9 @@ impl HTMLLinkElementMethods<crate::DomTypeHolder> for HTMLLinkElement {
     make_getter!(Rel, "rel");
 
     /// <https://html.spec.whatwg.org/multipage/#dom-link-rel>
-    fn SetRel(&self, rel: DOMString, can_gc: CanGc) {
+    fn SetRel(&self, cx: &mut JSContext, rel: DOMString) {
         self.upcast::<Element>()
-            .set_tokenlist_attribute(&local_name!("rel"), rel, can_gc);
+            .set_tokenlist_attribute(cx, &local_name!("rel"), rel);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-link-as
@@ -1133,20 +1271,24 @@ struct FaviconFetchContext {
 impl FetchResponseListener for FaviconFetchContext {
     fn process_request_body(&mut self, _: RequestId) {}
 
-    fn process_request_eof(&mut self, _: RequestId) {}
-
     fn process_response(
         &mut self,
+        _: &mut js::context::JSContext,
         request_id: RequestId,
         metadata: Result<FetchMetadata, NetworkError>,
     ) {
         self.image_cache.notify_pending_response(
             self.id,
-            FetchResponseMsg::ProcessResponse(request_id, metadata.clone()),
+            FetchResponseMsg::ProcessResponse(request_id, metadata),
         );
     }
 
-    fn process_response_chunk(&mut self, request_id: RequestId, chunk: Vec<u8>) {
+    fn process_response_chunk(
+        &mut self,
+        _: &mut js::context::JSContext,
+        request_id: RequestId,
+        chunk: Vec<u8>,
+    ) {
         self.image_cache.notify_pending_response(
             self.id,
             FetchResponseMsg::ProcessResponseChunk(request_id, chunk.into()),
@@ -1164,7 +1306,7 @@ impl FetchResponseListener for FaviconFetchContext {
             self.id,
             FetchResponseMsg::ProcessResponseEOF(request_id, response.clone(), timing.clone()),
         );
-        submit_timing(&self, &response, &timing, CanGc::from_cx(cx));
+        submit_timing(cx, &self, &response, &timing);
     }
 
     fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<Violation>) {

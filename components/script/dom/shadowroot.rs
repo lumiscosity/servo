@@ -39,7 +39,7 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::css::cssstylesheet::CSSStyleSheet;
 use crate::dom::css::stylesheetlist::{StyleSheetList, StyleSheetListOwner};
 use crate::dom::document::Document;
-use crate::dom::documentfragment::{DocumentFragment, LayoutDocumentFragmentHelpers};
+use crate::dom::documentfragment::DocumentFragment;
 use crate::dom::documentorshadowroot::{
     DocumentOrShadowRoot, ServoStylesheetInDocument, StylesheetSource,
 };
@@ -177,11 +177,6 @@ impl ShadowRoot {
 
     pub(crate) fn owner_doc(&self) -> &Document {
         &self.document
-    }
-
-    pub(crate) fn get_focused_element(&self) -> Option<DomRoot<Element>> {
-        // XXX get retargeted focused element
-        None
     }
 
     pub(crate) fn stylesheet_count(&self) -> usize {
@@ -387,8 +382,7 @@ impl ShadowRoot {
 impl ShadowRootMethods<crate::DomTypeHolder> for ShadowRoot {
     /// <https://html.spec.whatwg.org/multipage/#dom-document-activeelement>
     fn GetActiveElement(&self) -> Option<DomRoot<Element>> {
-        self.document_or_shadow_root
-            .get_active_element(self.get_focused_element(), None, None)
+        self.document_or_shadow_root.active_element(self.upcast())
     }
 
     /// <https://drafts.csswg.org/cssom-view/#dom-document-elementfrompoint>
@@ -460,29 +454,32 @@ impl ShadowRootMethods<crate::DomTypeHolder> for ShadowRoot {
             StyleSheetList::new(
                 &self.window,
                 StyleSheetListOwner::ShadowRoot(Dom::from_ref(self)),
-                CanGc::note(),
+                CanGc::deprecated_note(),
             )
         })
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-shadowroot-gethtml>
-    fn GetHTML(&self, options: &GetHTMLOptions, can_gc: CanGc) -> DOMString {
+    fn GetHTML(&self, cx: &mut js::context::JSContext, options: &GetHTMLOptions) -> DOMString {
         // > ShadowRoot's getHTML(options) method steps are to return the result of HTML fragment serialization
         // >  algorithm with this, options["serializableShadowRoots"], and options["shadowRoots"].
         self.upcast::<Node>().html_serialize(
+            cx,
             TraversalScope::ChildrenOnly(None),
             options.serializableShadowRoots,
             options.shadowRoots.clone(),
-            can_gc,
         )
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-shadowroot-innerhtml>
-    fn GetInnerHTML(&self, can_gc: CanGc) -> Fallible<TrustedHTMLOrNullIsEmptyString> {
+    fn GetInnerHTML(
+        &self,
+        cx: &mut js::context::JSContext,
+    ) -> Fallible<TrustedHTMLOrNullIsEmptyString> {
         // ShadowRoot's innerHTML getter steps are to return the result of running fragment serializing
         // algorithm steps with this and true.
         self.upcast::<Node>()
-            .fragment_serialization_algorithm(true, can_gc)
+            .fragment_serialization_algorithm(cx, true)
             .map(TrustedHTMLOrNullIsEmptyString::NullIsEmptyString)
     }
 
@@ -494,11 +491,11 @@ impl ShadowRootMethods<crate::DomTypeHolder> for ShadowRoot {
     ) -> ErrorResult {
         // Step 1. Let compliantString be the result of invoking the Get Trusted Type compliant string algorithm
         // with TrustedHTML, this's relevant global object, the given value, "ShadowRoot innerHTML", and "script".
-        let value = TrustedHTML::get_trusted_script_compliant_string(
+        let value = TrustedHTML::get_trusted_type_compliant_string(
+            cx,
             &self.owner_global(),
             value.convert(),
             "ShadowRoot innerHTML",
-            CanGc::from_cx(cx),
         )?;
 
         // Step 2. Let context be this's host.
@@ -512,7 +509,7 @@ impl ShadowRootMethods<crate::DomTypeHolder> for ShadowRoot {
         let frag = context.parse_fragment(value, cx)?;
 
         // Step 4. Replace all with fragment within this.
-        Node::replace_all(Some(frag.upcast()), self.upcast(), CanGc::from_cx(cx));
+        Node::replace_all(cx, Some(frag.upcast()), self.upcast());
         Ok(())
     }
 
@@ -530,11 +527,11 @@ impl ShadowRootMethods<crate::DomTypeHolder> for ShadowRoot {
         // Step 1. Let compliantHTML be the result of invoking the
         // Get Trusted Type compliant string algorithm with TrustedHTML,
         // this's relevant global object, html, "ShadowRoot setHTMLUnsafe", and "script".
-        let value = TrustedHTML::get_trusted_script_compliant_string(
+        let value = TrustedHTML::get_trusted_type_compliant_string(
+            cx,
             &self.owner_global(),
             value,
             "ShadowRoot setHTMLUnsafe",
-            CanGc::from_cx(cx),
         )?;
         // Step 2. Unsafely set HTMl given this, this's shadow host, and complaintHTML
         let target = self.upcast::<Node>();
@@ -601,9 +598,9 @@ impl VirtualMethods for ShadowRoot {
         Some(self.upcast::<DocumentFragment>() as &dyn VirtualMethods)
     }
 
-    fn bind_to_tree(&self, context: &BindContext, can_gc: CanGc) {
+    fn bind_to_tree(&self, cx: &mut js::context::JSContext, context: &BindContext) {
         if let Some(s) = self.super_type() {
-            s.bind_to_tree(context, can_gc);
+            s.bind_to_tree(cx, context);
         }
 
         // TODO(stevennovaryo): Handle adoptedStylesheet to deal with different
@@ -617,21 +614,21 @@ impl VirtualMethods for ShadowRoot {
 
         shadow_root.set_flag(NodeFlags::IS_CONNECTED, context.tree_connected);
 
-        let context = BindContext::new(shadow_root, IsShadowTree::Yes);
+        let inner_context = BindContext::new(shadow_root, IsShadowTree::Yes);
 
         // avoid iterate over the shadow root itself
-        for node in shadow_root.traverse_preorder(ShadowIncluding::Yes).skip(1) {
-            node.set_flag(NodeFlags::IS_CONNECTED, context.tree_connected);
+        for node in shadow_root.traverse_preorder(ShadowIncluding::No).skip(1) {
+            node.set_flag(NodeFlags::IS_CONNECTED, inner_context.tree_connected);
 
             // Out-of-document elements never have the descendants flag set
             debug_assert!(!node.get_flag(NodeFlags::HAS_DIRTY_DESCENDANTS));
-            vtable_for(&node).bind_to_tree(&context, can_gc);
+            vtable_for(&node).bind_to_tree(cx, &inner_context);
         }
     }
 
-    fn unbind_from_tree(&self, context: &UnbindContext, can_gc: CanGc) {
+    fn unbind_from_tree(&self, cx: &mut js::context::JSContext, context: &UnbindContext) {
         if let Some(s) = self.super_type() {
-            s.unbind_from_tree(context, can_gc);
+            s.unbind_from_tree(cx, context);
         }
 
         if context.tree_connected {
@@ -641,31 +638,23 @@ impl VirtualMethods for ShadowRoot {
     }
 }
 
-#[expect(unsafe_code)]
-pub(crate) trait LayoutShadowRootHelpers<'dom> {
-    fn get_host_for_layout(self) -> LayoutDom<'dom, Element>;
-    fn get_style_data_for_layout(self) -> &'dom CascadeData;
-    fn is_ua_widget(&self) -> bool;
-    unsafe fn flush_stylesheets(self, stylist: &mut Stylist, guard: &SharedRwLockReadGuard);
-}
-
-impl<'dom> LayoutShadowRootHelpers<'dom> for LayoutDom<'dom, ShadowRoot> {
+impl<'dom> LayoutDom<'dom, ShadowRoot> {
     #[inline]
-    fn get_host_for_layout(self) -> LayoutDom<'dom, Element> {
+    pub(crate) fn get_host_for_layout(self) -> LayoutDom<'dom, Element> {
         self.upcast::<DocumentFragment>()
             .shadowroot_host_for_layout()
     }
 
     #[inline]
     #[expect(unsafe_code)]
-    fn get_style_data_for_layout(self) -> &'dom CascadeData {
+    pub(crate) fn get_style_data_for_layout(self) -> &'dom CascadeData {
         fn is_sync<T: Sync>() {}
         let _ = is_sync::<CascadeData>;
         unsafe { &self.unsafe_get().author_styles.borrow_for_layout().data }
     }
 
     #[inline]
-    fn is_ua_widget(&self) -> bool {
+    pub(crate) fn is_user_agent_widget(&self) -> bool {
         self.unsafe_get().is_user_agent_widget()
     }
 
@@ -673,7 +662,14 @@ impl<'dom> LayoutShadowRootHelpers<'dom> for LayoutDom<'dom, ShadowRoot> {
     // probably be revisited.
     #[inline]
     #[expect(unsafe_code)]
-    unsafe fn flush_stylesheets(self, stylist: &mut Stylist, guard: &SharedRwLockReadGuard) {
+    pub(crate) unsafe fn flush_stylesheets_for_layout(
+        self,
+        stylist: &mut Stylist,
+        guard: &SharedRwLockReadGuard,
+    ) {
+        unsafe {
+            debug_assert!(self.upcast::<Node>().get_flag(NodeFlags::IS_CONNECTED));
+        };
         let author_styles = unsafe { self.unsafe_get().author_styles.borrow_mut_for_layout() };
         if author_styles.stylesheets.dirty() {
             author_styles.flush(stylist, guard);

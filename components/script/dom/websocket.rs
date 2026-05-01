@@ -6,8 +6,6 @@ use std::borrow::ToOwned;
 use std::cell::Cell;
 use std::ptr::{self, NonNull};
 
-use base::generic_channel::{LazyCallback, lazy_callback};
-use constellation_traits::BlobImpl;
 use dom_struct::dom_struct;
 use ipc_channel::router::ROUTER;
 use js::jsapi::JSObject;
@@ -15,6 +13,7 @@ use js::jsval::UndefinedValue;
 use js::realm::AutoRealm;
 use js::rust::{CustomAutoRooterGuard, HandleObject};
 use js::typedarray::{ArrayBuffer, ArrayBufferView, CreateWith};
+use net_traits::blob_url_store::UrlWithBlobClaim;
 use net_traits::request::{
     CacheMode, CredentialsMode, RedirectMode, Referrer, RequestBuilder, RequestMode,
     ServiceWorkersMode,
@@ -24,6 +23,8 @@ use net_traits::{
 };
 use profile_traits::ipc as ProfiledIpc;
 use script_bindings::conversions::SafeToJSValConvertible;
+use servo_base::generic_channel::{LazyCallback, lazy_callback};
+use servo_constellation_traits::BlobImpl;
 use servo_url::{ImmutableOrigin, ServoUrl};
 
 use crate::dom::bindings::cell::DomRefCell;
@@ -278,7 +279,7 @@ impl WebSocketMethods<crate::DomTypeHolder> for WebSocket {
         // "include", cache mode is "no-store" , and redirect mode is "error"
         let request = RequestBuilder::new(
             global.webview_id(),
-            url_record.clone(),
+            UrlWithBlobClaim::from_url_without_having_claimed_blob(url_record.clone()),
             Referrer::NoReferrer,
         )
         .with_global_scope(global)
@@ -520,7 +521,7 @@ impl TaskOnce for ConnectionEstablishedTask {
         };
 
         // Step 4.
-        ws.upcast().fire_event(atom!("open"), CanGc::from_cx(cx));
+        ws.upcast().fire_event(cx, atom!("open"));
     }
 }
 
@@ -566,7 +567,7 @@ impl TaskOnce for CloseTask {
 
         // Step 2.
         if self.failed {
-            ws.upcast().fire_event(atom!("error"), CanGc::from_cx(cx));
+            ws.upcast().fire_event(cx, atom!("error"));
         }
 
         // Step 3.

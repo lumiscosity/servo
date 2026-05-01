@@ -251,6 +251,12 @@ thread_local!(pub static PIPELINE_NAMESPACE: Cell<Option<PipelineNamespace>> = c
 )]
 pub struct PipelineNamespaceId(pub u32);
 
+pub const EMBEDDER_PIPELINE_NAMESPACE_ID: PipelineNamespaceId = PipelineNamespaceId(0);
+pub const CONSTELLATION_PIPELINE_NAMESPACE_ID: PipelineNamespaceId = PipelineNamespaceId(1);
+/// The next available [`PipelineNamespaceId`] for the allocation in the constellation. Starting from 2,
+/// since we reserved namespace 0 for the embedder, and 1 for the constellation.
+pub const FIRST_CONTENT_PIPELINE_NAMESPACE_ID: PipelineNamespaceId = PipelineNamespaceId(2);
+
 namespace_id! {PipelineId, PipelineIndex, "Pipeline"}
 
 size_of_test!(PipelineId, 8);
@@ -276,6 +282,12 @@ impl From<PipelineId> for TreeId {
             Uuid::new_v5(&PIPELINE_IDS, &pipeline_id.namespace_id.0.to_be_bytes());
         let with_index = Uuid::new_v5(&with_namespace_id, &pipeline_id.index.0.get().to_be_bytes());
         TreeId(with_index)
+    }
+}
+
+impl From<PipelineId> for u64 {
+    fn from(pipeline_id: PipelineId) -> Self {
+        ((pipeline_id.namespace_id.0 as u64) << 32) + pipeline_id.index.0.get() as u64
     }
 }
 
@@ -415,6 +427,10 @@ namespace_id! {ServiceWorkerId, ServiceWorkerIndex, "ServiceWorker"}
 namespace_id! {ServiceWorkerRegistrationId, ServiceWorkerRegistrationIndex, "ServiceWorkerRegistration"}
 
 namespace_id! {BlobId, BlobIndex, "Blob"}
+
+namespace_id! {FileId, FileIndex, "File"}
+
+namespace_id! {FileListId, FileListIndex, "FileList"}
 
 namespace_id! {DomPointId, DomPointIndex, "DomPoint"}
 

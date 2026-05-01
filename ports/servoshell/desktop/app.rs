@@ -4,16 +4,12 @@
 
 //! Application entry point, runs the event loop.
 
-use std::path::Path;
 use std::rc::Rc;
 use std::time::Instant;
 use std::{env, fs};
 
 use servo::protocol_handler::ProtocolRegistry;
-use servo::user_contents::UserStyleSheet;
-use servo::{
-    EventLoopWaker, Opts, Preferences, ServoBuilder, ServoUrl, UserContentManager, UserScript,
-};
+use servo::{EventLoopWaker, Opts, Preferences, ServoBuilder, ServoUrl, UserContentManager};
 use url::Url;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -30,7 +26,7 @@ use crate::parser::get_default_url;
 use crate::prefs::ServoShellPreferences;
 use crate::running_app_state::RunningAppState;
 #[cfg(feature = "gamepad")]
-use crate::running_app_state::ServoshellGamepadProvider;
+use crate::running_app_state::ServoshellGamepadDelegate;
 use crate::window::{PlatformWindow, ServoShellWindowId};
 
 pub(crate) enum AppState {
@@ -72,7 +68,7 @@ impl App {
             servoshell_preferences: servo_shell_preferences,
             waker: event_loop.create_event_loop_waker(),
             event_loop_proxy: event_loop.event_loop_proxy(),
-            initial_url: initial_url.clone(),
+            initial_url,
             t_start: t,
             t,
             state: AppState::Initializing,
@@ -114,16 +110,9 @@ impl App {
         servo.setup_logging();
 
         let user_content_manager = Rc::new(UserContentManager::new(&servo));
-        for script in load_userscripts(self.servoshell_preferences.userscripts_directory.as_deref())
-            .expect("Loading userscripts failed")
-        {
-            user_content_manager.add_script(Rc::new(script));
-        }
 
-        for (contents, url) in &self.opts.user_stylesheets {
-            let contents = String::try_from(contents.clone()).unwrap();
-            let user_stylesheet = UserStyleSheet::new(contents, url.clone().into_url());
-            user_content_manager.add_stylesheet(Rc::new(user_stylesheet));
+        for user_stylesheet in &self.servoshell_preferences.user_stylesheets {
+            user_content_manager.add_stylesheet(user_stylesheet.clone());
         }
 
         let running_state = Rc::new(RunningAppState::new(
@@ -133,13 +122,14 @@ impl App {
             user_content_manager,
             self.preferences.clone(),
             #[cfg(feature = "gamepad")]
-            ServoshellGamepadProvider::maybe_new().map(Rc::new),
+            ServoshellGamepadDelegate::maybe_new().map(Rc::new),
         ));
         running_state.open_window(platform_window, self.initial_url.as_url().clone());
 
         self.state = AppState::Running(running_state);
     }
 
+    #[servo::servo_tracing::instrument(level = "debug", skip_all)]
     fn create_platform_window(
         &self,
         url: Url,
@@ -225,7 +215,7 @@ impl ApplicationHandler<AppEvent> for App {
             .and_then(|window_id| state.window(ServoShellWindowId::from(u64::from(window_id))))
         {
             if let Some(headed_window) = window.platform_window().as_headed_window() {
-                headed_window.handle_winit_app_event(&window, app_event);
+                headed_window.handle_winit_app_event(state.clone(), app_event);
             }
         }
 
@@ -236,19 +226,4 @@ impl ApplicationHandler<AppEvent> for App {
         // Block until the window gets an event
         event_loop.set_control_flow(ControlFlow::Wait);
     }
-}
-
-fn load_userscripts(userscripts_directory: Option<&Path>) -> std::io::Result<Vec<UserScript>> {
-    let mut userscripts = Vec::new();
-    if let Some(userscripts_directory) = &userscripts_directory {
-        let mut files = std::fs::read_dir(userscripts_directory)?
-            .map(|e| e.map(|entry| entry.path()))
-            .collect::<Result<Vec<_>, _>>()?;
-        files.sort_unstable();
-        for file in files {
-            let script = std::fs::read_to_string(&file)?;
-            userscripts.push(UserScript::new(script, Some(file)));
-        }
-    }
-    Ok(userscripts)
 }

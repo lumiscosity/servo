@@ -8,7 +8,7 @@ use std::f64::consts::{FRAC_PI_2, PI};
 use std::rc::Rc;
 use std::{mem, ptr};
 
-use base::cross_process_instant::CrossProcessInstant;
+use servo_base::cross_process_instant::CrossProcessInstant;
 use dom_struct::dom_struct;
 use euclid::{RigidTransform3D, Transform3D, Vector3D};
 use ipc_channel::ipc::IpcReceiver;
@@ -213,8 +213,8 @@ impl XRSession {
                 let frame: Frame = message.unwrap();
                 let time = CrossProcessInstant::now();
                 let this = this.clone();
-                task_source.queue(task!(xr_raf_callback: move || {
-                    this.root().raf_callback(frame, time, CanGc::note());
+                task_source.queue(task!(xr_raf_callback: move |cx| {
+                    this.root().raf_callback(cx, frame, time);
                 }));
             }),
         );
@@ -237,7 +237,7 @@ impl XRSession {
             ProfileGenericCallback::new(global.time_profiler_chan().clone(), move |message| {
                 let this = this.clone();
                 task_source.queue(task!(xr_event_callback: move || {
-                    this.root().event_callback(message.unwrap(), CanGc::note());
+                    this.root().event_callback(message.unwrap(), CanGc::deprecated_note());
                 }))
             })
             .expect("Could not create callback");
@@ -267,7 +267,7 @@ impl XRSession {
             .dom_manipulation_task_source()
             .queue(task!(session_initial_inputs: move || {
                 let this = this.root();
-                this.input_sources.add_input_sources(&this, &initial_inputs, CanGc::note());
+                this.input_sources.add_input_sources(&this, &initial_inputs, CanGc::deprecated_note());
             }));
     }
 
@@ -414,7 +414,12 @@ impl XRSession {
     }
 
     /// <https://immersive-web.github.io/webxr/#xr-animation-frame>
-    fn raf_callback(&self, mut frame: Frame, time: CrossProcessInstant, can_gc: CanGc) {
+    fn raf_callback(
+        &self,
+        cx: &mut js::context::JSContext,
+        mut frame: Frame,
+        time: CrossProcessInstant,
+    ) {
         debug!("WebXR RAF callback {:?}", frame);
 
         // Step 1-2 happen in the xebxr device thread
@@ -434,7 +439,7 @@ impl XRSession {
 
         // TODO: how does this fit the webxr spec?
         for event in frame.events.drain(..) {
-            self.handle_frame_event(event, can_gc);
+            self.handle_frame_event(event, CanGc::from_cx(cx));
         }
 
         // Step 4
@@ -466,7 +471,7 @@ impl XRSession {
         }
 
         let time = self.global().performance().to_dom_high_res_time_stamp(time);
-        let frame = XRFrame::new(self.global().as_window(), self, frame, CanGc::note());
+        let frame = XRFrame::new(self.global().as_window(), self, frame, CanGc::from_cx(cx));
 
         // Step 8-9
         frame.set_active(true);
@@ -484,7 +489,7 @@ impl XRSession {
         for i in 0..len {
             let callback = self.current_raf_callback_list.borrow()[i].1.clone();
             if let Some(callback) = callback {
-                let _ = callback.Call__(time, &frame, ExceptionHandling::Report, can_gc);
+                let _ = callback.Call__(cx, time, &frame, ExceptionHandling::Report);
             }
         }
         self.outside_raf.set(true);
@@ -1071,9 +1076,9 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
                 let this = this.clone();
                 task_source.queue(task!(update_session_framerate: move || {
                     let session = this.root();
-                    session.apply_nominal_framerate(message.unwrap(), CanGc::note());
+                    session.apply_nominal_framerate(message.unwrap(), CanGc::deprecated_note());
                     if let Some(promise) = session.update_framerate_promise.borrow_mut().take() {
-                        promise.resolve_native(&(), CanGc::note());
+                        promise.resolve_native(&(), CanGc::deprecated_note());
                     };
                 }));
             })

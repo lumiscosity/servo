@@ -86,7 +86,6 @@ impl PromiseHelper for Rc<Promise> {
 impl Drop for Promise {
     #[expect(unsafe_code)]
     fn drop(&mut self) {
-        self.reflector.drop_memory(self);
         unsafe {
             let object = self.permanent_js_root.get().to_object();
             assert!(!object.is_null());
@@ -142,7 +141,7 @@ impl Promise {
                 permanent_js_root: Heap::default(),
             };
             let promise = Rc::new(promise);
-            promise.init_reflector::<Promise>(obj.get());
+            promise.init_reflector_without_associated_memory(obj.get());
             promise.initialize(cx);
             promise
         }
@@ -354,7 +353,7 @@ unsafe extern "C" fn native_handler_callback(
     argc: u32,
     vp: *mut JSVal,
 ) -> bool {
-    // Safety: it is safe to construct a JSContext from engine hook.
+    // SAFETY: it is safe to construct a JSContext from engine hook.
     let mut cx = unsafe { JSContext::from_ptr(ptr::NonNull::new(cx).unwrap()) };
     let mut cx = CurrentRealm::assert(&mut cx);
     let cx = &mut cx;
@@ -426,7 +425,7 @@ impl FromJSValConvertibleRc for Promise {
         let global_scope =
             unsafe { GlobalScope::from_context(*cx, InRealm::Already(&in_realm_proof)) };
 
-        let promise = Promise::new_resolved(&global_scope, cx, value, CanGc::note());
+        let promise = Promise::new_resolved(&global_scope, cx, value, CanGc::deprecated_note());
         Ok(ConversionResult::Success(promise))
     }
 }

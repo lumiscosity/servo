@@ -6,13 +6,13 @@ use std::cell::Cell;
 use std::cmp::Ordering;
 use std::time::Duration;
 
-use base::cross_process_instant::CrossProcessInstant;
 use malloc_size_of_derive::MallocSizeOf;
 use profile_traits::time::{
     ProfilerCategory, ProfilerChan, TimerMetadata, TimerMetadataFrameType, TimerMetadataReflowType,
     send_profile_data,
 };
 use script_traits::ProgressiveWebMetricType;
+use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_config::opts;
 use servo_url::ServoUrl;
 
@@ -52,17 +52,12 @@ fn set_metric(
         metric_time,
     );
 
-    // Print the metric to console if the print-pwm option was given.
-    if opts::get().print_pwm {
+    if opts::get().debug.progressive_web_metrics {
         let navigation_start = pwm
             .navigation_start()
             .unwrap_or_else(CrossProcessInstant::epoch);
-        println!(
-            "{:?} {:?} {:?}",
-            url,
-            metric_type,
-            (metric_time - navigation_start).as_seconds_f64()
-        );
+        let duration = (metric_time - navigation_start).as_seconds_f64();
+        println!("{url:?} {metric_type:?} {duration:?}s");
     }
 }
 
@@ -313,7 +308,7 @@ impl ProgressiveWebMetrics {
 
 #[cfg(test)]
 mod test {
-    use base::generic_channel;
+    use servo_base::generic_channel;
 
     use super::*;
 

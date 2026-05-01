@@ -7,31 +7,26 @@
 //! inspection, JS evaluation, autocompletion) in Servo.
 
 use std::collections::HashMap;
-use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use atomic_refcell::AtomicRefCell;
-use base::generic_channel::{self, GenericSender};
-use base::id::TEST_PIPELINE_ID;
-use devtools_traits::EvaluateJSReplyValue::{
-    ActorValue, BooleanValue, NullValue, NumberValue, StringValue, VoidValue,
-};
 use devtools_traits::{
-    ConsoleArgument, ConsoleMessage, ConsoleMessageFields, DevtoolScriptControlMsg, PageError,
-    StackFrame, get_time_stamp,
+    ConsoleMessage, ConsoleMessageFields, DevtoolScriptControlMsg, PageError, StackFrame,
+    get_time_stamp,
 };
 use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
-use serde_json::{self, Map, Number, Value};
+use serde_json::{self, Map, Value};
+use servo_base::generic_channel::{self, GenericSender};
+use servo_base::id::TEST_PIPELINE_ID;
 use uuid::Uuid;
 
 use crate::actor::{Actor, ActorError, ActorRegistry};
 use crate::actors::browsing_context::BrowsingContextActor;
-use crate::actors::object::ObjectActor;
-use crate::actors::worker::WorkerActor;
-use crate::protocol::{ClientRequest, JsonPacketStream};
+use crate::actors::worker::WorkerTargetActor;
+use crate::protocol::{ClientRequest, DevtoolsConnection, JsonPacketStream};
 use crate::resource::{ResourceArrayType, ResourceAvailable};
-use crate::{EmptyReplyMsg, StreamId, UniqueId};
+use crate::{EmptyReplyMsg, StreamId, UniqueId, debugger_value_to_json};
 
 #[derive(Clone, Serialize, MallocSizeOf)]
 #[serde(rename_all = "camelCase")]
@@ -54,92 +49,10 @@ impl DevtoolsConsoleMessage {
             arguments: message
                 .arguments
                 .into_iter()
-                .map(|argument| console_argument_to_value(argument, registry))
+                .map(|argument| debugger_value_to_json(registry, argument))
                 .collect(),
             stacktrace: message.stacktrace,
         }
-    }
-}
-
-fn console_argument_to_value(argument: ConsoleArgument, registry: &ActorRegistry) -> Value {
-    match argument {
-        ConsoleArgument::String(value) => Value::String(value),
-        ConsoleArgument::Integer(value) => Value::Number(value.into()),
-        ConsoleArgument::Number(value) => {
-            Number::from_f64(value).map(Value::from).unwrap_or_default()
-        },
-        ConsoleArgument::Boolean(value) => Value::Bool(value),
-        ConsoleArgument::Object(object) => {
-            // Create a new actor for the object.
-            // These are currently never cleaned up, and we make no attempt at re-using the same actor
-            // if the same object is logged repeatedly.
-            let actor = ObjectActor::register(registry, None, object.class.clone());
-
-            #[derive(Serialize)]
-            struct PropertyDescriptor {
-                configurable: bool,
-                enumerable: bool,
-                writable: bool,
-                value: Value,
-            }
-
-            #[derive(Serialize)]
-            #[serde(rename_all = "camelCase")]
-            struct DevtoolsConsoleObjectArgument {
-                r#type: String,
-                actor: String,
-                class: String,
-                own_property_length: usize,
-                extensible: bool,
-                frozen: bool,
-                sealed: bool,
-                is_error: bool,
-                preview: DevtoolsConsoleObjectArgumentPreview,
-            }
-
-            #[derive(Serialize)]
-            #[serde(rename_all = "camelCase")]
-            struct DevtoolsConsoleObjectArgumentPreview {
-                kind: String,
-                own_properties: HashMap<String, PropertyDescriptor>,
-                own_properties_length: usize,
-            }
-
-            let own_properties: HashMap<String, PropertyDescriptor> = object
-                .own_properties
-                .into_iter()
-                .map(|property| {
-                    let property_descriptor = PropertyDescriptor {
-                        configurable: property.configurable,
-                        enumerable: property.enumerable,
-                        writable: property.writable,
-                        value: console_argument_to_value(property.value, registry),
-                    };
-
-                    (property.key, property_descriptor)
-                })
-                .collect();
-
-            let argument = DevtoolsConsoleObjectArgument {
-                r#type: "object".to_owned(),
-                actor,
-                class: object.class,
-                own_property_length: own_properties.len(),
-                extensible: true,
-                frozen: false,
-                sealed: false,
-                is_error: false,
-                preview: DevtoolsConsoleObjectArgumentPreview {
-                    kind: "Object".to_string(),
-                    own_properties_length: own_properties.len(),
-                    own_properties,
-                },
-            };
-
-            // to_value can fail if the implementation of Serialize fails or there are non-string map keys.
-            // Neither should be possible here
-            serde_json::to_value(argument).unwrap()
-        },
     }
 }
 
@@ -281,36 +194,38 @@ pub(crate) struct ConsoleActor {
 }
 
 impl ConsoleActor {
-    pub fn new(name: String, root: Root) -> Self {
-        Self {
-            name,
+    pub fn register(registry: &ActorRegistry, name: String, root: Root) -> String {
+        let actor = Self {
+            name: name.clone(),
             root,
             cached_events: Default::default(),
             client_ready_to_receive_messages: false.into(),
-        }
+        };
+        registry.register(actor);
+        name
     }
 
     fn script_chan(&self, registry: &ActorRegistry) -> GenericSender<DevtoolScriptControlMsg> {
         match &self.root {
-            Root::BrowsingContext(browsing_context) => registry
-                .find::<BrowsingContextActor>(browsing_context)
-                .script_chan
+            Root::BrowsingContext(browsing_context_name) => registry
+                .find::<BrowsingContextActor>(browsing_context_name)
+                .script_chan(),
+            Root::DedicatedWorker(worker_name) => registry
+                .find::<WorkerTargetActor>(worker_name)
+                .script_sender
                 .clone(),
-            Root::DedicatedWorker(worker) => {
-                registry.find::<WorkerActor>(worker).script_chan.clone()
-            },
         }
     }
 
     fn current_unique_id(&self, registry: &ActorRegistry) -> UniqueId {
         match &self.root {
-            Root::BrowsingContext(browsing_context) => UniqueId::Pipeline(
+            Root::BrowsingContext(browsing_context_name) => UniqueId::Pipeline(
                 registry
-                    .find::<BrowsingContextActor>(browsing_context)
+                    .find::<BrowsingContextActor>(browsing_context_name)
                     .pipeline_id(),
             ),
-            Root::DedicatedWorker(worker) => {
-                UniqueId::Worker(registry.find::<WorkerActor>(worker).worker_id)
+            Root::DedicatedWorker(worker_name) => {
+                UniqueId::Worker(registry.find::<WorkerTargetActor>(worker_name).worker_id)
             },
         }
     }
@@ -326,8 +241,7 @@ impl ConsoleActor {
             .and_then(|v| v.as_str())
             .map(String::from);
         let (chan, port) = generic_channel::channel().unwrap();
-        // FIXME: Redesign messages so we don't have to fake pipeline ids when
-        //        communicating with workers.
+        // FIXME: Redesign messages so we don't have to fake pipeline ids when communicating with workers.
         let pipeline = match self.current_unique_id(registry) {
             UniqueId::Pipeline(p) => p,
             UniqueId::Worker(_) => TEST_PIPELINE_ID,
@@ -341,65 +255,13 @@ impl ConsoleActor {
             ))
             .unwrap();
 
-        // TODO: Extract conversion into protocol module or some other useful place
         let eval_result = port.recv().map_err(|_| ())?;
         let has_exception = eval_result.has_exception;
-
-        let result = match eval_result.value {
-            VoidValue => {
-                let mut m = Map::new();
-                m.insert("type".to_owned(), Value::String("undefined".to_owned()));
-                Value::Object(m)
-            },
-            NullValue => {
-                let mut m = Map::new();
-                m.insert("type".to_owned(), Value::String("null".to_owned()));
-                Value::Object(m)
-            },
-            BooleanValue(val) => Value::Bool(val),
-            NumberValue(val) => {
-                if val.is_nan() {
-                    let mut m = Map::new();
-                    m.insert("type".to_owned(), Value::String("NaN".to_owned()));
-                    Value::Object(m)
-                } else if val.is_infinite() {
-                    let mut m = Map::new();
-                    if val < 0. {
-                        m.insert("type".to_owned(), Value::String("-Infinity".to_owned()));
-                    } else {
-                        m.insert("type".to_owned(), Value::String("Infinity".to_owned()));
-                    }
-                    Value::Object(m)
-                } else if val == 0. && val.is_sign_negative() {
-                    let mut m = Map::new();
-                    m.insert("type".to_owned(), Value::String("-0".to_owned()));
-                    Value::Object(m)
-                } else {
-                    Value::Number(Number::from_f64(val).unwrap())
-                }
-            },
-            StringValue(s) => Value::String(s),
-            ActorValue { class, uuid, name } => {
-                let mut m = Map::new();
-                let actor = ObjectActor::register(registry, Some(uuid), class.clone());
-
-                m.insert("type".to_owned(), Value::String("object".to_owned()));
-                m.insert("class".to_owned(), Value::String(class));
-                m.insert("actor".to_owned(), Value::String(actor));
-                m.insert("extensible".to_owned(), Value::Bool(true));
-                m.insert("frozen".to_owned(), Value::Bool(false));
-                m.insert("sealed".to_owned(), Value::Bool(false));
-                if let Some(name) = name {
-                    m.insert("name".to_owned(), Value::String(name));
-                }
-                Value::Object(m)
-            },
-        };
 
         let reply = EvaluateJSReply {
             from: self.name(),
             input,
-            result,
+            result: debugger_value_to_json(registry, eval_result.value),
             timestamp: get_time_stamp(),
             exception: Value::Null,
             exception_message: Value::Null,
@@ -414,7 +276,7 @@ impl ConsoleActor {
         resource: ConsoleResource,
         id: UniqueId,
         registry: &ActorRegistry,
-        stream: &mut TcpStream,
+        stream: &mut DevtoolsConnection,
     ) {
         self.cached_events
             .borrow_mut()
@@ -429,13 +291,15 @@ impl ConsoleActor {
         }
         let resource_type = resource.resource_type();
         if id == self.current_unique_id(registry) {
-            if let Root::BrowsingContext(bc) = &self.root {
-                registry.find::<BrowsingContextActor>(bc).resource_array(
-                    resource,
-                    resource_type,
-                    ResourceArrayType::Available,
-                    stream,
-                )
+            if let Root::BrowsingContext(browsing_context_name) = &self.root {
+                registry
+                    .find::<BrowsingContextActor>(browsing_context_name)
+                    .resource_array(
+                        resource,
+                        resource_type,
+                        ResourceArrayType::Available,
+                        stream,
+                    )
             };
         }
     }
@@ -444,18 +308,20 @@ impl ConsoleActor {
         &self,
         id: UniqueId,
         registry: &ActorRegistry,
-        stream: &mut TcpStream,
+        stream: &mut DevtoolsConnection,
     ) {
         if id == self.current_unique_id(registry) {
-            if let Root::BrowsingContext(bc) = &self.root {
-                registry.find::<BrowsingContextActor>(bc).resource_array(
-                    ConsoleClearMessage {
-                        level: "clear".to_owned(),
-                    },
-                    "console-message".into(),
-                    ResourceArrayType::Available,
-                    stream,
-                )
+            if let Root::BrowsingContext(browsing_context_name) = &self.root {
+                registry
+                    .find::<BrowsingContextActor>(browsing_context_name)
+                    .resource_array(
+                        ConsoleClearMessage {
+                            level: "clear".to_owned(),
+                        },
+                        "console-message".into(),
+                        ResourceArrayType::Available,
+                        stream,
+                    )
             };
         }
     }
@@ -529,7 +395,7 @@ impl Actor for ConsoleActor {
                 };
                 // Emit an eager reply so that the client starts listening
                 // for an async event with the resultID
-                let stream = request.reply(&early_reply)?;
+                let mut stream = request.reply(&early_reply)?;
 
                 if msg.get("eager").and_then(|v| v.as_bool()).unwrap_or(false) {
                     // We don't support the side-effect free evaluation that eager evaluation

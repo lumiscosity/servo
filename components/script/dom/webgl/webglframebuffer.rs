@@ -5,14 +5,14 @@
 // https://www.khronos.org/registry/webgl/specs/latest/1.0/webgl.idl
 use std::cell::Cell;
 
-use canvas_traits::webgl::{
-    WebGLCommand, WebGLError, WebGLFramebufferBindingRequest, WebGLFramebufferId,
-    WebGLRenderbufferId, WebGLResult, WebGLTextureId, WebGLVersion, webgl_channel,
-};
 use dom_struct::dom_struct;
 #[cfg(feature = "webxr")]
 use euclid::Size2D;
 use script_bindings::weakref::WeakRef;
+use servo_canvas_traits::webgl::{
+    WebGLCommand, WebGLError, WebGLFramebufferBindingRequest, WebGLFramebufferId,
+    WebGLRenderbufferId, WebGLResult, WebGLTextureId, WebGLVersion, webgl_channel,
+};
 #[cfg(feature = "webxr")]
 use webxr_api::Viewport;
 
@@ -892,11 +892,10 @@ impl WebGLFramebuffer {
         Ok(())
     }
 
-    fn with_matching_renderbuffers<F>(&self, rb: &WebGLRenderbuffer, mut closure: F)
+    fn with_matching_renderbuffers_id<F>(&self, rb_id: &WebGLRenderbufferId, mut closure: F)
     where
         F: FnMut(&DomRefCell<Option<WebGLFramebufferAttachment>>, u32),
     {
-        let rb_id = rb.id();
         let attachments = [
             (&self.depth, constants::DEPTH_ATTACHMENT),
             (&self.stencil, constants::STENCIL_ATTACHMENT),
@@ -916,24 +915,23 @@ impl WebGLFramebuffer {
         }
 
         for (attachment, name) in &attachments {
-            if has_matching_id(attachment, &rb_id) {
+            if has_matching_id(attachment, rb_id) {
                 closure(attachment, *name);
             }
         }
 
         for (idx, attachment) in self.colors.iter().enumerate() {
-            if has_matching_id(attachment, &rb_id) {
+            if has_matching_id(attachment, rb_id) {
                 let name = constants::COLOR_ATTACHMENT0 + idx as u32;
                 closure(attachment, name);
             }
         }
     }
 
-    fn with_matching_textures<F>(&self, texture: &WebGLTexture, mut closure: F)
+    fn with_matching_textures_id<F>(&self, tex_id: WebGLTextureId, mut closure: F)
     where
         F: FnMut(&DomRefCell<Option<WebGLFramebufferAttachment>>, u32),
     {
-        let tex_id = texture.id();
         let attachments = [
             (&self.depth, constants::DEPTH_ATTACHMENT),
             (&self.stencil, constants::STENCIL_ATTACHMENT),
@@ -964,13 +962,13 @@ impl WebGLFramebuffer {
         }
     }
 
-    pub(crate) fn detach_renderbuffer(&self, rb: &WebGLRenderbuffer) -> WebGLResult<()> {
+    pub(crate) fn detach_renderbuffer_by_id(&self, rb_id: &WebGLRenderbufferId) -> WebGLResult<()> {
         // Opaque framebuffers cannot have their attachments changed
         // https://immersive-web.github.io/webxr/#opaque-framebuffer
         self.validate_transparent()?;
 
         let mut depth_or_stencil_updated = false;
-        self.with_matching_renderbuffers(rb, |att, name| {
+        self.with_matching_renderbuffers_id(rb_id, |att, name| {
             depth_or_stencil_updated |= INTERESTING_ATTACHMENT_POINTS.contains(&name);
             if let Some(att) = &*att.borrow() {
                 att.detach();
@@ -985,13 +983,13 @@ impl WebGLFramebuffer {
         Ok(())
     }
 
-    pub(crate) fn detach_texture(&self, texture: &WebGLTexture) -> WebGLResult<()> {
+    pub(crate) fn detach_texture(&self, tex_id: WebGLTextureId) -> WebGLResult<()> {
         // Opaque framebuffers cannot have their attachments changed
         // https://immersive-web.github.io/webxr/#opaque-framebuffer
         self.validate_transparent()?;
 
         let mut depth_or_stencil_updated = false;
-        self.with_matching_textures(texture, |att, name| {
+        self.with_matching_textures_id(tex_id, |att, name| {
             depth_or_stencil_updated |= INTERESTING_ATTACHMENT_POINTS.contains(&name);
             if let Some(att) = &*att.borrow() {
                 att.detach();
@@ -1007,14 +1005,14 @@ impl WebGLFramebuffer {
     }
 
     pub(crate) fn invalidate_renderbuffer(&self, rb: &WebGLRenderbuffer) {
-        self.with_matching_renderbuffers(rb, |_att, _| {
+        self.with_matching_renderbuffers_id(&rb.id(), |_att, _| {
             self.is_initialized.set(false);
             self.update_status();
         });
     }
 
     pub(crate) fn invalidate_texture(&self, texture: &WebGLTexture) {
-        self.with_matching_textures(texture, |_att, _name| {
+        self.with_matching_textures_id(texture.id(), |_att, _name| {
             self.update_status();
         });
     }

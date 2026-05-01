@@ -4,7 +4,6 @@
 
 use std::io::{Read, Seek, Write};
 
-use base::id::PipelineId;
 use crossbeam_channel::Sender;
 use cssparser::SourceLocation;
 use encoding_rs::UTF_8;
@@ -15,6 +14,7 @@ use net_traits::{
     ResourceFetchTiming,
 };
 use servo_arc::Arc;
+use servo_base::id::PipelineId;
 use servo_config::pref;
 use servo_url::ServoUrl;
 use style::context::QuirksMode;
@@ -46,7 +46,7 @@ use crate::dom::window::CSSErrorReporter;
 use crate::fetch::{RequestWithGlobalScope, create_a_potential_cors_request};
 use crate::messaging::{CommonScriptMsg, MainThreadScriptMsg};
 use crate::network_listener::{self, FetchResponseListener, ResourceTimingListener};
-use crate::script_runtime::{CanGc, ScriptThreadEventCategory};
+use crate::script_runtime::ScriptThreadEventCategory;
 use crate::task_source::TaskSourceName;
 use crate::unminify::{
     BeautifyFileType, create_output_file, create_temp_files, execute_js_beautify,
@@ -319,9 +319,7 @@ impl StylesheetContext {
                 true => atom!("error"),
                 false => atom!("load"),
             };
-            element
-                .upcast::<EventTarget>()
-                .fire_event(event, CanGc::from_cx(cx));
+            element.upcast::<EventTarget>().fire_event(cx, event);
         }
         // Regardless if there are other pending events, we need to unblock
         // rendering for this particular request and signal that the load has finished
@@ -335,9 +333,12 @@ impl StylesheetContext {
 impl FetchResponseListener for StylesheetContext {
     fn process_request_body(&mut self, _: RequestId) {}
 
-    fn process_request_eof(&mut self, _: RequestId) {}
-
-    fn process_response(&mut self, _: RequestId, metadata: Result<FetchMetadata, NetworkError>) {
+    fn process_response(
+        &mut self,
+        _: &mut js::context::JSContext,
+        _: RequestId,
+        metadata: Result<FetchMetadata, NetworkError>,
+    ) {
         if let Ok(FetchMetadata::Filtered {
             filtered: FilteredMetadata::Opaque | FilteredMetadata::OpaqueRedirect(_),
             ..
@@ -352,7 +353,12 @@ impl FetchResponseListener for StylesheetContext {
         });
     }
 
-    fn process_response_chunk(&mut self, _: RequestId, mut payload: Vec<u8>) {
+    fn process_response_chunk(
+        &mut self,
+        _: &mut js::context::JSContext,
+        _: RequestId,
+        mut payload: Vec<u8>,
+    ) {
         self.data.append(&mut payload);
     }
 
@@ -363,7 +369,7 @@ impl FetchResponseListener for StylesheetContext {
         status: Result<(), NetworkError>,
         timing: ResourceFetchTiming,
     ) {
-        network_listener::submit_timing(&self, &status, &timing, CanGc::from_cx(cx));
+        network_listener::submit_timing(cx, &self, &status, &timing);
 
         let document = self.document.root();
         let Some(metadata) = self.metadata.as_ref() else {
@@ -506,7 +512,8 @@ impl ElementStylesheetLoader<'_> {
         // If element's media attribute's value matches the environment and
         // element is potentially render-blocking, then block rendering on element.
         context.is_render_blocking = element.media_attribute_matches_media_environment() &&
-            owner.potentially_render_blocking();
+            owner.potentially_render_blocking() &&
+            document.allows_adding_render_blocking_elements();
         if context.is_render_blocking {
             document.increment_render_blocking_element_count();
         }

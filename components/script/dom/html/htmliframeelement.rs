@@ -5,11 +5,6 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use base::id::{BrowsingContextId, PipelineId, WebViewId};
-use constellation_traits::{
-    IFrameLoadInfo, IFrameLoadInfoWithData, JsEvalResult, LoadData, LoadOrigin,
-    NavigationHistoryBehavior, ScriptToConstellationMessage,
-};
 use content_security_policy::sandboxing_directive::{
     SandboxingFlagSet, parse_a_sandboxing_directive,
 };
@@ -21,8 +16,12 @@ use js::rust::HandleObject;
 use net_traits::ReferrerPolicy;
 use net_traits::request::Destination;
 use profile_traits::ipc as ProfiledIpc;
-use script_bindings::script_runtime::temp_cx;
 use script_traits::{NewPipelineInfo, UpdatePipelineIdReason};
+use servo_base::id::{BrowsingContextId, PipelineId, WebViewId};
+use servo_constellation_traits::{
+    IFrameLoadInfo, IFrameLoadInfoWithData, LoadData, LoadOrigin, NavigationHistoryBehavior,
+    ScriptToConstellationMessage, TargetSnapshotParams,
+};
 use servo_url::ServoUrl;
 use style::attr::{AttrValue, LengthOrPercentageOrAuto};
 use stylo_atoms::Atom;
@@ -35,14 +34,13 @@ use crate::dom::bindings::codegen::Bindings::WindowBinding::Window_Binding::Wind
 use crate::dom::bindings::codegen::UnionTypes::TrustedHTMLOrString;
 use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::inheritance::Castable;
+use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{DomRoot, LayoutDom, MutNullableDom};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::document::Document;
 use crate::dom::domtokenlist::DOMTokenList;
-use crate::dom::element::{
-    AttributeMutation, Element, LayoutElementHelpers, reflect_referrer_policy_attribute,
-};
+use crate::dom::element::{AttributeMutation, Element, reflect_referrer_policy_attribute};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::html::htmlelement::HTMLElement;
@@ -51,6 +49,9 @@ use crate::dom::performance::performanceresourcetiming::InitiatorType;
 use crate::dom::trustedtypes::trustedhtml::TrustedHTML;
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::dom::windowproxy::WindowProxy;
+use crate::navigation::{
+    determine_creation_sandboxing_flags, determine_iframe_element_referrer_policy,
+};
 use crate::network_listener::ResourceTimingListener;
 use crate::script_runtime::CanGc;
 use crate::script_thread::{ScriptThread, with_script_thread};
@@ -62,8 +63,8 @@ enum PipelineType {
     Navigation,
 }
 
-#[derive(PartialEq)]
-enum ProcessingMode {
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum ProcessingMode {
     FirstTime,
     NotFirstTime,
 }
@@ -116,7 +117,10 @@ pub(crate) struct HTMLIFrameElement {
 
 impl HTMLIFrameElement {
     /// <https://html.spec.whatwg.org/multipage/#shared-attribute-processing-steps-for-iframe-and-frame-elements>,
-    fn shared_attribute_processing_steps_for_iframe_and_frame_elements(&self) -> Option<ServoUrl> {
+    fn shared_attribute_processing_steps_for_iframe_and_frame_elements(
+        &self,
+        _mode: ProcessingMode,
+    ) -> Option<ServoUrl> {
         let element = self.upcast::<Element>();
         // Step 2. If element has a src attribute specified, and its value is not the empty string, then:
         let url = element
@@ -129,7 +133,7 @@ impl HTMLIFrameElement {
                     // Step 2.1. Let maybeURL be the result of encoding-parsing a URL given that attribute's value,
                     // relative to element's node document.
                     // Step 2.2. If maybeURL is not failure, then set url to maybeURL.
-                    self.owner_document().base_url().join(&url).ok()
+                    self.owner_document().encoding_parse_a_url(&url).ok()
                 }
             })
             // Step 1. Let url be the URL record about:blank.
@@ -150,7 +154,9 @@ impl HTMLIFrameElement {
         &self,
         load_data: LoadData,
         history_handling: NavigationHistoryBehavior,
-        cx: &mut js::context::JSContext,
+        mode: ProcessingMode,
+        target_snapshot_params: TargetSnapshotParams,
+        cx: &mut JSContext,
     ) {
         // In case we fired a synchronous load event, but navigate away
         // in the event listener of that event, then we should still
@@ -160,7 +166,14 @@ impl HTMLIFrameElement {
         // of whether we synchronously fired a load in the same microtask.
         self.already_fired_synchronous_load_event.set(false);
 
-        self.start_new_pipeline(load_data, PipelineType::Navigation, history_handling, cx);
+        self.start_new_pipeline(
+            load_data,
+            PipelineType::Navigation,
+            history_handling,
+            mode,
+            target_snapshot_params,
+            cx,
+        );
     }
 
     fn start_new_pipeline(
@@ -168,7 +181,72 @@ impl HTMLIFrameElement {
         mut load_data: LoadData,
         pipeline_type: PipelineType,
         history_handling: NavigationHistoryBehavior,
-        cx: &mut js::context::JSContext,
+        mode: ProcessingMode,
+        target_snapshot_params: TargetSnapshotParams,
+        cx: &mut JSContext,
+    ) {
+        let document = self.owner_document();
+
+        {
+            let load_blocker = &self.load_blocker;
+            // Any oustanding load is finished from the point of view of the blocked
+            // document; the new navigation will continue blocking it.
+            LoadBlocker::terminate(load_blocker, cx);
+
+            *load_blocker.borrow_mut() = Some(LoadBlocker::new(
+                &document,
+                LoadType::Subframe(load_data.url.clone()),
+            ));
+        }
+
+        if load_data.url.scheme() != "javascript" {
+            self.continue_navigation(
+                load_data,
+                pipeline_type,
+                history_handling,
+                target_snapshot_params,
+            );
+            return;
+        }
+
+        // TODO(jdm): The spec uses the navigate algorithm here, but
+        //   our iframe navigation is not yet unified enough to follow that.
+        //   Eventually we should remove the task and invoke ScriptThread::navigate instead.
+        let iframe = Trusted::new(self);
+        let doc = Trusted::new(&*document);
+        document
+            .global()
+            .task_manager()
+            .networking_task_source()
+            .queue(task!(navigate_to_javascript: move |cx| {
+                let this = iframe.root();
+                let window_proxy = this.GetContentWindow();
+                if let Some(window_proxy) = window_proxy {
+                    // If this method returns false we are not creating a new
+                    // document and the frame can be considered loaded.
+                    if !ScriptThread::navigate_to_javascript_url(
+                        cx,
+                        &this.owner_global(),
+                        &window_proxy.global(),
+                        &mut load_data,
+                        Some(this.upcast()),
+                        Some(mode == ProcessingMode::FirstTime),
+                    ) {
+                        LoadBlocker::terminate(&this.load_blocker, cx);
+                        return;
+                    }
+                    load_data.about_base_url = doc.root().about_base_url();
+                }
+                this.continue_navigation(load_data, pipeline_type, history_handling, target_snapshot_params);
+            }));
+    }
+
+    fn continue_navigation(
+        &self,
+        load_data: LoadData,
+        pipeline_type: PipelineType,
+        history_handling: NavigationHistoryBehavior,
+        target_snapshot_params: TargetSnapshotParams,
     ) {
         let browsing_context_id = match self.browsing_context_id() {
             None => return warn!("Attempted to start a new pipeline on an unattached iframe."),
@@ -178,42 +256,6 @@ impl HTMLIFrameElement {
         let webview_id = match self.webview_id() {
             None => return warn!("Attempted to start a new pipeline on an unattached iframe."),
             Some(id) => id,
-        };
-
-        let document = self.owner_document();
-
-        {
-            let load_blocker = &self.load_blocker;
-            // Any oustanding load is finished from the point of view of the blocked
-            // document; the new navigation will continue blocking it.
-            LoadBlocker::terminate(load_blocker, cx);
-        }
-
-        if load_data.url.scheme() == "javascript" {
-            let window_proxy = self.GetContentWindow();
-            if let Some(window_proxy) = window_proxy {
-                if !ScriptThread::navigate_to_javascript_url(
-                    cx,
-                    &document.global(),
-                    &window_proxy.global(),
-                    &mut load_data,
-                    Some(self.upcast()),
-                ) {
-                    return;
-                }
-                load_data.about_base_url = document.about_base_url();
-            }
-        }
-
-        match load_data.js_eval_result {
-            Some(JsEvalResult::NoContent) => (),
-            _ => {
-                let mut load_blocker = self.load_blocker.borrow_mut();
-                *load_blocker = Some(LoadBlocker::new(
-                    &document,
-                    LoadType::Subframe(load_data.url.clone()),
-                ));
-            },
         };
 
         let window = self.owner_window();
@@ -229,6 +271,7 @@ impl HTMLIFrameElement {
             is_private: false, // FIXME
             inherited_secure_context: load_data.inherited_secure_context,
             history_handling,
+            target_snapshot_params,
         };
 
         let viewport_details = window
@@ -265,6 +308,7 @@ impl HTMLIFrameElement {
                     viewport_details,
                     user_content_manager_id: None,
                     theme: window.theme(),
+                    target_snapshot_params,
                 };
 
                 self.pipeline_id.set(Some(new_pipeline_id));
@@ -301,7 +345,12 @@ impl HTMLIFrameElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#navigate-an-iframe-or-frame>
-    fn navigate_an_iframe_or_frame(&self, cx: &mut js::context::JSContext, load_data: LoadData) {
+    fn navigate_an_iframe_or_frame(
+        &self,
+        cx: &mut JSContext,
+        load_data: LoadData,
+        mode: ProcessingMode,
+    ) {
         // Step 2. If element's content navigable's active document is not completely loaded,
         // then set historyHandling to "replace".
         let history_handling = if !self
@@ -320,7 +369,14 @@ impl HTMLIFrameElement {
         // Step 4. Navigate element's content navigable to url using element's node document,
         // with historyHandling set to historyHandling, referrerPolicy set to referrerPolicy,
         // documentResource set to srcdocString, and initialInsertion set to initialInsertion.
-        self.navigate_or_reload_child_browsing_context(load_data, history_handling, cx);
+        let target_snapshot_params = snapshot_self(self);
+        self.navigate_or_reload_child_browsing_context(
+            load_data,
+            history_handling,
+            mode,
+            target_snapshot_params,
+            cx,
+        );
     }
 
     /// <https://html.spec.whatwg.org/multipage/#will-lazy-load-element-steps>
@@ -335,7 +391,7 @@ impl HTMLIFrameElement {
     }
 
     /// Step 1.3. of <https://html.spec.whatwg.org/multipage/#process-the-iframe-attributes>
-    fn navigate_to_the_srcdoc_resource(&self, cx: &mut js::context::JSContext) {
+    fn navigate_to_the_srcdoc_resource(&self, mode: ProcessingMode, cx: &mut JSContext) {
         // Step 1.3. Navigate to the srcdoc resource: Navigate an iframe or frame given element,
         // about:srcdoc, the empty string, and the value of element's srcdoc attribute.
         let url = ServoUrl::parse("about:srcdoc").unwrap();
@@ -361,11 +417,11 @@ impl HTMLIFrameElement {
                 .get_string_attribute(&local_name!("srcdoc")),
         );
 
-        self.navigate_an_iframe_or_frame(cx, load_data);
+        self.navigate_an_iframe_or_frame(cx, load_data, mode);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#the-iframe-element:potentially-delays-the-load-event>
-    fn mark_navigation_as_lazy_loaded(&self, cx: &mut js::context::JSContext) {
+    fn mark_navigation_as_lazy_loaded(&self, cx: &mut JSContext) {
         // > An iframe element whose current navigation was lazy loaded boolean is false potentially delays the load event.
         self.current_navigation_was_lazy_loaded.set(true);
         let blocker = &self.load_blocker;
@@ -373,8 +429,9 @@ impl HTMLIFrameElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#process-the-iframe-attributes>
-    fn process_the_iframe_attributes(&self, mode: ProcessingMode, cx: &mut js::context::JSContext) {
+    fn process_the_iframe_attributes(&self, mode: ProcessingMode, cx: &mut JSContext) {
         let element = self.upcast::<Element>();
+
         // Step 1. If `element`'s `srcdoc` attribute is specified, then:
         //
         // Note that this also includes the empty string
@@ -396,7 +453,7 @@ impl HTMLIFrameElement {
             }
             // Step 1.3. Navigate to the srcdoc resource: Navigate an iframe or frame given element,
             // about:srcdoc, the empty string, and the value of element's srcdoc attribute.
-            self.navigate_to_the_srcdoc_resource(cx);
+            self.navigate_to_the_srcdoc_resource(mode, cx);
             return;
         }
 
@@ -418,7 +475,7 @@ impl HTMLIFrameElement {
 
         // Step 2.1. Let url be the result of running the shared attribute processing steps
         // for iframe and frame elements given element and initialInsertion.
-        let Some(url) = self.shared_attribute_processing_steps_for_iframe_and_frame_elements()
+        let Some(url) = self.shared_attribute_processing_steps_for_iframe_and_frame_elements(mode)
         else {
             // Step 2.2. If url is null, then return.
             return;
@@ -429,14 +486,7 @@ impl HTMLIFrameElement {
             // We should **not** send a load event in `iframe_load_event_steps`.
             self.already_fired_synchronous_load_event.set(true);
             // Step 2.3.1. Run the iframe load event steps given element.
-            //
-            // Note: we are not actually calling that method. That's because
-            // `iframe_load_event_steps` currently doesn't adhere to the spec
-            // at all. In this case, WPT tests only care about the load event,
-            // so we can fire that. Following https://github.com/servo/servo/issues/31973
-            // we should call `iframe_load_event_steps` once it is spec-compliant.
-            self.upcast::<EventTarget>()
-                .fire_event(atom!("load"), CanGc::from_cx(cx));
+            self.run_iframe_load_event_steps(cx);
             // Step 2.3.2. Return.
             return;
         }
@@ -516,7 +566,14 @@ impl HTMLIFrameElement {
             NavigationHistoryBehavior::Push
         };
 
-        self.navigate_or_reload_child_browsing_context(load_data, history_handling, cx);
+        let target_snapshot_params = snapshot_self(self);
+        self.navigate_or_reload_child_browsing_context(
+            load_data,
+            history_handling,
+            mode,
+            target_snapshot_params,
+            cx,
+        );
     }
 
     /// <https://html.spec.whatwg.org/multipage/#create-a-new-child-navigable>
@@ -526,7 +583,7 @@ impl HTMLIFrameElement {
     /// For now only the iframe load event steps are skipped in some cases for this initial document,
     /// and we still fire load and pageshow events as part of `maybe_queue_document_completion`.
     /// Also, some controversy spec-wise remains: <https://github.com/whatwg/html/issues/4965>
-    fn create_nested_browsing_context(&self, cx: &mut js::context::JSContext) {
+    fn create_nested_browsing_context(&self, cx: &mut JSContext) {
         let url = ServoUrl::parse("about:blank").unwrap();
         let document = self.owner_document();
         let window = self.owner_window();
@@ -556,6 +613,8 @@ impl HTMLIFrameElement {
             load_data,
             PipelineType::InitialAboutBlank,
             NavigationHistoryBehavior::Push,
+            ProcessingMode::FirstTime,
+            snapshot_self(self),
             cx,
         );
     }
@@ -570,12 +629,15 @@ impl HTMLIFrameElement {
         }
     }
 
+    /// Returns true if the contained pipeline was updated, false otherwise.
+    /// This can occur if the iframe's nested browsing context has changed
+    /// since the asynchronous update was started.
     pub(crate) fn update_pipeline_id(
         &self,
         new_pipeline_id: PipelineId,
         reason: UpdatePipelineIdReason,
-        cx: &mut js::context::JSContext,
-    ) {
+        cx: &mut JSContext,
+    ) -> bool {
         // For all updates except the one for the initial blank document,
         // we need to set the flag back to false because the navigation is complete,
         // because the goal is to, when a navigation is pending, to skip the async load
@@ -586,7 +648,7 @@ impl HTMLIFrameElement {
         if self.pending_pipeline_id.get() != Some(new_pipeline_id) &&
             reason == UpdatePipelineIdReason::Navigation
         {
-            return;
+            return false;
         }
 
         self.pipeline_id.set(Some(new_pipeline_id));
@@ -599,6 +661,7 @@ impl HTMLIFrameElement {
         }
 
         self.upcast::<Node>().dirty(NodeDamage::Other);
+        true
     }
 
     fn new_inherited(
@@ -626,19 +689,19 @@ impl HTMLIFrameElement {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
     ) -> DomRoot<HTMLIFrameElement> {
         Node::reflect_node_with_proto(
+            cx,
             Box::new(HTMLIFrameElement::new_inherited(
                 local_name, prefix, document,
             )),
             document,
             proto,
-            can_gc,
         )
     }
 
@@ -678,11 +741,7 @@ impl HTMLIFrameElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#iframe-load-event-steps>
-    pub(crate) fn iframe_load_event_steps(
-        &self,
-        loaded_pipeline: PipelineId,
-        cx: &mut js::context::JSContext,
-    ) {
+    pub(crate) fn iframe_load_event_steps(&self, loaded_pipeline: PipelineId, cx: &mut JSContext) {
         // TODO(#9592): assert that the load blocker is present at all times when we
         //              can guarantee that it's created for the case of iframe.reload().
         if Some(loaded_pipeline) != self.pending_pipeline_id.get() {
@@ -728,15 +787,31 @@ impl HTMLIFrameElement {
             // do not fire if there is a pending navigation.
             !self.pending_navigation.get()
         };
+
         // If we already fired a synchronous load event, we shouldn't fire another
         // one in this method.
         let should_fire_event =
             !self.already_fired_synchronous_load_event.replace(false) && should_fire_event;
         if should_fire_event {
-            // Step 6. Fire an event named load at element.
-            self.upcast::<EventTarget>()
-                .fire_event(atom!("load"), CanGc::from_cx(cx));
+            self.run_iframe_load_event_steps(cx);
+        } else {
+            debug!(
+                "suppressing load event for iframe, loaded {:?}",
+                loaded_pipeline
+            );
         }
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#iframe-load-event-steps>
+    pub(crate) fn run_iframe_load_event_steps(&self, cx: &mut JSContext) {
+        // TODO 1. Assert: element's content navigable is not null.
+
+        // TODO 2-4 Mark resource timing.
+
+        // TODO 5 Set childDocument's iframe load in progress flag.
+
+        // Step 6. Fire an event named load at element.
+        self.upcast::<EventTarget>().fire_event(cx, atom!("load"));
 
         let blocker = &self.load_blocker;
         LoadBlocker::terminate(blocker, cx);
@@ -764,7 +839,7 @@ impl HTMLIFrameElement {
     }
 
     /// Step 4.2. of <https://html.spec.whatwg.org/multipage/#destroy-a-document-and-its-descendants>
-    pub(crate) fn destroy_document_and_its_descendants(&self, cx: &mut js::context::JSContext) {
+    pub(crate) fn destroy_document_and_its_descendants(&self, cx: &mut JSContext) {
         let Some(pipeline_id) = self.pipeline_id.get() else {
             return;
         };
@@ -776,7 +851,7 @@ impl HTMLIFrameElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#destroy-a-child-navigable>
-    fn destroy_child_navigable(&self, cx: &mut js::context::JSContext) {
+    fn destroy_child_navigable(&self, cx: &mut JSContext) {
         let blocker = &self.load_blocker;
         LoadBlocker::terminate(blocker, cx);
 
@@ -835,25 +910,18 @@ impl HTMLIFrameElement {
     }
 }
 
-pub(crate) trait HTMLIFrameElementLayoutMethods {
-    fn pipeline_id(self) -> Option<PipelineId>;
-    fn browsing_context_id(self) -> Option<BrowsingContextId>;
-    fn get_width(self) -> LengthOrPercentageOrAuto;
-    fn get_height(self) -> LengthOrPercentageOrAuto;
-}
-
-impl HTMLIFrameElementLayoutMethods for LayoutDom<'_, HTMLIFrameElement> {
+impl LayoutDom<'_, HTMLIFrameElement> {
     #[inline]
-    fn pipeline_id(self) -> Option<PipelineId> {
+    pub(crate) fn pipeline_id(self) -> Option<PipelineId> {
         (self.unsafe_get()).pipeline_id.get()
     }
 
     #[inline]
-    fn browsing_context_id(self) -> Option<BrowsingContextId> {
+    pub(crate) fn browsing_context_id(self) -> Option<BrowsingContextId> {
         (self.unsafe_get()).browsing_context_id.get()
     }
 
-    fn get_width(self) -> LengthOrPercentageOrAuto {
+    pub(crate) fn get_width(self) -> LengthOrPercentageOrAuto {
         self.upcast::<Element>()
             .get_attr_for_layout(&ns!(), &local_name!("width"))
             .map(AttrValue::as_dimension)
@@ -861,7 +929,7 @@ impl HTMLIFrameElementLayoutMethods for LayoutDom<'_, HTMLIFrameElement> {
             .unwrap_or(LengthOrPercentageOrAuto::Auto)
     }
 
-    fn get_height(self) -> LengthOrPercentageOrAuto {
+    pub(crate) fn get_height(self) -> LengthOrPercentageOrAuto {
         self.upcast::<Element>()
             .get_attr_for_layout(&ns!(), &local_name!("height"))
             .map(AttrValue::as_dimension)
@@ -875,7 +943,7 @@ impl HTMLIFrameElementMethods<crate::DomTypeHolder> for HTMLIFrameElement {
     make_url_getter!(Src, "src");
 
     // https://html.spec.whatwg.org/multipage/#dom-iframe-src
-    make_url_setter!(SetSrc, "src");
+    make_url_setter!(cx, SetSrc, "src");
 
     /// <https://html.spec.whatwg.org/multipage/#dom-iframe-srcdoc>
     fn Srcdoc(&self) -> TrustedHTMLOrString {
@@ -884,22 +952,22 @@ impl HTMLIFrameElementMethods<crate::DomTypeHolder> for HTMLIFrameElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-iframe-srcdoc>
-    fn SetSrcdoc(&self, value: TrustedHTMLOrString, can_gc: CanGc) -> Fallible<()> {
+    fn SetSrcdoc(&self, cx: &mut JSContext, value: TrustedHTMLOrString) -> Fallible<()> {
         // Step 1: Let compliantString be the result of invoking the
         // Get Trusted Type compliant string algorithm with TrustedHTML,
         // this's relevant global object, the given value, "HTMLIFrameElement srcdoc", and "script".
         let element = self.upcast::<Element>();
-        let value = TrustedHTML::get_trusted_script_compliant_string(
+        let value = TrustedHTML::get_trusted_type_compliant_string(
+            cx,
             &element.owner_global(),
             value,
             "HTMLIFrameElement srcdoc",
-            can_gc,
         )?;
         // Step 2: Set an attribute value given this, srcdoc's local name, and compliantString.
         element.set_attribute(
             &local_name!("srcdoc"),
             AttrValue::String(value.str().to_owned()),
-            can_gc,
+            CanGc::from_cx(cx),
         );
         Ok(())
     }
@@ -909,7 +977,7 @@ impl HTMLIFrameElementMethods<crate::DomTypeHolder> for HTMLIFrameElement {
     /// The supported tokens for sandbox's DOMTokenList are the allowed values defined in the
     /// sandbox attribute and supported by the user agent. These range of possible values is
     /// defined here: <https://html.spec.whatwg.org/multipage/#attr-iframe-sandbox>
-    fn Sandbox(&self, can_gc: CanGc) -> DomRoot<DOMTokenList> {
+    fn Sandbox(&self, cx: &mut JSContext) -> DomRoot<DOMTokenList> {
         self.sandbox.or_init(|| {
             DOMTokenList::new(
                 self.upcast::<Element>(),
@@ -929,7 +997,7 @@ impl HTMLIFrameElementMethods<crate::DomTypeHolder> for HTMLIFrameElement {
                     Atom::from("allow-top-navigation-by-user-activation"),
                     Atom::from("allow-top-navigation-to-custom-protocols"),
                 ]),
-                can_gc,
+                CanGc::from_cx(cx),
             )
         })
     }
@@ -954,7 +1022,7 @@ impl HTMLIFrameElementMethods<crate::DomTypeHolder> for HTMLIFrameElement {
         if !self
             .owner_document()
             .origin()
-            .same_origin_domain(document.origin())
+            .same_origin_domain(&document.origin())
         {
             return None;
         }
@@ -968,12 +1036,12 @@ impl HTMLIFrameElementMethods<crate::DomTypeHolder> for HTMLIFrameElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#attr-iframe-referrerpolicy
-    make_setter!(SetReferrerPolicy, "referrerpolicy");
+    make_setter!(cx, SetReferrerPolicy, "referrerpolicy");
 
     // https://html.spec.whatwg.org/multipage/#attr-iframe-allowfullscreen
     make_bool_getter!(AllowFullscreen, "allowfullscreen");
     // https://html.spec.whatwg.org/multipage/#attr-iframe-allowfullscreen
-    make_bool_setter!(SetAllowFullscreen, "allowfullscreen");
+    make_bool_setter!(cx, SetAllowFullscreen, "allowfullscreen");
 
     // <https://html.spec.whatwg.org/multipage/#dom-dim-width>
     make_getter!(Width, "width");
@@ -988,12 +1056,12 @@ impl HTMLIFrameElementMethods<crate::DomTypeHolder> for HTMLIFrameElement {
     // https://html.spec.whatwg.org/multipage/#other-elements,-attributes-and-apis:attr-iframe-frameborder
     make_getter!(FrameBorder, "frameborder");
     // https://html.spec.whatwg.org/multipage/#other-elements,-attributes-and-apis:attr-iframe-frameborder
-    make_setter!(SetFrameBorder, "frameborder");
+    make_setter!(cx, SetFrameBorder, "frameborder");
 
     // https://html.spec.whatwg.org/multipage/#dom-iframe-name
     // A child browsing context checks the name of its iframe only at the time
     // it is created; subsequent name sets have no special effect.
-    make_atomic_setter!(SetName, "name");
+    make_atomic_setter!(cx, SetName, "name");
 
     // https://html.spec.whatwg.org/multipage/#dom-iframe-name
     // This is specified as reflecting the name content attribute of the
@@ -1013,7 +1081,13 @@ impl HTMLIFrameElementMethods<crate::DomTypeHolder> for HTMLIFrameElement {
     );
 
     // https://html.spec.whatwg.org/multipage/#attr-iframe-loading
-    make_setter!(SetLoading, "loading");
+    make_setter!(cx, SetLoading, "loading");
+
+    // https://html.spec.whatwg.org/multipage/#dom-iframe-longdesc
+    make_url_getter!(LongDesc, "longdesc");
+
+    // https://html.spec.whatwg.org/multipage/#dom-iframe-longdesc
+    make_url_setter!(cx, SetLongDesc, "longdesc");
 }
 
 impl VirtualMethods for HTMLIFrameElement {
@@ -1021,14 +1095,10 @@ impl VirtualMethods for HTMLIFrameElement {
         Some(self.upcast::<HTMLElement>() as &dyn VirtualMethods)
     }
 
-    #[expect(unsafe_code)]
-    fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation, _can_gc: CanGc) {
-        // TODO: https://github.com/servo/servo/issues/42812
-        let mut cx = unsafe { temp_cx() };
-        let cx = &mut cx;
+    fn attribute_mutated(&self, cx: &mut JSContext, attr: &Attr, mutation: AttributeMutation) {
         self.super_type()
             .unwrap()
-            .attribute_mutated(attr, mutation, CanGc::from_cx(cx));
+            .attribute_mutated(cx, attr, mutation);
         match *attr.local_name() {
             // From <https://html.spec.whatwg.org/multipage/#attr-iframe-sandbox>:
             //
@@ -1090,7 +1160,7 @@ impl VirtualMethods for HTMLIFrameElement {
                     LazyLoadResumptionSteps::None => (),
                     LazyLoadResumptionSteps::SrcDoc => {
                         // Step 4. Invoke resumptionSteps.
-                        self.navigate_to_the_srcdoc_resource(cx);
+                        self.navigate_to_the_srcdoc_resource(ProcessingMode::NotFirstTime, cx);
                     },
                 }
             },
@@ -1146,23 +1216,19 @@ impl VirtualMethods for HTMLIFrameElement {
         self.process_the_iframe_attributes(ProcessingMode::FirstTime, cx);
     }
 
-    fn bind_to_tree(&self, context: &BindContext, can_gc: CanGc) {
+    fn bind_to_tree(&self, cx: &mut JSContext, context: &BindContext) {
         if let Some(s) = self.super_type() {
-            s.bind_to_tree(context, can_gc);
+            s.bind_to_tree(cx, context);
         }
         self.owner_document().invalidate_iframes_collection();
     }
 
     /// <https://html.spec.whatwg.org/multipage/#the-iframe-element:html-element-removing-steps>
-    #[expect(unsafe_code)]
-    fn unbind_from_tree(&self, context: &UnbindContext, can_gc: CanGc) {
-        self.super_type().unwrap().unbind_from_tree(context, can_gc);
-
-        // TODO: https://github.com/servo/servo/issues/42837
-        let mut cx = unsafe { temp_cx() };
+    fn unbind_from_tree(&self, cx: &mut JSContext, context: &UnbindContext) {
+        self.super_type().unwrap().unbind_from_tree(cx, context);
 
         // The iframe HTML element removing steps, given removedNode, are to destroy a child navigable given removedNode
-        self.destroy_child_navigable(&mut cx);
+        self.destroy_child_navigable(cx);
 
         self.owner_document().invalidate_iframes_collection();
     }
@@ -1183,7 +1249,9 @@ impl<'a> IframeContext<'a> {
         Self {
             element,
             url: element
-                .shared_attribute_processing_steps_for_iframe_and_frame_elements()
+                .shared_attribute_processing_steps_for_iframe_and_frame_elements(
+                    ProcessingMode::NotFirstTime,
+                )
                 .expect("Must always have a URL when navigating"),
         }
     }
@@ -1199,5 +1267,18 @@ impl<'a> ResourceTimingListener for IframeContext<'a> {
 
     fn resource_timing_global(&self) -> DomRoot<GlobalScope> {
         self.element.upcast::<Node>().owner_doc().global()
+    }
+}
+
+fn snapshot_self(iframe: &HTMLIFrameElement) -> TargetSnapshotParams {
+    let child_navigable = iframe.GetContentWindow();
+    TargetSnapshotParams {
+        sandboxing_flags: determine_creation_sandboxing_flags(
+            child_navigable.as_deref(),
+            Some(iframe.upcast()),
+        ),
+        iframe_element_referrer_policy: determine_iframe_element_referrer_policy(Some(
+            iframe.upcast(),
+        )),
     }
 }

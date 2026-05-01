@@ -6,8 +6,6 @@ use std::cell::{Cell, RefCell};
 use std::ptr;
 use std::rc::Rc;
 
-use base::id::{MessagePortId, MessagePortIndex};
-use constellation_traits::{MessagePortImpl, PortMessageTask};
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::jsapi::{Heap, JS_NewObject, JSObject};
@@ -15,6 +13,8 @@ use js::jsval::UndefinedValue;
 use js::rust::{CustomAutoRooter, CustomAutoRooterGuard, HandleValue};
 use rustc_hash::FxHashMap;
 use script_bindings::conversions::SafeToJSValConvertible;
+use servo_base::id::{MessagePortId, MessagePortIndex};
+use servo_constellation_traits::{MessagePortImpl, PortMessageTask};
 
 use crate::dom::bindings::codegen::Bindings::EventHandlerBinding::EventHandlerNonNull;
 use crate::dom::bindings::codegen::Bindings::MessagePortBinding::{
@@ -107,9 +107,9 @@ impl MessagePort {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#handler-messageport-onmessage>
-    fn set_onmessage(&self, listener: Option<Rc<EventHandlerNonNull>>) {
+    fn set_onmessage(&self, cx: &mut JSContext, listener: Option<Rc<EventHandlerNonNull>>) {
         let eventtarget = self.upcast::<EventTarget>();
-        eventtarget.set_event_handler_common("message", listener);
+        eventtarget.set_event_handler_common(cx, "message", listener);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#message-port-post-message-steps>
@@ -333,16 +333,15 @@ impl MessagePortMethods<crate::DomTypeHolder> for MessagePort {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-messageport-start>
-    fn Start(&self, can_gc: CanGc) {
+    fn Start(&self, cx: &mut JSContext) {
         if self.detached.get() {
             return;
         }
-        self.global()
-            .start_message_port(self.message_port_id(), can_gc);
+        self.global().start_message_port(cx, self.message_port_id());
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-messageport-close>
-    fn Close(&self, can_gc: CanGc) {
+    fn Close(&self, cx: &mut JSContext) {
         // Set this's [[Detached]] internal slot value to true.
         self.detached.set(true);
 
@@ -350,27 +349,26 @@ impl MessagePortMethods<crate::DomTypeHolder> for MessagePort {
         global.close_message_port(self.message_port_id());
 
         // If this is entangled, disentangle it.
-        global.disentangle_port(self, can_gc);
+        global.disentangle_port(cx, self);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#handler-messageport-onmessage>
-    fn GetOnmessage(&self, can_gc: CanGc) -> Option<Rc<EventHandlerNonNull>> {
+    fn GetOnmessage(&self, cx: &mut JSContext) -> Option<Rc<EventHandlerNonNull>> {
         if self.detached.get() {
             return None;
         }
         let eventtarget = self.upcast::<EventTarget>();
-        eventtarget.get_event_handler_common("message", can_gc)
+        eventtarget.get_event_handler_common(cx, "message")
     }
 
     /// <https://html.spec.whatwg.org/multipage/#handler-messageport-onmessage>
-    fn SetOnmessage(&self, listener: Option<Rc<EventHandlerNonNull>>, can_gc: CanGc) {
+    fn SetOnmessage(&self, cx: &mut JSContext, listener: Option<Rc<EventHandlerNonNull>>) {
         if self.detached.get() {
             return;
         }
-        self.set_onmessage(listener);
+        self.set_onmessage(cx, listener);
         // Note: we cannot use the event_handler macro, due to the need to start the port.
-        self.global()
-            .start_message_port(self.message_port_id(), can_gc);
+        self.global().start_message_port(cx, self.message_port_id());
     }
 
     // <https://html.spec.whatwg.org/multipage/#handler-messageport-onmessageerror>

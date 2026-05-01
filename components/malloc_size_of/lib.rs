@@ -59,7 +59,6 @@ use resvg::usvg::{self, tiny_skia_path};
 use style::properties::ComputedValues;
 use style::values::generics::length::GenericLengthPercentageOrAuto;
 pub use stylo_malloc_size_of::MallocSizeOfOps;
-use uuid::Uuid;
 
 /// Trait for measuring the "deep" heap usage of a data structure. This is the
 /// most commonly-used of the traits.
@@ -389,6 +388,13 @@ impl<T: MallocSizeOf> MallocSizeOf for std::collections::VecDeque<T> {
             n += elem.size_of(ops);
         }
         n
+    }
+}
+
+impl MallocSizeOf for std::path::PathBuf {
+    fn size_of(&self, _ops: &mut MallocSizeOfOps) -> usize {
+        // This should be an approximation of the actual size
+        self.as_os_str().as_encoded_bytes().len()
     }
 }
 
@@ -1073,6 +1079,12 @@ impl<T> MallocSizeOf for tokio::sync::mpsc::UnboundedSender<T> {
     }
 }
 
+impl<T> MallocSizeOf for tokio::sync::oneshot::Sender<T> {
+    fn size_of(&self, _ops: &mut MallocSizeOfOps) -> usize {
+        0
+    }
+}
+
 impl<T> MallocSizeOf for ipc_channel::ipc::IpcSender<T> {
     fn size_of(&self, _ops: &mut MallocSizeOfOps) -> usize {
         0
@@ -1109,6 +1121,22 @@ impl MallocSizeOf for servo_arc::Arc<ComputedValues> {
     }
 }
 
+impl MallocSizeOf for http::HeaderMap {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        // The headermap in http is more complicated than a simple hashmap
+        // However, this should give us a reasonable approximation.
+        self.iter()
+            .map(|entry| entry.0.size_of(ops) + entry.1.size_of(ops))
+            .sum()
+    }
+}
+
+impl MallocSizeOf for data_url::mime::Mime {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.type_.size_of(ops) + self.parameters.size_of(ops) + self.subtype.size_of(ops)
+    }
+}
+
 malloc_size_of_hash_map!(indexmap::IndexMap<K, V, S>);
 malloc_size_of_hash_set!(indexmap::IndexSet<T, S>);
 
@@ -1117,11 +1145,15 @@ malloc_size_of_is_0!(f32, f64);
 malloc_size_of_is_0!(i8, i16, i32, i64, i128, isize);
 malloc_size_of_is_0!(u8, u16, u32, u64, u128, usize);
 
-malloc_size_of_is_0!(Uuid);
+malloc_size_of_is_0!(uuid::Uuid);
 malloc_size_of_is_0!(app_units::Au);
 malloc_size_of_is_0!(content_security_policy::Destination);
 malloc_size_of_is_0!(content_security_policy::sandboxing_directive::SandboxingFlagSet);
+malloc_size_of_is_0!(encoding_rs::Decoder);
 malloc_size_of_is_0!(http::StatusCode);
+malloc_size_of_is_0!(http::Method);
+malloc_size_of_is_0!(icu_locid::subtags::Language);
+malloc_size_of_is_0!(keyboard_types::Code);
 malloc_size_of_is_0!(keyboard_types::Modifiers);
 malloc_size_of_is_0!(mime::Mime);
 malloc_size_of_is_0!(resvg::usvg::fontdb::ID);
@@ -1149,11 +1181,24 @@ malloc_size_of_is_0!(style::stylesheets::Stylesheet);
 malloc_size_of_is_0!(style::stylesheets::FontFaceRule);
 malloc_size_of_is_0!(style::values::specified::source_size_list::SourceSizeList);
 malloc_size_of_is_0!(taffy::Layout);
+malloc_size_of_is_0!(time::Duration);
 malloc_size_of_is_0!(unicode_bidi::Level);
 malloc_size_of_is_0!(unicode_script::Script);
-malloc_size_of_is_0!(urlpattern::UrlPattern);
-malloc_size_of_is_0!(utf8::Incomplete);
 malloc_size_of_is_0!(std::net::TcpStream);
+
+impl MallocSizeOf for urlpattern::UrlPattern {
+    fn size_of(&self, _ops: &mut MallocSizeOfOps) -> usize {
+        // This is an approximation
+        self.protocol().len() +
+            self.username().len() +
+            self.password().len() +
+            self.hostname().len() +
+            self.port().len() +
+            self.pathname().len() +
+            self.search().len() +
+            self.hash().len()
+    }
+}
 
 impl<S: tendril::TendrilSink<tendril::fmt::UTF8, A>, A: tendril::Atomicity> MallocSizeOf
     for tendril::stream::LossyDecoder<S, A>
@@ -1182,6 +1227,7 @@ macro_rules! malloc_size_of_is_webrender_malloc_size_of(
     );
 );
 
+malloc_size_of_is_webrender_malloc_size_of!(webrender::FastTransform<webrender_api::units::LayoutPixel, webrender_api::units::LayoutPixel>);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::BorderRadius);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::BorderStyle);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::BoxShadowClipMode);
@@ -1189,9 +1235,10 @@ malloc_size_of_is_webrender_malloc_size_of!(webrender_api::ColorF);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::Epoch);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::ExtendMode);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::ExternalScrollId);
-malloc_size_of_is_webrender_malloc_size_of!(webrender_api::FontKey);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::FontInstanceFlags);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::FontInstanceKey);
+malloc_size_of_is_webrender_malloc_size_of!(webrender_api::FontKey);
+malloc_size_of_is_webrender_malloc_size_of!(webrender_api::FontVariation);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::GlyphInstance);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::GradientStop);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::ImageKey);
@@ -1200,13 +1247,14 @@ malloc_size_of_is_webrender_malloc_size_of!(webrender_api::LineStyle);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::MixBlendMode);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::NormalBorder);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::PipelineId);
+malloc_size_of_is_webrender_malloc_size_of!(
+    webrender_api::PropertyBindingKey<webrender_api::ColorF>
+);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::ReferenceFrameKind);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::RepeatMode);
-malloc_size_of_is_webrender_malloc_size_of!(webrender_api::FontVariation);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::SpatialId);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::StickyOffsetBounds);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::TransformStyle);
-malloc_size_of_is_webrender_malloc_size_of!(webrender::FastTransform<webrender_api::units::LayoutPixel,webrender_api::units::LayoutPixel>);
 
 macro_rules! malloc_size_of_is_stylo_malloc_size_of(
     ($($ty:ty),+) => (
@@ -1262,6 +1310,7 @@ malloc_size_of_is_stylo_malloc_size_of!(style::attr::AttrValue);
 malloc_size_of_is_stylo_malloc_size_of!(style::color::AbsoluteColor);
 malloc_size_of_is_stylo_malloc_size_of!(style::computed_values::font_variant_caps::T);
 malloc_size_of_is_stylo_malloc_size_of!(style::computed_values::text_decoration_style::T);
+malloc_size_of_is_stylo_malloc_size_of!(style::computed_values::text_rendering::T);
 malloc_size_of_is_stylo_malloc_size_of!(style::dom::OpaqueNode);
 malloc_size_of_is_stylo_malloc_size_of!(style::invalidation::element::restyle_hints::RestyleHint);
 malloc_size_of_is_stylo_malloc_size_of!(style::logical_geometry::WritingMode);
@@ -1293,6 +1342,7 @@ malloc_size_of_is_stylo_malloc_size_of!(style::values::specified::font::XLang);
 malloc_size_of_is_stylo_malloc_size_of!(style::values::specified::TextDecorationLine);
 malloc_size_of_is_stylo_malloc_size_of!(stylo_dom::ElementState);
 malloc_size_of_is_stylo_malloc_size_of!(style::computed_values::font_optical_sizing::T);
+malloc_size_of_is_stylo_malloc_size_of!(style::computed_values::font_kerning::T);
 
 impl<T> MallocSizeOf for GenericLengthPercentageOrAuto<T>
 where

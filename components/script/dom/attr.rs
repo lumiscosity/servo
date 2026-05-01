@@ -9,6 +9,7 @@ use std::sync::LazyLock;
 use devtools_traits::AttrInfo;
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Namespace, Prefix, local_name, ns};
+use js::context::JSContext;
 use style::attr::{AttrIdentifier, AttrValue};
 use style::values::GenericAtomIdent;
 
@@ -61,6 +62,7 @@ impl Attr {
     }
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
+        cx: &mut js::context::JSContext,
         document: &Document,
         local_name: LocalName,
         value: AttrValue,
@@ -68,14 +70,13 @@ impl Attr {
         namespace: Namespace,
         prefix: Option<Prefix>,
         owner: Option<&Element>,
-        can_gc: CanGc,
     ) -> DomRoot<Attr> {
         Node::reflect_node(
+            cx,
             Box::new(Attr::new_inherited(
                 document, local_name, value, name, namespace, prefix, owner,
             )),
             document,
-            can_gc,
         )
     }
 
@@ -109,7 +110,7 @@ impl AttrMethods<crate::DomTypeHolder> for Attr {
     }
 
     /// <https://dom.spec.whatwg.org/#set-an-existing-attribute-value>
-    fn SetValue(&self, value: DOMString, can_gc: CanGc) -> Fallible<()> {
+    fn SetValue(&self, cx: &mut JSContext, value: DOMString) -> Fallible<()> {
         // Step 2. Otherwise:
         if let Some(owner) = self.owner() {
             // Step 2.1. Let element be attribute’s element.
@@ -117,18 +118,18 @@ impl AttrMethods<crate::DomTypeHolder> for Attr {
             // get trusted type compliant attribute value with attribute’s local name,
             // attribute’s namespace, element, and value. [TRUSTED-TYPES]
             let value = TrustedTypePolicyFactory::get_trusted_types_compliant_attribute_value(
+                cx,
                 owner.namespace(),
                 owner.local_name(),
                 self.local_name(),
                 Some(self.namespace()),
                 TrustedTypeOrString::String(value),
                 &owner.owner_global(),
-                can_gc,
             )?;
             if let Some(owner) = self.owner() {
                 // Step 2.4. Change attribute to verifiedValue.
                 let value = owner.parse_attribute(self.namespace(), self.local_name(), value);
-                owner.change_attribute(self, value, can_gc);
+                owner.change_attribute(self, value, CanGc::from_cx(cx));
             } else {
                 // Step 2.3. If attribute’s element is null, then set attribute’s value to verifiedValue, and return.
                 self.set_value(value);
@@ -232,26 +233,20 @@ impl Attr {
     }
 }
 
-pub(crate) trait AttrHelpersForLayout<'dom> {
-    fn value(self) -> &'dom AttrValue;
-    fn local_name(self) -> &'dom LocalName;
-    fn namespace(self) -> &'dom Namespace;
-}
-
 #[expect(unsafe_code)]
-impl<'dom> AttrHelpersForLayout<'dom> for LayoutDom<'dom, Attr> {
+impl<'dom> LayoutDom<'dom, Attr> {
     #[inline]
-    fn value(self) -> &'dom AttrValue {
+    pub(crate) fn value(self) -> &'dom AttrValue {
         unsafe { self.unsafe_get().value.borrow_for_layout() }
     }
 
     #[inline]
-    fn local_name(self) -> &'dom LocalName {
+    pub(crate) fn local_name(self) -> &'dom LocalName {
         &self.unsafe_get().identifier.local_name.0
     }
 
     #[inline]
-    fn namespace(self) -> &'dom Namespace {
+    pub(crate) fn namespace(self) -> &'dom Namespace {
         &self.unsafe_get().identifier.namespace.0
     }
 }

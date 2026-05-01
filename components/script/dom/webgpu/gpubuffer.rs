@@ -6,10 +6,10 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::string::String;
 
-use base::generic_channel::GenericSharedMemory;
 use dom_struct::dom_struct;
 use js::typedarray::HeapArrayBuffer;
 use script_bindings::trace::RootedTraceableBox;
+use servo_base::generic_channel::GenericSharedMemory;
 use webgpu_traits::{Mapping, WebGPU, WebGPUBuffer, WebGPURequest};
 use wgpu_core::device::HostMap;
 use wgpu_core::resource::BufferAccessError;
@@ -170,7 +170,7 @@ impl GPUBuffer {
 
         Ok(GPUBuffer::new(
             &device.global(),
-            device.channel().clone(),
+            device.channel(),
             buffer,
             device,
             descriptor.size,
@@ -194,7 +194,7 @@ impl GPUBufferMethods<crate::DomTypeHolder> for GPUBuffer {
         // Step 1
         let promise = self.pending_map.borrow_mut().take();
         if let Some(promise) = promise {
-            promise.reject_error(Error::Abort(None), CanGc::note());
+            promise.reject_error(Error::Abort(None), CanGc::deprecated_note());
             *self.pending_map.borrow_mut() = Some(promise);
         }
         // Step 2
@@ -414,7 +414,7 @@ impl GPUBuffer {
         match mapping {
             Err(error) => {
                 *self.pending_map.borrow_mut() = None;
-                p.reject_error(error.clone(), can_gc);
+                p.reject_error(error, can_gc);
             },
             Ok(mut mapping) => {
                 // Step 5
@@ -432,13 +432,13 @@ impl GPUBuffer {
 impl RoutedPromiseListener<Result<Mapping, BufferAccessError>> for GPUBuffer {
     fn handle_response(
         &self,
+        cx: &mut js::context::JSContext,
         response: Result<Mapping, BufferAccessError>,
         promise: &Rc<Promise>,
-        can_gc: CanGc,
     ) {
         match response {
-            Ok(mapping) => self.map_success(promise, mapping, can_gc),
-            Err(_) => self.map_failure(promise, can_gc),
+            Ok(mapping) => self.map_success(promise, mapping, CanGc::from_cx(cx)),
+            Err(_) => self.map_failure(promise, CanGc::from_cx(cx)),
         }
     }
 }

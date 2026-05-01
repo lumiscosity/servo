@@ -8,7 +8,7 @@ on:
     inputs:
       profile:
         required: false
-        default: "release"
+        default: "checked-release"
         type: string
       build-args:
         default: ""
@@ -53,9 +53,9 @@ on:
     inputs:
       profile:
         required: false
-        default: "release"
+        default: "checked-release"
         type: choice
-        options: ["release", "debug", "production"]
+        options: ["checked-release", "release", "debug", "production"]
       wpt-args:
         default: ""
         required: false
@@ -105,7 +105,7 @@ jobs:
     steps:
       - name: Runner select
         id: select
-        uses: servo/ci-runners/actions/runner-select@6d88b19dda997f1ce2a11e4c1c34717c2bbcafba
+        uses: servo/ci-runners/actions/runner-select@f0b81b95522256c64ee207b4236ec71fc23b99a1
         with:
           GITHUB_TOKEN: ${{ github.token }}
           # Before updating the GH action runner image for the nightly job, ensure
@@ -128,7 +128,7 @@ jobs:
     outputs:
       artifact_ids: ${{ steps.artifact_ids.outputs.artifact_ids }}
     steps:
-      - uses: servo/ci-runners/actions/checkout@6d88b19dda997f1ce2a11e4c1c34717c2bbcafba
+      - uses: servo/ci-runners/actions/checkout@f0b81b95522256c64ee207b4236ec71fc23b99a1
       - name: Free Disk Space (Ubuntu)
         uses: jlumbroso/free-disk-space@main
         if: ${{ runner.environment != 'self-hosted' }}
@@ -145,7 +145,9 @@ jobs:
       - name: Change Mirror Priorities
         if: ${{ runner.environment != 'self-hosted' }}
         uses: ./.github/actions/apt-mirrors
-      - uses: taiki-e/install-action@v2
+      - name: Install cargo nextest
+        if: ${{ inputs.unit-tests }}
+        uses: taiki-e/install-action@v2
         with:
           tool: nextest
       - name: Bootstrap dependencies
@@ -155,7 +157,7 @@ jobs:
           sudo apt update
           echo "wireshark-common wireshark-common/install-setuid boolean true" | sudo debconf-set-selections
           sudo apt install -qy tshark
-          ./mach bootstrap --yes --skip-lints
+          ./mach bootstrap --yes --skip-lints --skip-nextest
 
       # Always install crown, even on self-hosted runners, because it is tightly
       # coupled to the rustc version, and we may have the wrong version if the
@@ -287,6 +289,7 @@ jobs:
           # lld seems to use less memory and prevents OOM errors during linking.
           # We can remove this after upgrading to Rust 1.90, where lld will be the default.
           RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+          LLVM_OBJDUMP: llvm-objdump-14
         run: |
           cargo +${{ steps.msrv.outputs.rust_version }} build -p servo --locked
 
@@ -301,7 +304,7 @@ jobs:
     steps:
       - name: Runner select
         id: select
-        uses: servo/ci-runners/actions/runner-select@6d88b19dda997f1ce2a11e4c1c34717c2bbcafba
+        uses: servo/ci-runners/actions/runner-select@f0b81b95522256c64ee207b4236ec71fc23b99a1
         with:
           GITHUB_TOKEN: ${{ github.token }}
           # Before updating the GH action runner image for the nightly job, ensure
@@ -323,7 +326,7 @@ jobs:
     runs-on: ${{ needs.runner-select-coverage.outputs.selected-runner-label }}
     continue-on-error: true
     steps:
-      - uses: servo/ci-runners/actions/checkout@6d88b19dda997f1ce2a11e4c1c34717c2bbcafba
+      - uses: servo/ci-runners/actions/checkout@f0b81b95522256c64ee207b4236ec71fc23b99a1
       - name: Free Disk Space (Ubuntu)
         uses: jlumbroso/free-disk-space@main
         if: ${{ runner.environment != 'self-hosted' }}
@@ -352,17 +355,6 @@ jobs:
         run: |
           sudo apt update
           ./mach bootstrap --yes --skip-lints
-      - name: Determine options
-        id: options
-        run: |
-          if [[ ${{ runner.environment }} == 'self-hosted' ]];
-          then
-            CARGO_PROFILE=dev
-          else
-            # github hosted runners don't have enough diskspace for the dev profile.
-            CARGO_PROFILE=coverage
-          fi
-          echo "cargo_profile=${CARGO_PROFILE}" | tee $GITHUB_OUTPUT
       - name: Run unit-tests with coverage
         shell: bash
         env:
@@ -370,7 +362,7 @@ jobs:
           LANG: en-US
         run: |
           ./mach test-unit --code-coverage \
-              --profile=${{ steps.options.outputs.cargo_profile }} \
+              --profile=coverage \
               --llvm-cov-option=--codecov \
               --llvm-cov-option=--output-path=codecov.json
       - name: Upload coverage to Codecov
@@ -389,6 +381,13 @@ jobs:
       - uses: actions/checkout@v5
         if: github.event_name != 'pull_request_target'
         with:
+          fetch-depth: 1
+      # This is necessary to checkout the pull request if this run was triggered via a
+      # `pull_request_target` event.
+      - uses: actions/checkout@v5
+        if: github.event_name == 'pull_request_target'
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1
       - name: Change Mirror Priorities
         uses: ./.github/actions/apt-mirrors

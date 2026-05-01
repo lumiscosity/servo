@@ -12,9 +12,9 @@ use dpi::PhysicalSize;
 use embedder_traits::EventLoopWaker;
 use paint_api::rendering_context::{RenderingContext, SoftwareRenderingContext};
 use servo::{
-    EmbedderControl, InputEvent, JSValue, JavaScriptEvaluationError, LoadStatus, MouseButton,
-    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Preferences, Servo, ServoBuilder,
-    SimpleDialog, WebView, WebViewDelegate,
+    ConsoleLogLevel, EmbedderControl, InputEvent, JSValue, JavaScriptEvaluationError, LoadStatus,
+    MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Preferences, Servo,
+    ServoBuilder, SimpleDialog, WebView, WebViewDelegate,
 };
 use webrender_api::units::DevicePoint;
 
@@ -95,6 +95,8 @@ pub(crate) struct WebViewDelegateImpl {
     pub(crate) active_dialog: RefCell<Option<SimpleDialog>>,
     pub(crate) number_of_controls_shown: Cell<usize>,
     pub(crate) number_of_controls_hidden: Cell<usize>,
+    pub(crate) last_accesskit_tree_updates: RefCell<Vec<accesskit::TreeUpdate>>,
+    pub(crate) console_messages: RefCell<Vec<(ConsoleLogLevel, String)>>,
 }
 
 #[allow(dead_code)] // Used by some tests and not others
@@ -106,6 +108,8 @@ impl WebViewDelegateImpl {
         self.controls_shown.borrow_mut().clear();
         self.number_of_controls_shown.set(0);
         self.number_of_controls_hidden.set(0);
+        self.last_accesskit_tree_updates.borrow_mut().clear();
+        self.console_messages.borrow_mut().clear();
     }
 }
 
@@ -146,6 +150,20 @@ impl WebViewDelegate for WebViewDelegateImpl {
     fn hide_embedder_control(&self, _webview: WebView, _control_id: servo::EmbedderControlId) {
         self.number_of_controls_hidden
             .set(self.number_of_controls_hidden.get() + 1);
+    }
+
+    fn notify_accessibility_tree_update(
+        &self,
+        _webview: WebView,
+        tree_update: accesskit::TreeUpdate,
+    ) {
+        self.last_accesskit_tree_updates
+            .borrow_mut()
+            .push(tree_update);
+    }
+
+    fn show_console_message(&self, _webview: WebView, level: ConsoleLogLevel, message: String) {
+        self.console_messages.borrow_mut().push((level, message));
     }
 }
 

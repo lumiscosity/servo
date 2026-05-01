@@ -4,21 +4,20 @@
 
 //! The walker actor is responsible for traversing the DOM tree in various ways to create new nodes
 
-use std::net::TcpStream;
-
 use atomic_refcell::AtomicRefCell;
-use base::generic_channel::{self, GenericSender};
-use base::id::PipelineId;
 use devtools_traits::DevtoolScriptControlMsg::{GetChildren, GetDocumentElement, GetRootNode};
 use devtools_traits::{DevtoolScriptControlMsg, DomMutation};
 use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{self, Map, Value};
+use servo_base::generic_channel::{self, GenericSender};
+use servo_base::id::PipelineId;
 
-use crate::actor::{Actor, ActorEncode, ActorError, ActorRegistry};
+use crate::actor::{Actor, ActorEncode, ActorError, ActorRegistry, DowncastableActorArc};
+use crate::actors::browsing_context::BrowsingContextActor;
 use crate::actors::inspector::layout::LayoutInspectorActor;
 use crate::actors::inspector::node::{NodeActorMsg, NodeInfoToProtocol};
-use crate::protocol::{ClientRequest, JsonPacketStream};
+use crate::protocol::{ClientRequest, DevtoolsConnection, JsonPacketStream};
 use crate::{ActorMsg, EmptyReplyMsg, StreamId};
 
 #[derive(Serialize)]
@@ -31,8 +30,8 @@ pub(crate) struct WalkerMsg {
 pub(crate) struct WalkerActor {
     pub name: String,
     pub mutations: AtomicRefCell<Vec<DomMutation>>,
-    pub pipeline: PipelineId,
-    pub script_chan: GenericSender<DevtoolScriptControlMsg>,
+    /// Name of the [`BrowsingContextActor`] that owns this walker.
+    pub browsing_context_name: String,
 }
 
 #[derive(Serialize)]
@@ -141,6 +140,7 @@ impl Actor for WalkerActor {
         msg: &Map<String, Value>,
         _id: StreamId,
     ) -> Result<(), ActorError> {
+        let browsing_context_actor = self.browsing_context_actor(registry);
         match msg_type {
             "children" => {
                 let target = msg
@@ -151,9 +151,10 @@ impl Actor for WalkerActor {
                 let Some((tx, rx)) = generic_channel::channel() else {
                     return Err(ActorError::Internal);
                 };
-                self.script_chan
+                browsing_context_actor
+                    .script_chan()
                     .send(GetChildren(
-                        self.pipeline,
+                        browsing_context_actor.pipeline_id(),
                         registry.actor_to_script(target.into()),
                         tx,
                     ))
@@ -171,8 +172,8 @@ impl Actor for WalkerActor {
                         .map(|child| {
                             child.encode(
                                 registry,
-                                self.script_chan.clone(),
-                                self.pipeline,
+                                browsing_context_actor.script_chan(),
+                                browsing_context_actor.pipeline_id(),
                                 self.name(),
                             )
                         })
@@ -189,8 +190,9 @@ impl Actor for WalkerActor {
                 let Some((tx, rx)) = generic_channel::channel() else {
                     return Err(ActorError::Internal);
                 };
-                self.script_chan
-                    .send(GetDocumentElement(self.pipeline, tx))
+                browsing_context_actor
+                    .script_chan()
+                    .send(GetDocumentElement(browsing_context_actor.pipeline_id(), tx))
                     .map_err(|_| ActorError::Internal)?;
                 let doc_elem_info = rx
                     .recv()
@@ -198,8 +200,8 @@ impl Actor for WalkerActor {
                     .ok_or(ActorError::Internal)?;
                 let node = doc_elem_info.encode(
                     registry,
-                    self.script_chan.clone(),
-                    self.pipeline,
+                    browsing_context_actor.script_chan(),
+                    browsing_context_actor.pipeline_id(),
                     self.name(),
                 );
 
@@ -211,13 +213,13 @@ impl Actor for WalkerActor {
             },
             "getLayoutInspector" => {
                 // TODO: Create actual layout inspector actor
-                let layout = LayoutInspectorActor::new(registry.new_name::<LayoutInspectorActor>());
-                let actor = layout.encode(registry);
-                registry.register(layout);
+                let layout_inspector_name = LayoutInspectorActor::register(registry);
+                let layout_inspector_actor =
+                    registry.find::<LayoutInspectorActor>(&layout_inspector_name);
 
                 let msg = GetLayoutInspectorReply {
                     from: self.name(),
-                    actor,
+                    actor: layout_inspector_actor.encode(registry),
                 };
                 request.reply_final(&msg)?
             },
@@ -235,17 +237,17 @@ impl Actor for WalkerActor {
                     .ok_or(ActorError::MissingParameter)?
                     .as_str()
                     .ok_or(ActorError::BadParameterType)?;
-                let node = msg
+                let node_name = msg
                     .get("node")
                     .ok_or(ActorError::MissingParameter)?
                     .as_str()
                     .ok_or(ActorError::BadParameterType)?;
                 let mut hierarchy = find_child(
-                    &self.script_chan,
-                    self.pipeline,
+                    &browsing_context_actor.script_chan(),
+                    browsing_context_actor.pipeline_id(),
                     &self.name,
                     registry,
-                    node,
+                    node_name,
                     vec![],
                     |msg| msg.display_name == selector,
                 )
@@ -278,10 +280,31 @@ impl Actor for WalkerActor {
 }
 
 impl WalkerActor {
+    pub fn register(registry: &ActorRegistry, browsing_context_name: String) -> String {
+        let name = registry.new_name::<WalkerActor>();
+        let actor = WalkerActor {
+            name: name.clone(),
+            mutations: AtomicRefCell::new(vec![]),
+            browsing_context_name,
+        };
+        registry.register::<Self>(actor);
+        name
+    }
+
+    pub(crate) fn browsing_context_actor(
+        &self,
+        registry: &ActorRegistry,
+    ) -> DowncastableActorArc<BrowsingContextActor> {
+        registry.find::<BrowsingContextActor>(&self.browsing_context_name)
+    }
+
     pub(crate) fn root(&self, registry: &ActorRegistry) -> Result<NodeActorMsg, ActorError> {
+        let browsing_context_actor = self.browsing_context_actor(registry);
+        let pipeline = browsing_context_actor.pipeline_id();
         let (tx, rx) = generic_channel::channel().ok_or(ActorError::Internal)?;
-        self.script_chan
-            .send(GetRootNode(self.pipeline, tx))
+        browsing_context_actor
+            .script_chan()
+            .send(GetRootNode(pipeline, tx))
             .map_err(|_| ActorError::Internal)?;
         let root_node = rx
             .recv()
@@ -289,8 +312,8 @@ impl WalkerActor {
             .ok_or(ActorError::Internal)?;
         Ok(root_node.encode(
             registry,
-            self.script_chan.clone(),
-            self.pipeline,
+            browsing_context_actor.script_chan(),
+            pipeline,
             self.name(),
         ))
     }
@@ -298,7 +321,7 @@ impl WalkerActor {
     pub(crate) fn handle_dom_mutation(
         &self,
         dom_mutation: DomMutation,
-        stream: &mut TcpStream,
+        stream: &mut DevtoolsConnection,
     ) -> Result<(), ActorError> {
         let mut pending_mutations = self.mutations.borrow_mut();
 
@@ -366,7 +389,7 @@ pub fn find_child(
     pipeline: PipelineId,
     name: &str,
     registry: &ActorRegistry,
-    node: &str,
+    node_name: &str,
     mut hierarchy: Vec<NodeActorMsg>,
     compare_fn: impl Fn(&NodeActorMsg) -> bool + Clone,
 ) -> Result<Vec<NodeActorMsg>, Vec<NodeActorMsg>> {
@@ -374,7 +397,7 @@ pub fn find_child(
     script_chan
         .send(GetChildren(
             pipeline,
-            registry.actor_to_script(node.into()),
+            registry.actor_to_script(node_name.into()),
             tx,
         ))
         .unwrap();

@@ -5,11 +5,11 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use base::id::WebViewId;
 use embedder_traits::{InputEventId, PaintHitTestResult, Scroll, TouchEventType, TouchId};
 use euclid::{Point2D, Scale, Vector2D};
 use log::{debug, error, warn};
 use rustc_hash::{FxHashMap, FxHashSet};
+use servo_base::id::WebViewId;
 use style_traits::CSSPixel;
 use webrender_api::units::{DevicePixel, DevicePoint, DeviceVector2D};
 
@@ -475,7 +475,6 @@ impl TouchHandler {
                     Some(ScrollZoomEvent::Scroll(ScrollEvent {
                         scroll: Scroll::Delta((-delta).into()),
                         point,
-                        event_count: 1,
                     }))
                 } else if delta.x.abs() > TOUCH_PAN_MIN_SCREEN_PX * scale ||
                     delta.y.abs() > TOUCH_PAN_MIN_SCREEN_PX * scale
@@ -497,7 +496,6 @@ impl TouchHandler {
                     Some(ScrollZoomEvent::Scroll(ScrollEvent {
                         scroll: Scroll::Delta((-delta).into()),
                         point,
-                        event_count: 1,
                     }))
                 } else {
                     // We don't update the touchpoint, so multiple small moves can

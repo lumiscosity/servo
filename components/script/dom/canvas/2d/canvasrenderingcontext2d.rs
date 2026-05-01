@@ -2,13 +2,13 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use base::{Epoch, generic_channel};
-use canvas_traits::canvas::{Canvas2dMsg, CanvasId};
 use dom_struct::dom_struct;
 use euclid::default::Size2D;
 use js::context::JSContext;
 use pixels::Snapshot;
 use script_bindings::reflector::AssociatedMemory;
+use servo_base::{Epoch, generic_channel};
+use servo_canvas_traits::canvas::{Canvas2dMsg, CanvasId};
 use servo_url::ServoUrl;
 use webrender_api::ImageKey;
 
@@ -544,7 +544,8 @@ impl CanvasRenderingContext2DMethods<crate::DomTypeHolder> for CanvasRenderingCo
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-putimagedata>
     fn PutImageData(&self, imagedata: &ImageData, dx: i32, dy: i32) {
         self.canvas_state
-            .put_image_data(self.canvas.size(), imagedata, dx, dy)
+            .put_image_data(self.canvas.size(), imagedata, dx, dy);
+        self.mark_as_dirty();
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-putimagedata

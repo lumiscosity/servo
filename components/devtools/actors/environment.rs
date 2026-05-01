@@ -2,18 +2,20 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::collections::HashMap;
+
 use devtools_traits::EnvironmentInfo;
 use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::actor::{Actor, ActorEncode, ActorRegistry};
-use crate::actors::object::ObjectActorMsg;
+use crate::actors::object::{ObjectActorMsg, ObjectPropertyDescriptor};
 
-#[derive(Default, Serialize)]
+#[derive(Serialize)]
 struct EnvironmentBindings {
     arguments: Vec<Value>,
-    variables: Map<String, Value>,
+    variables: HashMap<String, ObjectPropertyDescriptor>,
 }
 
 #[derive(Serialize)]
@@ -48,7 +50,7 @@ pub(crate) struct EnvironmentActorMsg {
 pub(crate) struct EnvironmentActor {
     name: String,
     environment: EnvironmentInfo,
-    parent: Option<String>,
+    parent_name: Option<String>,
 }
 
 impl Actor for EnvironmentActor {
@@ -61,23 +63,23 @@ impl EnvironmentActor {
     pub fn register(
         registry: &ActorRegistry,
         environment: EnvironmentInfo,
-        parent: Option<String>,
+        parent_name: Option<String>,
     ) -> String {
-        let name = registry.new_name::<Self>();
-        let actor = Self {
-            name: name.clone(),
-            parent,
+        let environment_name = registry.new_name::<Self>();
+        let environment_actor = Self {
+            name: environment_name.clone(),
+            parent_name,
             environment,
         };
-        registry.register(actor);
-        name
+        registry.register(environment_actor);
+        environment_name
     }
 }
 
 impl ActorEncode<EnvironmentActorMsg> for EnvironmentActor {
     fn encode(&self, registry: &ActorRegistry) -> EnvironmentActorMsg {
         let parent = self
-            .parent
+            .parent_name
             .as_ref()
             .map(|p| registry.find::<EnvironmentActor>(p))
             .map(|p| Box::new(p.encode(registry)));
@@ -87,13 +89,30 @@ impl ActorEncode<EnvironmentActorMsg> for EnvironmentActor {
             type_: self.environment.type_.clone(),
             scope_kind: self.environment.scope_kind.clone(),
             parent,
-            bindings: None,
             function: self
                 .environment
                 .function_display_name
                 .clone()
                 .map(|display_name| EnvironmentFunction { display_name }),
             object: None,
+            bindings: Some(EnvironmentBindings {
+                arguments: [].to_vec(),
+                variables: self
+                    .environment
+                    .binding_variables
+                    .clone()
+                    .into_iter()
+                    .map(|ref property_descriptor| {
+                        (
+                            property_descriptor.name.clone(),
+                            ObjectPropertyDescriptor::from_property_descriptor(
+                                registry,
+                                property_descriptor,
+                            ),
+                        )
+                    })
+                    .collect(),
+            }),
         }
     }
 }

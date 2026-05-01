@@ -42,7 +42,7 @@ use crate::geom::{
     LogicalRect, LogicalSides, LogicalSides1D, LogicalVec2, PhysicalPoint, PhysicalRect,
     PhysicalSides, PhysicalVec, ToLogical, ToLogicalWithContainingBlock,
 };
-use crate::layout_box_base::CacheableLayoutResult;
+use crate::layout_box_base::IndependentFormattingContextLayoutResult;
 use crate::positioned::{PositioningContext, PositioningContextLength, relative_adjustement};
 use crate::sizing::{
     ComputeInlineContentSizes, ContentSizes, InlineContentSizesResult, LazySize, Size,
@@ -68,7 +68,7 @@ enum CellContentAlignment {
 /// the table. Note that this is only done for slots that are not
 /// covered by spans or empty.
 struct CellLayout {
-    layout: CacheableLayoutResult,
+    layout: IndependentFormattingContextLayoutResult,
     padding: LogicalSides<Au>,
     border: LogicalSides<Au>,
     positioning_context: PositioningContext,
@@ -620,10 +620,8 @@ impl<'a> TableLayout<'a> {
         let colspan_cell_min_size = (colspan_cell_constraints.content_sizes.min_content -
             total_border_spacing)
             .max(Au::zero());
-        let distributed_minimum = Self::distribute_width_to_columns(
-            colspan_cell_min_size,
-            &self.columns[column_range.clone()],
-        );
+        let distributed_minimum =
+            Self::distribute_width_to_columns(colspan_cell_min_size, &self.columns[column_range]);
         {
             let column_span = &mut self.columns[colspan_cell_constraints.range()];
             for (column, minimum_size) in column_span.iter_mut().zip(distributed_minimum) {
@@ -1056,7 +1054,7 @@ impl<'a> TableLayout<'a> {
         // > Otherwise, if there is any such column, the distributed widths of all columns that have
         // > originating cells are increased by equal amounts so the total increase adds to the excess
         // > width.
-        let has_originating_cells_columns = all_columns.clone().filter(has_originating_cells);
+        let has_originating_cells_columns = all_columns.filter(has_originating_cells);
         let total_has_originating_cells = has_originating_cells_columns.clone().count();
         if total_has_originating_cells > 0 {
             let extra_space_per_column =
@@ -1542,6 +1540,7 @@ impl<'a> TableLayout<'a> {
             containing_block,
             None, /* sequential_layout_state */
             ignore_block_margins_for_stretch,
+            false, /* has_inline_parent */
         );
 
         if let Some(mut positioning_context) = positioning_context.take() {
@@ -1561,7 +1560,7 @@ impl<'a> TableLayout<'a> {
         positioning_context: &mut PositioningContext,
         containing_block_for_children: &ContainingBlock,
         containing_block_for_table: &ContainingBlock,
-    ) -> CacheableLayoutResult {
+    ) -> IndependentFormattingContextLayoutResult {
         let table_writing_mode = containing_block_for_children.style.writing_mode;
         self.compute_border_collapse(table_writing_mode);
         let layout_style = self.table.layout_style(Some(&self));
@@ -1598,7 +1597,7 @@ impl<'a> TableLayout<'a> {
         let offset_from_wrapper = -self.pbm.padding - self.pbm.border;
         let mut current_block_offset = offset_from_wrapper.block_start;
 
-        let mut table_layout = CacheableLayoutResult {
+        let mut table_layout = IndependentFormattingContextLayoutResult {
             fragments: Vec::new(),
             content_block_size: Zero::zero(),
             content_inline_size_for_table: None,
@@ -2678,7 +2677,7 @@ impl Table {
         positioning_context: &mut PositioningContext,
         containing_block_for_children: &ContainingBlock,
         containing_block_for_table: &ContainingBlock,
-    ) -> CacheableLayoutResult {
+    ) -> IndependentFormattingContextLayoutResult {
         TableLayout::new(self).layout(
             layout_context,
             positioning_context,

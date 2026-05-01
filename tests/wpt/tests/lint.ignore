@@ -108,8 +108,11 @@ TRAILING WHITESPACE: xml/xslt/resources/testu1LINE.xml
 PRINT STATEMENT: dom/nodes/Document-createElement-namespace-tests/generate.py
 PRINT STATEMENT: encrypted-media/polyfill/make-polyfill-tests.py
 PRINT STATEMENT: resources/test/conftest.py
-PRINT STATEMENT: webdriver/tests/support/helpers.py
 PRINT STATEMENT: webdriver/tests/bidi/browser/set_download_behavior/conftest.py
+PRINT STATEMENT: webdriver/tests/bidi/browsing_context/print/*
+PRINT STATEMENT: webdriver/tests/classic/print/*
+PRINT STATEMENT: webdriver/tests/support/bidi/fixtures.py
+PRINT STATEMENT: webdriver/tests/support/classic/helpers.py
 
 # semi-legitimate use of console.*
 CONSOLE: console/*
@@ -129,6 +132,7 @@ CONSOLE: webaudio/resources/audit.js:41
 # Intentional use of console.*
 CONSOLE: infrastructure/testdriver/bidi/subscription.html
 CONSOLE: infrastructure/testdriver/bidi/subscription.window.js
+CONSOLE: html/browsers/history/the-location-interface/cross-origin-location-stringify-crash.sub.html
 CONSOLE: html/editing/dnd/events/ua-shadow-contents-manual.html
 
 # use of console in a public library - annotation-model ensures
@@ -159,6 +163,9 @@ SET TIMEOUT: conformance-checkers/*
 SET TIMEOUT: content-security-policy/*
 SET TIMEOUT: css/css-image-animation/image-animation-img-running.tentative.html
 SET TIMEOUT: css/css-image-animation/image-animation-img-running-to-normal.tentative.html
+SET TIMEOUT: css/css-image-animation/image-animation-paused-exact-frame.tentative.html
+SET TIMEOUT: css/css-image-animation/image-animation-stopped-reset-frame.tentative.html
+SET TIMEOUT: css/css-image-animation/image-animation-video-poster-running.html
 SET TIMEOUT: css/compositing/opacity-and-transform-animation-crash.html
 SET TIMEOUT: css/css-contain/contain-body-overflow-002.html
 SET TIMEOUT: css/css-display/display-contents-shadow-dom-1.html
@@ -408,7 +415,6 @@ SET TIMEOUT: css/css-fonts/font-display/font-display-feature-policy-02.tentative
 SET TIMEOUT: css/css-fonts/font-display/font-display-preload.html
 SET TIMEOUT: css/css-view-transitions/no-painting-while-render-blocked.html
 SET TIMEOUT: document-policy/font-display/override-to-optional.tentative.html
-SET TIMEOUT: feature-policy/experimental-features/resources/focus-without-user-activation-iframe-tentative.html
 SET TIMEOUT: geolocation/watchposition-timeout.https.window.js
 SET TIMEOUT: permissions-policy/experimental-features/resources/focus-without-user-activation-iframe-tentative.html
 SET TIMEOUT: html/browsers/windows/auxiliary-browsing-contexts/resources/close-opener.html
@@ -421,6 +427,7 @@ SET TIMEOUT: html/webappapis/timers/*
 SET TIMEOUT: portals/history/resources/portal-harness.js
 SET TIMEOUT: requestidlecallback/deadline-after-expired-timer.html
 SET TIMEOUT: resource-timing/tentative/initiator-url/set-timeout.html
+SET TIMEOUT: resource-timing/tentative/initiator-url/set-timeout.any.js
 SET TIMEOUT: resources/*
 SET TIMEOUT: scheduler/tentative/current-task-signal-async-abort.any.js
 SET TIMEOUT: scheduler/tentative/current-task-signal-async-priority.any.js
@@ -446,6 +453,7 @@ SET TIMEOUT: acid/acid3/test.html
 *: resources/webidl2/*
 *: tools/*
 *: */third_party/*
+*: third_party/*
 
 # .gitignore files in child directories
 *: cors/resources/.gitignore
@@ -749,10 +757,6 @@ REFERENCE-IN-OTHER-TYPE: css/css-transforms/css-transform-scale-001-manual.html
 
 # Needs control of page size
 REFERENCE-IN-OTHER-TYPE: css/css-multicol/moz-multicol3-column-balancing-break-inside-avoid-1.html
-
-PRINT STATEMENT: webdriver/tests/bidi/browsing_context/print/*
-PRINT STATEMENT: webdriver/tests/classic/print/*
-PRINT STATEMENT: webdriver/tests/support/fixtures_bidi.py
 
 DUPLICATE-BASENAME-PATH: acid/acid3/empty.html
 DUPLICATE-BASENAME-PATH: acid/acid3/empty.xml

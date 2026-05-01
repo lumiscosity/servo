@@ -5,6 +5,7 @@
 use std::cell::RefCell;
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use servo_arc::Arc;
 use style::shared_lock::{Locked, SharedRwLockReadGuard, ToCssWithGuard};
 use style::stylesheets::{CssRuleType, NestedDeclarationsRule};
@@ -14,7 +15,7 @@ use super::cssstyledeclaration::{CSSModificationAccess, CSSStyleDeclaration, CSS
 use super::cssstylesheet::CSSStyleSheet;
 use crate::dom::bindings::codegen::Bindings::CSSNestedDeclarationsBinding::CSSNestedDeclarationsMethods;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object};
+use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object_with_cx};
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::window::Window;
@@ -42,18 +43,18 @@ impl CSSNestedDeclarations {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         window: &Window,
         parent_stylesheet: &CSSStyleSheet,
         nesteddeclarationsrule: Arc<Locked<NestedDeclarationsRule>>,
-        can_gc: CanGc,
     ) -> DomRoot<Self> {
-        reflect_dom_object(
+        reflect_dom_object_with_cx(
             Box::new(Self::new_inherited(
                 parent_stylesheet,
                 nesteddeclarationsrule,
             )),
             window,
-            can_gc,
+            cx,
         )
     }
 
@@ -87,7 +88,7 @@ impl SpecificCSSRule for CSSNestedDeclarations {
 
 impl CSSNestedDeclarationsMethods<crate::DomTypeHolder> for CSSNestedDeclarations {
     /// <https://drafts.csswg.org/css-nesting/#dom-cssnesteddeclarations-style>
-    fn Style(&self, can_gc: CanGc) -> DomRoot<CSSStyleDeclaration> {
+    fn Style(&self, cx: &mut JSContext) -> DomRoot<CSSStyleDeclaration> {
         self.style_declaration.or_init(|| {
             let guard = self.css_rule.shared_lock().read();
             CSSStyleDeclaration::new(
@@ -104,7 +105,7 @@ impl CSSNestedDeclarationsMethods<crate::DomTypeHolder> for CSSNestedDeclaration
                 ),
                 None,
                 CSSModificationAccess::ReadWrite,
-                can_gc,
+                CanGc::from_cx(cx),
             )
         })
     }

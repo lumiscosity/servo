@@ -2,13 +2,13 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use base::id::{BrowsingContextId, PipelineId, WebViewId};
-use constellation_traits::ScriptToConstellationMessage;
-use ipc_channel::ipc;
 use rustc_hash::FxBuildHasher;
 use script_bindings::inheritance::Castable;
 use script_bindings::root::{Dom, DomRoot};
 use script_bindings::str::DOMString;
+use servo_base::generic_channel;
+use servo_base::id::{BrowsingContextId, PipelineId, WebViewId};
+use servo_constellation_traits::ScriptToConstellationMessage;
 
 use crate::document_collection::DocumentCollection;
 use crate::dom::bindings::cell::DomRefCell;
@@ -45,13 +45,6 @@ impl ScriptWindowProxies {
         None
     }
 
-    pub(crate) fn get(&self, id: BrowsingContextId) -> Option<DomRoot<WindowProxy>> {
-        self.map
-            .borrow()
-            .get(&id)
-            .map(|context| DomRoot::from_ref(&**context))
-    }
-
     pub(crate) fn insert(&self, id: BrowsingContextId, proxy: DomRoot<WindowProxy>) {
         self.map.borrow_mut().insert(id, Dom::from_ref(&*proxy));
     }
@@ -77,7 +70,7 @@ impl ScriptWindowProxies {
     ) -> Option<DomRoot<WindowProxy>> {
         let (browsing_context_id, parent_pipeline_id) =
             self.ask_constellation_for_browsing_context_info(senders, webview_id, pipeline_id)?;
-        if let Some(window_proxy) = self.get(browsing_context_id) {
+        if let Some(window_proxy) = self.find_window_proxy(browsing_context_id) {
             return Some(window_proxy);
         }
 
@@ -123,7 +116,7 @@ impl ScriptWindowProxies {
         parent_info: Option<PipelineId>,
         opener: Option<BrowsingContextId>,
     ) -> DomRoot<WindowProxy> {
-        if let Some(window_proxy) = self.get(browsing_context_id) {
+        if let Some(window_proxy) = self.find_window_proxy(browsing_context_id) {
             // Note: we do not set the window to be the currently-active one,
             // this will be done instead when the script-thread handles the `SetDocumentActivity` msg.
             return window_proxy;
@@ -172,7 +165,7 @@ impl ScriptWindowProxies {
         webview_id: WebViewId,
         pipeline_id: PipelineId,
     ) -> Option<(BrowsingContextId, Option<PipelineId>)> {
-        let (result_sender, result_receiver) = ipc::channel().unwrap();
+        let (result_sender, result_receiver) = generic_channel::channel().unwrap();
         let msg = ScriptToConstellationMessage::GetBrowsingContextInfo(pipeline_id, result_sender);
         senders
             .pipeline_to_constellation_sender

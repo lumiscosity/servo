@@ -41,6 +41,7 @@ use js::jsapi::{
 };
 use js::jsval::{JSVal, ObjectValue, UndefinedValue};
 use js::panic::wrap_panic;
+use js::realm::CurrentRealm;
 pub(crate) use js::rust::ThreadSafeJSContext;
 use js::rust::wrappers::{GetPromiseIsHandled, JS_GetPromiseResult};
 use js::rust::wrappers2::{
@@ -81,6 +82,7 @@ use crate::dom::bindings::root::trace_roots;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::utils::DOM_CALLBACKS;
 use crate::dom::bindings::{principals, settings_stack};
+use crate::dom::console::stringify_handle_value;
 use crate::dom::csp::CspReporting;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
@@ -123,9 +125,9 @@ pub(crate) enum ScriptThreadEventCategory {
     FontLoading,
     FormPlannedNavigation,
     GeolocationEvent,
-    HistoryEvent,
     ImageCacheMsg,
     InputEvent,
+    NavigationAndTraversalEvent,
     NetworkEvent,
     PortMessage,
     Rendering,
@@ -165,7 +167,9 @@ impl From<ScriptThreadEventCategory> for ProfilerCategory {
                 ProfilerCategory::ScriptPlannedNavigation
             },
             ScriptThreadEventCategory::GeolocationEvent => ProfilerCategory::ScriptGeolocationEvent,
-            ScriptThreadEventCategory::HistoryEvent => ProfilerCategory::ScriptHistoryEvent,
+            ScriptThreadEventCategory::NavigationAndTraversalEvent => {
+                ProfilerCategory::ScriptNavigationAndTraversalEvent
+            },
             ScriptThreadEventCategory::ImageCacheMsg => ProfilerCategory::ScriptImageCacheMsg,
             ScriptThreadEventCategory::InputEvent => ProfilerCategory::ScriptInputEvent,
             ScriptThreadEventCategory::NetworkEvent => ProfilerCategory::ScriptNetworkEvent,
@@ -212,7 +216,9 @@ impl From<ScriptThreadEventCategory> for ScriptHangAnnotation {
                 ScriptHangAnnotation::FormPlannedNavigation
             },
             ScriptThreadEventCategory::GeolocationEvent => ScriptHangAnnotation::GeolocationEvent,
-            ScriptThreadEventCategory::HistoryEvent => ScriptHangAnnotation::HistoryEvent,
+            ScriptThreadEventCategory::NavigationAndTraversalEvent => {
+                ScriptHangAnnotation::NavigationAndTraversalEvent
+            },
             ScriptThreadEventCategory::ImageCacheMsg => ScriptHangAnnotation::ImageCacheMsg,
             ScriptThreadEventCategory::NetworkEvent => ScriptHangAnnotation::NetworkEvent,
             ScriptThreadEventCategory::Rendering => ScriptHangAnnotation::Rendering,
@@ -333,7 +339,7 @@ unsafe extern "C" fn push_new_interrupt_queue(interrupt_queues: *mut c_void) -> 
             unsafe { Box::from_raw(interrupt_queues as *mut Vec<Rc<MicrotaskQueue>>) };
         let new_queue = Rc::new(MicrotaskQueue::default());
         result = Rc::as_ptr(&new_queue) as *const c_void;
-        interrupt_queues.push(new_queue.clone());
+        interrupt_queues.push(new_queue);
         std::mem::forget(interrupt_queues);
     });
     result
@@ -467,16 +473,15 @@ unsafe extern "C" fn promise_rejection_tracker(
                 let target = Trusted::new(global.upcast::<EventTarget>());
                 let promise =
                     Promise::new_with_js_promise(unsafe { Handle::from_raw(promise) }, cx);
-                let trusted_promise = TrustedPromise::new(promise.clone());
+                let trusted_promise = TrustedPromise::new(promise);
 
                 // Step 5-4.
                 global.task_manager().dom_manipulation_task_source().queue(
-                task!(rejection_handled_event: move || {
+                task!(rejection_handled_event: move |cx| {
                     let target = target.root();
-                    let cx = GlobalScope::get_cx();
                     let root_promise = trusted_promise.root();
 
-                    rooted!(in(*cx) let mut reason = UndefinedValue());
+                    rooted!(&in(cx) let mut reason = UndefinedValue());
                     unsafe{JS_GetPromiseResult(root_promise.reflector().get_jsobject(), reason.handle_mut())};
 
                     let event = PromiseRejectionEvent::new(
@@ -486,10 +491,10 @@ unsafe extern "C" fn promise_rejection_tracker(
                         EventCancelable::Cancelable,
                         root_promise,
                         reason.handle(),
-                        CanGc::note()
+                        CanGc::from_cx(cx),
                     );
 
-                    event.upcast::<Event>().fire(&target, CanGc::note());
+                    event.upcast::<Event>().fire(&target, CanGc::from_cx(cx));
                 })
             );
             },
@@ -498,10 +503,10 @@ unsafe extern "C" fn promise_rejection_tracker(
 }
 
 #[expect(unsafe_code)]
-fn safely_convert_null_to_string(cx: JSContext, str_: HandleString) -> DOMString {
+fn safely_convert_null_to_string(cx: &mut js::context::JSContext, str_: HandleString) -> DOMString {
     DOMString::from(match std::ptr::NonNull::new(*str_) {
         None => "".to_owned(),
-        Some(str_) => unsafe { jsstr_to_string(*cx, str_) },
+        Some(str_) => unsafe { jsstr_to_string(cx.raw_cx(), str_) },
     })
 }
 
@@ -534,11 +539,13 @@ unsafe extern "C" fn content_security_policy_allows(
     can_compile_strings: *mut bool,
 ) -> bool {
     let mut allowed = false;
-    let cx = unsafe { JSContext::from_ptr(cx) };
+    // SAFETY: We are in SM hook
+    let mut cx = unsafe { js::context::JSContext::from_ptr(NonNull::new(cx).unwrap()) };
+    let cx = &mut cx;
     wrap_panic(&mut || {
         // SpiderMonkey provides null pointer when executing webassembly.
-        let in_realm_proof = AlreadyInRealm::assert_for_cx(cx);
-        let global = unsafe { &GlobalScope::from_context(*cx, InRealm::Already(&in_realm_proof)) };
+        let realm = CurrentRealm::assert(cx);
+        let global = GlobalScope::from_current_realm(&realm);
         let csp_list = global.get_csp_list();
 
         // If we don't have any CSP checks to run, short-circuit all logic here
@@ -567,9 +574,9 @@ unsafe extern "C" fn content_security_policy_allows(
                         };
                         let value = arg.into_handle().get();
                         if value.is_object() {
-                            if let Ok(trusted_script) =
-                                unsafe { root_from_object::<TrustedScript>(value.to_object(), *cx) }
-                            {
+                            if let Ok(trusted_script) = unsafe {
+                                root_from_object::<TrustedScript>(value.to_object(), cx.raw_cx())
+                            } {
                                 parameter_args_vec
                                     .push(TrustedScriptOrString::TrustedScript(trusted_script));
                             } else {
@@ -588,19 +595,21 @@ unsafe extern "C" fn content_security_policy_allows(
                         }
                     }
 
+                    let code_string = safely_convert_null_to_string(cx, code_string);
+                    let body_string = safely_convert_null_to_string(cx, body_string);
+
                     TrustedScript::can_compile_string_with_trusted_type(
                         cx,
-                        global,
-                        safely_convert_null_to_string(cx, code_string),
+                        &global,
+                        code_string,
                         compilation_type,
                         parameter_strings_vec,
-                        safely_convert_null_to_string(cx, body_string),
+                        body_string,
                         parameter_args_vec,
                         unsafe { HandleValue::from_raw(body_arg) },
-                        CanGc::note(),
                     )
                 },
-                RuntimeCode::WASM => global.get_csp_list().is_wasm_evaluation_allowed(global),
+                RuntimeCode::WASM => global.get_csp_list().is_wasm_evaluation_allowed(&global),
             };
     });
     unsafe { *can_compile_strings = allowed };
@@ -611,73 +620,79 @@ unsafe extern "C" fn content_security_policy_allows(
 /// <https://html.spec.whatwg.org/multipage/#notify-about-rejected-promises>
 pub(crate) fn notify_about_rejected_promises(global: &GlobalScope) {
     let cx = GlobalScope::get_cx();
-    unsafe {
-        // Step 2.
-        if !global.get_uncaught_rejections().borrow().is_empty() {
-            // Step 1.
-            let uncaught_rejections: Vec<TrustedPromise> = global
-                .get_uncaught_rejections()
-                .borrow()
-                .iter()
-                .map(|promise| {
-                    let promise =
-                        Promise::new_with_js_promise(Handle::from_raw(promise.handle()), cx);
 
-                    TrustedPromise::new(promise)
-                })
-                .collect();
+    // Step 1. Let list be a clone of global's about-to-be-notified rejected promises list.
+    let uncaught_rejections: Vec<TrustedPromise> = global
+        .get_uncaught_rejections()
+        .borrow_mut()
+        .drain(..)
+        .map(|promise| {
+            let promise =
+                Promise::new_with_js_promise(unsafe { Handle::from_raw(promise.handle()) }, cx);
 
-            // Step 3.
-            global.get_uncaught_rejections().borrow_mut().clear();
+            TrustedPromise::new(promise)
+        })
+        .collect();
 
-            let target = Trusted::new(global.upcast::<EventTarget>());
-
-            // Step 4.
-            global.task_manager().dom_manipulation_task_source().queue(
-                task!(unhandled_rejection_event: move || {
-                    let target = target.root();
-                    let cx = GlobalScope::get_cx();
-
-                    for promise in uncaught_rejections {
-                        let promise = promise.root();
-
-                        // Step 4-1.
-                        let promise_is_handled = GetPromiseIsHandled(promise.reflector().get_jsobject());
-                        if promise_is_handled {
-                            continue;
-                        }
-
-                        // Step 4-2.
-                        rooted!(in(*cx) let mut reason = UndefinedValue());
-                        JS_GetPromiseResult(promise.reflector().get_jsobject(), reason.handle_mut());
-
-                        let event = PromiseRejectionEvent::new(
-                            &target.global(),
-                            atom!("unhandledrejection"),
-                            EventBubbles::DoesNotBubble,
-                            EventCancelable::Cancelable,
-                            promise.clone(),
-                            reason.handle(),
-                            CanGc::note()
-                        );
-
-                        let not_canceled = event.upcast::<Event>().fire(&target, CanGc::note());
-
-                        // Step 4-3. If notCanceled is true, then the user agent
-                        // may report p.[[PromiseResult]] to a developer console.
-                        if not_canceled {
-                            // TODO: The promise rejection is not handled; we need to add it back to the list.
-                        }
-
-                        // Step 4-4.
-                        if !promise_is_handled {
-                            target.global().add_consumed_rejection(promise.reflector().get_jsobject().into_handle());
-                        }
-                    }
-                })
-            );
-        }
+    // Step 2. If list is empty, then return.
+    if uncaught_rejections.is_empty() {
+        return;
     }
+
+    // Step 3. Empty global's about-to-be-notified rejected promises list.
+    // NOTE: We did this as part of Step 1. using the "drain(..)" call.
+
+    // Step 4. Queue a global task on the DOM manipulation task source given global to run the following step:
+    let target = Trusted::new(global.upcast::<EventTarget>());
+    global.task_manager().dom_manipulation_task_source().queue(
+        task!(unhandled_rejection_event: move |cx| {
+            let target = target.root();
+
+            // Step 4.1 For each promise p of list:
+            for promise in uncaught_rejections {
+                let promise = promise.root();
+
+                // 4.1.1 If p.[[PromiseIsHandled]] is true, then continue.
+                let promise_is_handled = unsafe { GetPromiseIsHandled(promise.reflector().get_jsobject()) };
+                if promise_is_handled {
+                    continue;
+                }
+
+                // Step 4.1.2 Let notCanceled be the result of firing an event named unhandledrejection at global,
+                // using PromiseRejectionEvent, with the cancelable attribute initialized to true,
+                // the promise attribute initialized to p, and the reason attribute initialized to p.[[PromiseResult]].
+                rooted!(&in(cx) let mut reason = UndefinedValue());
+                unsafe {
+                    JS_GetPromiseResult(promise.reflector().get_jsobject(), reason.handle_mut());
+                }
+
+                log::error!(
+                    "Unhandled promise rejection: {}",
+                    stringify_handle_value(reason.handle())
+                );
+
+                let event = PromiseRejectionEvent::new(
+                    &target.global(),
+                    atom!("unhandledrejection"),
+                    EventBubbles::DoesNotBubble,
+                    EventCancelable::Cancelable,
+                    promise.clone(),
+                    reason.handle(),
+                    CanGc::from_cx(cx)
+                );
+                event.upcast::<Event>().fire(&target, CanGc::from_cx(cx));
+
+                // TODO: Step 4.1.3 If notCanceled is true, then the user agent may report
+                // p.[[PromiseResult]] to a developer console.
+
+                // Step 4.1.4 If p.[[PromiseIsHandled]] is false, then append p to global's outstanding
+                // rejected promises weak set.
+                if !promise_is_handled {
+                    target.global().add_consumed_rejection(promise.reflector().get_jsobject().into_handle());
+                }
+            }
+        })
+    );
 }
 
 /// Data that is sent to SpiderMonkey runtime callbacks as a pointer, which allows access
@@ -1330,24 +1345,32 @@ unsafe extern "C" fn consume_stream(
     _mime_type: MimeType,
     _consumer: *mut JSStreamConsumer,
 ) -> bool {
-    let cx = unsafe { JSContext::from_ptr(cx) };
-    let in_realm_proof = AlreadyInRealm::assert_for_cx(cx);
-    let global = unsafe { GlobalScope::from_context(*cx, InRealm::Already(&in_realm_proof)) };
+    let mut cx = unsafe {
+        // SAFETY: We are in SM hook
+        js::context::JSContext::from_ptr(
+            NonNull::new(cx).expect("JSContext should not be null in SM hook"),
+        )
+    };
+    let cx = &mut cx;
+    let realm = CurrentRealm::assert(cx);
+    let global = GlobalScope::from_current_realm(&realm);
 
     // Step 2.1 Upon fulfillment of source, store the Response with value unwrappedSource.
     if let Ok(unwrapped_source) =
-        root_from_handleobject::<Response>(unsafe { RustHandleObject::from_raw(obj) }, *cx)
+        unsafe { root_from_handleobject::<Response>(RustHandleObject::from_raw(obj), cx.raw_cx()) }
     {
         // Step 2.2 Let mimeType be the result of extracting a MIME type from response’s header list.
-        let mimetype = unwrapped_source.Headers(CanGc::note()).extract_mime_type();
+        let mimetype = unwrapped_source
+            .Headers(CanGc::from_cx(cx))
+            .extract_mime_type();
 
         // Step 2.3 If mimeType is not `application/wasm`, return with a TypeError and abort these substeps.
         if !&mimetype[..].eq_ignore_ascii_case(b"application/wasm") {
             throw_dom_exception(
-                cx,
+                cx.into(),
                 &global,
                 Error::Type(c"Response has unsupported MIME type".to_owned()),
-                CanGc::note(),
+                CanGc::from_cx(cx),
             );
             return false;
         }
@@ -1357,10 +1380,10 @@ unsafe extern "C" fn consume_stream(
             DOMResponseType::Basic | DOMResponseType::Cors | DOMResponseType::Default => {},
             _ => {
                 throw_dom_exception(
-                    cx,
+                    cx.into(),
                     &global,
                     Error::Type(c"Response.type must be 'basic', 'cors' or 'default'".to_owned()),
-                    CanGc::note(),
+                    CanGc::from_cx(cx),
                 );
                 return false;
             },
@@ -1369,10 +1392,10 @@ unsafe extern "C" fn consume_stream(
         // Step 2.5 If response’s status is not an ok status, return with a TypeError and abort these substeps.
         if !unwrapped_source.Ok() {
             throw_dom_exception(
-                cx,
+                cx.into(),
                 &global,
                 Error::Type(c"Response does not have ok status".to_owned()),
-                CanGc::note(),
+                CanGc::from_cx(cx),
             );
             return false;
         }
@@ -1380,10 +1403,10 @@ unsafe extern "C" fn consume_stream(
         // Step 2.6.1 If response body is locked, return with a TypeError and abort these substeps.
         if unwrapped_source.is_locked() {
             throw_dom_exception(
-                cx,
+                cx.into(),
                 &global,
                 Error::Type(c"There was an error consuming the Response".to_owned()),
-                CanGc::note(),
+                CanGc::from_cx(cx),
             );
             return false;
         }
@@ -1391,10 +1414,10 @@ unsafe extern "C" fn consume_stream(
         // Step 2.6.2 If response body is alreaady consumed, return with a TypeError and abort these substeps.
         if unwrapped_source.is_disturbed() {
             throw_dom_exception(
-                cx,
+                cx.into(),
                 &global,
                 Error::Type(c"Response already consumed".to_owned()),
-                CanGc::note(),
+                CanGc::from_cx(cx),
             );
             return false;
         }
@@ -1402,10 +1425,10 @@ unsafe extern "C" fn consume_stream(
     } else {
         // Step 3 Upon rejection of source, return with reason.
         throw_dom_exception(
-            cx,
+            cx.into(),
             &global,
             Error::Type(c"expected Response or Promise resolving to Response".to_owned()),
-            CanGc::note(),
+            CanGc::from_cx(cx),
         );
         return false;
     }
@@ -1430,7 +1453,7 @@ unsafe extern "C" fn invoke_script_environment_preparer(
 
     run_a_script::<DomTypeHolder, _>(&global, || {
         if unsafe { !RunScriptEnvironmentPreparerClosure(*cx, closure) } {
-            report_pending_exception(cx, InRealm::Entered(&ar), CanGc::note());
+            report_pending_exception(cx, InRealm::Entered(&ar), CanGc::deprecated_note());
         };
     });
 }

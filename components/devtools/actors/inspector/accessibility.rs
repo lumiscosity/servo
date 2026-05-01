@@ -11,6 +11,8 @@ use serde_json::{Map, Value};
 
 use crate::StreamId;
 use crate::actor::{Actor, ActorError, ActorRegistry};
+use crate::actors::inspector::accessible_walker::AccessibleWalkerActor;
+use crate::actors::inspector::simulator::SimulatorActor;
 use crate::protocol::ClientRequest;
 
 #[derive(Serialize)]
@@ -90,14 +92,11 @@ impl Actor for AccessibilityActor {
                 request.reply_final(&msg)?
             },
             "getSimulator" => {
-                // TODO: Create actual simulator
-                let actor = registry.new_name::<SimulatorActor>();
-                registry.register(SimulatorActor {
-                    name: actor.clone(),
-                });
                 let msg = GetSimulatorReply {
                     from: self.name(),
-                    simulator: ActorMsg { actor },
+                    simulator: ActorMsg {
+                        actor: SimulatorActor::register(registry),
+                    },
                 };
                 request.reply_final(&msg)?
             },
@@ -111,14 +110,11 @@ impl Actor for AccessibilityActor {
                 request.reply_final(&msg)?
             },
             "getWalker" => {
-                // TODO: Create actual accessible walker
-                let actor = registry.new_name::<AccessibleWalkerActor>();
-                registry.register(AccessibleWalkerActor {
-                    name: actor.clone(),
-                });
                 let msg = GetWalkerReply {
                     from: self.name(),
-                    walker: ActorMsg { actor },
+                    walker: ActorMsg {
+                        actor: AccessibleWalkerActor::register(registry),
+                    },
                 };
                 request.reply_final(&msg)?
             },
@@ -129,29 +125,10 @@ impl Actor for AccessibilityActor {
 }
 
 impl AccessibilityActor {
-    pub fn new(name: String) -> Self {
-        Self { name }
-    }
-}
-
-#[derive(MallocSizeOf)]
-pub(crate) struct SimulatorActor {
-    name: String,
-}
-
-impl Actor for SimulatorActor {
-    fn name(&self) -> String {
-        self.name.clone()
-    }
-}
-
-#[derive(MallocSizeOf)]
-pub(crate) struct AccessibleWalkerActor {
-    name: String,
-}
-
-impl Actor for AccessibleWalkerActor {
-    fn name(&self) -> String {
-        self.name.clone()
+    pub fn register(registry: &ActorRegistry) -> String {
+        let name = registry.new_name::<Self>();
+        let actor = Self { name: name.clone() };
+        registry.register::<Self>(actor);
+        name
     }
 }

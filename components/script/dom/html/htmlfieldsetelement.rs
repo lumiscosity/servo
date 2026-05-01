@@ -55,19 +55,19 @@ impl HTMLFieldSetElement {
     }
 
     pub(crate) fn new(
+        cx: &mut js::context::JSContext,
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
     ) -> DomRoot<HTMLFieldSetElement> {
         Node::reflect_node_with_proto(
+            cx,
             Box::new(HTMLFieldSetElement::new_inherited(
                 local_name, prefix, document,
             )),
             document,
             proto,
-            can_gc,
         )
     }
 
@@ -87,17 +87,12 @@ impl HTMLFieldSetElement {
 
 impl HTMLFieldSetElementMethods<crate::DomTypeHolder> for HTMLFieldSetElement {
     /// <https://html.spec.whatwg.org/multipage/#dom-fieldset-elements>
-    fn Elements(&self, can_gc: CanGc) -> DomRoot<HTMLCollection> {
-        HTMLCollection::new_with_filter_fn(
-            &self.owner_window(),
-            self.upcast(),
-            |element, _| {
-                element
-                    .downcast::<HTMLElement>()
-                    .is_some_and(HTMLElement::is_listed_element)
-            },
-            can_gc,
-        )
+    fn Elements(&self, cx: &mut js::context::JSContext) -> DomRoot<HTMLCollection> {
+        HTMLCollection::new_with_filter_fn(cx, &self.owner_window(), self.upcast(), |element, _| {
+            element
+                .downcast::<HTMLElement>()
+                .is_some_and(HTMLElement::is_listed_element)
+        })
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-fieldset-disabled
@@ -158,10 +153,15 @@ impl VirtualMethods for HTMLFieldSetElement {
         Some(self.upcast::<HTMLElement>() as &dyn VirtualMethods)
     }
 
-    fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation, can_gc: CanGc) {
+    fn attribute_mutated(
+        &self,
+        cx: &mut js::context::JSContext,
+        attr: &Attr,
+        mutation: AttributeMutation,
+    ) {
         self.super_type()
             .unwrap()
-            .attribute_mutated(attr, mutation, can_gc);
+            .attribute_mutated(cx, attr, mutation);
         match *attr.local_name() {
             local_name!("disabled") => {
                 let disabled_state = match mutation {
@@ -177,7 +177,7 @@ impl VirtualMethods for HTMLFieldSetElement {
                 element.set_disabled_state(disabled_state);
                 element.set_enabled_state(!disabled_state);
                 let mut found_legend = false;
-                let children = node.children().filter(|node| {
+                let children = node.children_unrooted(cx.no_gc()).filter(|node| {
                     if found_legend {
                         true
                     } else if node.is::<HTMLLegendElement>() {
@@ -247,7 +247,7 @@ impl VirtualMethods for HTMLFieldSetElement {
                 }
             },
             local_name!("form") => {
-                self.form_attribute_mutated(mutation, can_gc);
+                self.form_attribute_mutated(mutation, CanGc::from_cx(cx));
             },
             _ => {},
         }

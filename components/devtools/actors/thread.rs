@@ -5,11 +5,11 @@
 use std::collections::HashSet;
 
 use atomic_refcell::AtomicRefCell;
-use base::generic_channel::GenericSender;
 use devtools_traits::{DevtoolScriptControlMsg, PauseReason};
 use malloc_size_of_derive::MallocSizeOf;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use servo_base::generic_channel::GenericSender;
 
 use super::source::{SourceManager, SourcesReply};
 use crate::actor::{Actor, ActorError, ActorRegistry};
@@ -112,22 +112,25 @@ pub(crate) struct ThreadActor {
     pub source_manager: SourceManager,
     script_sender: GenericSender<DevtoolScriptControlMsg>,
     pub frames: AtomicRefCell<HashSet<String>>,
-    browsing_context: Option<String>,
+    browsing_context_name: Option<String>,
 }
 
 impl ThreadActor {
-    pub fn new(
-        name: String,
+    pub fn register(
+        registry: &ActorRegistry,
         script_sender: GenericSender<DevtoolScriptControlMsg>,
-        browsing_context: Option<String>,
-    ) -> ThreadActor {
-        ThreadActor {
+        browsing_context_name: Option<String>,
+    ) -> String {
+        let name = registry.new_name::<Self>();
+        let actor = ThreadActor {
             name: name.clone(),
             source_manager: SourceManager::new(),
             script_sender,
             frames: Default::default(),
-            browsing_context,
-        }
+            browsing_context_name,
+        };
+        registry.register::<Self>(actor);
+        name
     }
 }
 
@@ -146,14 +149,11 @@ impl Actor for ThreadActor {
     ) -> Result<(), ActorError> {
         match msg_type {
             "attach" => {
-                let pause = registry.new_name::<PauseActor>();
-                registry.register(PauseActor {
-                    name: pause.clone(),
-                });
+                let pause_name = PauseActor::register(registry);
                 let msg = ThreadAttached {
                     from: self.name(),
                     type_: "paused".to_owned(),
-                    actor: pause,
+                    actor: pause_name,
                     frame: 0,
                     error: 0,
                     recording_endpoint: 0,
@@ -215,10 +215,11 @@ impl Actor for ThreadActor {
             },
 
             "frames" => {
-                let Some(ref browsing_context) = self.browsing_context else {
+                let Some(ref browsing_context_name) = self.browsing_context_name else {
                     return Err(ActorError::Internal);
                 };
-                let browsing_context = registry.find::<BrowsingContextActor>(browsing_context);
+                let browsing_context_actor =
+                    registry.find::<BrowsingContextActor>(browsing_context_name);
 
                 let frames: FramesRequest =
                     serde_json::from_value(msg.clone().into()).map_err(|_| ActorError::Internal)?;
@@ -228,7 +229,7 @@ impl Actor for ThreadActor {
                 };
                 self.script_sender
                     .send(DevtoolScriptControlMsg::ListFrames(
-                        browsing_context.pipeline_id(),
+                        browsing_context_actor.pipeline_id(),
                         frames.start,
                         frames.count,
                         tx,
@@ -242,7 +243,7 @@ impl Actor for ThreadActor {
                     from: self.name(),
                     frames: result
                         .iter()
-                        .map(|frame| registry.encode::<FrameActor, _>(frame))
+                        .map(|frame_name| registry.encode::<FrameActor, _>(frame_name))
                         .collect(),
                 };
                 request.reply_final(&msg)?

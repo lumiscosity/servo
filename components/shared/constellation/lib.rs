@@ -15,15 +15,12 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::time::Duration;
 
-use base::cross_process_instant::CrossProcessInstant;
-use base::generic_channel::GenericCallback;
-use base::id::{MessagePortId, PipelineId, ScriptEventLoopId, WebViewId};
 use embedder_traits::user_contents::{
     UserContentManagerId, UserScript, UserScriptId, UserStyleSheet, UserStyleSheetId,
 };
 use embedder_traits::{
     EmbedderControlId, EmbedderControlResponse, InputEventAndId, JavaScriptEvaluationId,
-    MediaSessionActionType, NewWebViewDetails, PaintHitTestResult, Theme, TraversalId,
+    MediaSessionActionType, NewWebViewDetails, PaintHitTestResult, Theme, TraversalId, UrlRequest,
     ViewportDetails, WebDriverCommandMsg,
 };
 pub use from_script_message::*;
@@ -32,6 +29,9 @@ use paint_api::PinchZoomInfos;
 use profile_traits::mem::MemoryReportResult;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use servo_base::cross_process_instant::CrossProcessInstant;
+use servo_base::generic_channel::GenericCallback;
+use servo_base::id::{MessagePortId, PipelineId, ScriptEventLoopId, WebViewId};
 use servo_config::prefs::PrefValue;
 use servo_url::{ImmutableOrigin, ServoUrl};
 pub use structured_data::*;
@@ -47,8 +47,8 @@ pub enum EmbedderToConstellationMessage {
     Exit,
     /// Whether to allow script to navigate.
     AllowNavigationResponse(PipelineId, bool),
-    /// Request to load a page.
-    LoadUrl(WebViewId, ServoUrl),
+    /// Request to load a page, with optionally additional data in [`URLRequest`].
+    LoadUrl(WebViewId, UrlRequest),
     /// Request to traverse the joint session history of the provided browsing context.
     TraverseHistory(WebViewId, TraversalDirection, TraversalId),
     /// Inform the Constellation that a `WebView`'s [`ViewportDetails`] have changed.
@@ -116,8 +116,8 @@ pub enum EmbedderToConstellationMessage {
     UserContentManagerAction(UserContentManagerId, UserContentManagerAction),
     /// Update pinch zoom details stored in the top level window
     UpdatePinchZoomInfos(PipelineId, PinchZoomInfos),
-    /// Activate or deactivate accessibility features.
-    SetAccessibilityActive(bool),
+    /// Activate or deactivate accessibility features for the given `WebView`.
+    SetAccessibilityActive(WebViewId, bool),
 }
 
 pub enum UserContentManagerAction {

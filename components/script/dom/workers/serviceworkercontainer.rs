@@ -5,12 +5,12 @@
 use std::default::Default;
 use std::rc::Rc;
 
-use base::generic_channel::GenericCallback;
-use constellation_traits::{
-    Job, JobError, JobResult, JobResultValue, JobType, ScriptToConstellationMessage,
-};
 use dom_struct::dom_struct;
 use js::realm::CurrentRealm;
+use servo_base::generic_channel::GenericCallback;
+use servo_constellation_traits::{
+    Job, JobError, JobResult, JobResultValue, JobType, ScriptToConstellationMessage,
+};
 
 use crate::dom::bindings::codegen::Bindings::ServiceWorkerContainerBinding::{
     RegistrationOptions, ServiceWorkerContainerMethods,
@@ -212,11 +212,11 @@ impl RegisterJobResultHandler {
                             JobError::TypeError => {
                                 promise.reject_error(
                                     Error::Type(c"Failed to register a ServiceWorker".to_owned()),
-                                    CanGc::note(),
+                                    CanGc::deprecated_note(),
                                 );
                             },
                             JobError::SecurityError => {
-                                promise.reject_error(Error::Security(None), CanGc::note());
+                                promise.reject_error(Error::Security(None), CanGc::deprecated_note());
                             },
                         }
 
@@ -252,11 +252,11 @@ impl RegisterJobResultHandler {
                         installing_worker,
                         waiting_worker,
                         active_worker,
-                        CanGc::note()
+                        CanGc::deprecated_note()
                     );
 
                     // Step 1.4
-                    promise.resolve_native(&*registration, CanGc::note());
+                    promise.resolve_native(&*registration, CanGc::deprecated_note());
                 }));
 
                 // TODO: step 2, handle equivalent jobs.

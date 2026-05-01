@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Prefix, local_name};
+use js::context::JSContext;
 use js::rust::HandleObject;
 use net_traits::ReferrerPolicy;
 use script_bindings::root::Dom;
@@ -79,20 +80,20 @@ impl HTMLStyleElement {
     }
 
     pub(crate) fn new(
+        cx: &mut js::context::JSContext,
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
         creator: ElementCreator,
-        can_gc: CanGc,
     ) -> DomRoot<HTMLStyleElement> {
         Node::reflect_node_with_proto(
+            cx,
             Box::new(HTMLStyleElement::new_inherited(
                 local_name, prefix, document, creator,
             )),
             document,
             proto,
-            can_gc,
         )
     }
 
@@ -253,7 +254,7 @@ impl HTMLStyleElement {
                     None, // todo handle title
                     sheet,
                     None, // constructor_document
-                    CanGc::note(),
+                    CanGc::deprecated_note(),
                 )
             })
         })
@@ -317,10 +318,8 @@ impl VirtualMethods for HTMLStyleElement {
         Some(self.upcast::<HTMLElement>() as &dyn VirtualMethods)
     }
 
-    fn children_changed(&self, mutation: &ChildrenMutation, can_gc: CanGc) {
-        self.super_type()
-            .unwrap()
-            .children_changed(mutation, can_gc);
+    fn children_changed(&self, cx: &mut JSContext, mutation: &ChildrenMutation) {
+        self.super_type().unwrap().children_changed(cx, mutation);
 
         // https://html.spec.whatwg.org/multipage/#update-a-style-block
         // > The element is not on the stack of open elements of an HTML parser or XML parser, and its children changed steps run.
@@ -329,8 +328,8 @@ impl VirtualMethods for HTMLStyleElement {
         }
     }
 
-    fn bind_to_tree(&self, context: &BindContext, can_gc: CanGc) {
-        self.super_type().unwrap().bind_to_tree(context, can_gc);
+    fn bind_to_tree(&self, cx: &mut JSContext, context: &BindContext) {
+        self.super_type().unwrap().bind_to_tree(cx, context);
 
         // https://html.spec.whatwg.org/multipage/#update-a-style-block
         // > The element is not on the stack of open elements of an HTML parser or XML parser, and it becomes connected or disconnected.
@@ -348,9 +347,9 @@ impl VirtualMethods for HTMLStyleElement {
         self.update_a_style_block();
     }
 
-    fn unbind_from_tree(&self, context: &UnbindContext, can_gc: CanGc) {
+    fn unbind_from_tree(&self, cx: &mut js::context::JSContext, context: &UnbindContext) {
         if let Some(s) = self.super_type() {
-            s.unbind_from_tree(context, can_gc);
+            s.unbind_from_tree(cx, context);
         }
 
         // https://html.spec.whatwg.org/multipage/#update-a-style-block
@@ -360,9 +359,14 @@ impl VirtualMethods for HTMLStyleElement {
         }
     }
 
-    fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation, can_gc: CanGc) {
+    fn attribute_mutated(
+        &self,
+        cx: &mut js::context::JSContext,
+        attr: &Attr,
+        mutation: AttributeMutation,
+    ) {
         if let Some(s) = self.super_type() {
-            s.attribute_mutated(attr, mutation, can_gc);
+            s.attribute_mutated(cx, attr, mutation);
         }
 
         let node = self.upcast::<Node>();
@@ -458,7 +462,7 @@ impl HTMLStyleElementMethods<crate::DomTypeHolder> for HTMLStyleElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-style-disabled>
-    fn SetDisabled(&self, value: bool) {
+    fn SetDisabled(&self, _cx: &mut js::context::JSContext, value: bool) {
         if let Some(sheet) = self.get_cssom_stylesheet() {
             sheet.set_disabled(value);
         }

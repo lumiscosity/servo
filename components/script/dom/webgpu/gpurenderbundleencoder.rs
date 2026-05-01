@@ -122,7 +122,7 @@ impl GPURenderBundleEncoder {
             &device.global(),
             render_bundle_encoder,
             device,
-            device.channel().clone(),
+            device.channel(),
             descriptor.parent.parent.label.clone(),
             can_gc,
         ))
@@ -279,7 +279,7 @@ impl GPURenderBundleEncoderMethods<crate::DomTypeHolder> for GPURenderBundleEnco
             self.device.id(),
             self.channel.clone(),
             descriptor.parent.label.clone(),
-            CanGc::note(),
+            CanGc::deprecated_note(),
         )
     }
 }

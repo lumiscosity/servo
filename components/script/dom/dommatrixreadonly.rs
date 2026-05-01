@@ -5,8 +5,6 @@
 use std::cell::Cell;
 use std::{f64, ptr};
 
-use base::id::{DomMatrixId, DomMatrixIndex};
-use constellation_traits::DomMatrix;
 use cssparser::{Parser, ParserInput};
 use dom_struct::dom_struct;
 use euclid::Angle;
@@ -19,6 +17,8 @@ use js::typedarray::{Float32Array, Float64Array, HeapFloat32Array, HeapFloat64Ar
 use rustc_hash::FxHashMap;
 use script_bindings::cformat;
 use script_bindings::trace::RootedTraceableBox;
+use servo_base::id::{DomMatrixId, DomMatrixIndex};
+use servo_constellation_traits::DomMatrix;
 use style::stylesheets::CssRuleType;
 use style_traits::ParsingMode;
 use url::Url;
@@ -799,7 +799,11 @@ impl DOMMatrixReadOnlyMethods<crate::DomTypeHolder> for DOMMatrixReadOnly {
     }
 
     /// <https://drafts.fxtf.org/geometry-1/#dom-dommatrixreadonly-transformpoint>
-    fn TransformPoint(&self, point: &DOMPointInit, can_gc: CanGc) -> DomRoot<DOMPoint> {
+    fn TransformPoint(
+        &self,
+        cx: &mut js::context::JSContext,
+        point: &DOMPointInit,
+    ) -> DomRoot<DOMPoint> {
         // Euclid always normalizes the homogeneous coordinate which is usually the right
         // thing but may (?) not be compliant with the CSS matrix spec (or at least is
         // probably not the behavior web authors will expect even if it is mathematically
@@ -812,7 +816,7 @@ impl DOMMatrixReadOnlyMethods<crate::DomTypeHolder> for DOMMatrixReadOnly {
         let z = point.x * mat.m13 + point.y * mat.m23 + point.z * mat.m33 + point.w * mat.m43;
         let w = point.x * mat.m14 + point.y * mat.m24 + point.z * mat.m34 + point.w * mat.m44;
 
-        DOMPoint::new(&self.global(), x, y, z, w, can_gc)
+        DOMPoint::new(cx, &self.global(), x, y, z, w)
     }
 
     /// <https://drafts.fxtf.org/geometry-1/#dom-dommatrixreadonly-tofloat32array>

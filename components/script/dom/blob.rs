@@ -5,15 +5,16 @@
 use std::ptr;
 use std::rc::Rc;
 
-use base::id::{BlobId, BlobIndex};
-use constellation_traits::{BlobData, BlobImpl};
 use dom_struct::dom_struct;
 use encoding_rs::UTF_8;
 use js::jsapi::JSObject;
+use js::realm::CurrentRealm;
 use js::rust::HandleObject;
 use js::typedarray::{ArrayBufferU8, Uint8};
 use net_traits::filemanager_thread::RelativePos;
 use rustc_hash::FxHashMap;
+use servo_base::id::{BlobId, BlobIndex};
+use servo_constellation_traits::{BlobData, BlobImpl};
 use uuid::Uuid;
 
 use crate::dom::bindings::buffer_source::create_buffer_source;
@@ -21,7 +22,9 @@ use crate::dom::bindings::codegen::Bindings::BlobBinding;
 use crate::dom::bindings::codegen::Bindings::BlobBinding::BlobMethods;
 use crate::dom::bindings::codegen::UnionTypes::ArrayBufferOrArrayBufferViewOrBlobOrString;
 use crate::dom::bindings::error::{Error, Fallible};
-use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object_with_proto};
+use crate::dom::bindings::reflector::{
+    DomGlobal, Reflector, reflect_dom_object_with_proto, reflect_dom_object_with_proto_and_cx,
+};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::serializable::Serializable;
 use crate::dom::bindings::str::DOMString;
@@ -29,7 +32,6 @@ use crate::dom::bindings::structuredclone::StructuredData;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
 use crate::dom::stream::readablestream::ReadableStream;
-use crate::realms::{AlreadyInRealm, InRealm};
 use crate::script_runtime::CanGc;
 
 /// <https://w3c.github.io/FileAPI/#dfn-Blob>
@@ -61,6 +63,22 @@ impl Blob {
         dom_blob
     }
 
+    fn new_with_proto_and_cx(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        blob_impl: BlobImpl,
+        cx: &mut js::context::JSContext,
+    ) -> DomRoot<Blob> {
+        let dom_blob = reflect_dom_object_with_proto_and_cx(
+            Box::new(Blob::new_inherited(&blob_impl)),
+            global,
+            proto,
+            cx,
+        );
+        global.track_blob(&dom_blob, blob_impl);
+        dom_blob
+    }
+
     pub(crate) fn new_inherited(blob_impl: &BlobImpl) -> Blob {
         Blob {
             reflector_: Reflector::new(),
@@ -85,8 +103,11 @@ impl Blob {
     }
 
     /// <https://w3c.github.io/FileAPI/#blob-get-stream>
-    pub(crate) fn get_stream(&self, can_gc: CanGc) -> Fallible<DomRoot<ReadableStream>> {
-        self.global().get_blob_stream(&self.blob_id, can_gc)
+    pub(crate) fn get_stream(
+        &self,
+        cx: &mut js::context::JSContext,
+    ) -> Fallible<DomRoot<ReadableStream>> {
+        self.global().get_blob_stream(cx, &self.blob_id)
     }
 }
 
@@ -161,9 +182,9 @@ impl BlobMethods<crate::DomTypeHolder> for Blob {
     // https://w3c.github.io/FileAPI/#constructorBlob
     #[expect(non_snake_case)]
     fn Constructor(
+        cx: &mut js::context::JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
         blobParts: Option<Vec<ArrayBufferOrArrayBufferViewOrBlobOrString>>,
         blobPropertyBag: &BlobBinding::BlobPropertyBag,
     ) -> Fallible<DomRoot<Blob>> {
@@ -178,7 +199,7 @@ impl BlobMethods<crate::DomTypeHolder> for Blob {
         let type_string = normalize_type_string(&blobPropertyBag.type_.str());
         let blob_impl = BlobImpl::new_from_bytes(bytes, type_string);
 
-        Ok(Blob::new_with_proto(global, proto, blob_impl, can_gc))
+        Ok(Blob::new_with_proto_and_cx(global, proto, blob_impl, cx))
     }
 
     /// <https://w3c.github.io/FileAPI/#dfn-size>
@@ -192,17 +213,17 @@ impl BlobMethods<crate::DomTypeHolder> for Blob {
     }
 
     // <https://w3c.github.io/FileAPI/#blob-get-stream>
-    fn Stream(&self, can_gc: CanGc) -> Fallible<DomRoot<ReadableStream>> {
-        self.get_stream(can_gc)
+    fn Stream(&self, cx: &mut js::context::JSContext) -> Fallible<DomRoot<ReadableStream>> {
+        self.get_stream(cx)
     }
 
     /// <https://w3c.github.io/FileAPI/#slice-method-algo>
     fn Slice(
         &self,
+        cx: &mut js::context::JSContext,
         start: Option<i64>,
         end: Option<i64>,
         content_type: Option<DOMString>,
-        can_gc: CanGc,
     ) -> DomRoot<Blob> {
         let global = self.global();
         let type_string = normalize_type_string(&content_type.unwrap_or_default().str());
@@ -221,26 +242,25 @@ impl BlobMethods<crate::DomTypeHolder> for Blob {
         };
 
         let blob_impl = BlobImpl::new_sliced(range, parent, type_string);
-        Blob::new(&global, blob_impl, can_gc)
+        Blob::new(&global, blob_impl, CanGc::from_cx(cx))
     }
 
     /// <https://w3c.github.io/FileAPI/#text-method-algo>
-    fn Text(&self, can_gc: CanGc) -> Rc<Promise> {
+    fn Text(&self, cx: &mut CurrentRealm) -> Rc<Promise> {
         let global = self.global();
-        let in_realm_proof = AlreadyInRealm::assert::<crate::DomTypeHolder>();
-        let p = Promise::new_in_current_realm(InRealm::Already(&in_realm_proof), can_gc);
+        let p = Promise::new_in_realm(cx);
         let id = self.get_blob_url_id();
         global.read_file_async(
             id,
             p.clone(),
-            Box::new(|promise, bytes| match bytes {
+            Box::new(|cx, promise, bytes| match bytes {
                 Ok(b) => {
                     let (text, _) = UTF_8.decode_with_bom_removal(&b);
                     let text = DOMString::from(text);
-                    promise.resolve_native(&text, CanGc::note());
+                    promise.resolve_native(&text, CanGc::from_cx(cx));
                 },
                 Err(e) => {
-                    promise.reject_error(e, CanGc::note());
+                    promise.reject_error(e, CanGc::from_cx(cx));
                 },
             }),
         );
@@ -248,19 +268,18 @@ impl BlobMethods<crate::DomTypeHolder> for Blob {
     }
 
     /// <https://w3c.github.io/FileAPI/#arraybuffer-method-algo>
-    fn ArrayBuffer(&self, in_realm: InRealm, can_gc: CanGc) -> Rc<Promise> {
-        let cx = GlobalScope::get_cx();
-        let promise = Promise::new_in_current_realm(in_realm, can_gc);
+    fn ArrayBuffer(&self, cx: &mut CurrentRealm) -> Rc<Promise> {
+        let promise = Promise::new_in_realm(cx);
 
         // 1. Let stream be the result of calling get stream on this.
-        let stream = self.get_stream(can_gc);
+        let stream = self.get_stream(cx);
 
         // 2. Let reader be the result of getting a reader from stream.
         //    If that threw an exception, return a new promise rejected with that exception.
-        let reader = match stream.and_then(|s| s.acquire_default_reader(can_gc)) {
+        let reader = match stream.and_then(|s| s.acquire_default_reader(CanGc::from_cx(cx))) {
             Ok(reader) => reader,
             Err(error) => {
-                promise.reject_error(error, can_gc);
+                promise.reject_error(error, CanGc::from_cx(cx));
                 return promise;
             },
         };
@@ -270,42 +289,40 @@ impl BlobMethods<crate::DomTypeHolder> for Blob {
         let failure_promise = promise.clone();
         reader.read_all_bytes(
             cx,
-            Rc::new(move |bytes| {
-                rooted!(in(*cx) let mut js_object = ptr::null_mut::<JSObject>());
+            Rc::new(move |cx, bytes| {
+                rooted!(&in(cx) let mut js_object = ptr::null_mut::<JSObject>());
                 // 4. Return the result of transforming promise by a fulfillment handler that returns a new
                 //    [ArrayBuffer]
                 let array_buffer = create_buffer_source::<ArrayBufferU8>(
-                    cx,
+                    cx.into(),
                     bytes,
                     js_object.handle_mut(),
-                    can_gc,
+                    CanGc::from_cx(cx),
                 )
                 .expect("Converting input to ArrayBufferU8 should never fail");
-                success_promise.resolve_native(&array_buffer, can_gc);
+                success_promise.resolve_native(&array_buffer, CanGc::from_cx(cx));
             }),
             Rc::new(move |cx, value| {
-                failure_promise.reject(cx, value, can_gc);
+                failure_promise.reject(cx.into(), value, CanGc::from_cx(cx));
             }),
-            can_gc,
         );
 
         promise
     }
 
     /// <https://w3c.github.io/FileAPI/#dom-blob-bytes>
-    fn Bytes(&self, in_realm: InRealm, can_gc: CanGc) -> Rc<Promise> {
-        let cx = GlobalScope::get_cx();
-        let p = Promise::new_in_current_realm(in_realm, can_gc);
+    fn Bytes(&self, cx: &mut CurrentRealm) -> Rc<Promise> {
+        let p = Promise::new_in_realm(cx);
 
         // 1. Let stream be the result of calling get stream on this.
-        let stream = self.get_stream(can_gc);
+        let stream = self.get_stream(cx);
 
         // 2. Let reader be the result of getting a reader from stream.
         //    If that threw an exception, return a new promise rejected with that exception.
-        let reader = match stream.and_then(|s| s.acquire_default_reader(can_gc)) {
+        let reader = match stream.and_then(|s| s.acquire_default_reader(CanGc::from_cx(cx))) {
             Ok(r) => r,
             Err(e) => {
-                p.reject_error(e, can_gc);
+                p.reject_error(e, CanGc::from_cx(cx));
                 return p;
             },
         };
@@ -315,16 +332,20 @@ impl BlobMethods<crate::DomTypeHolder> for Blob {
         let p_failure = p.clone();
         reader.read_all_bytes(
             cx,
-            Rc::new(move |bytes| {
-                rooted!(in(*cx) let mut js_object = ptr::null_mut::<JSObject>());
-                let arr = create_buffer_source::<Uint8>(cx, bytes, js_object.handle_mut(), can_gc)
-                    .expect("Converting input to uint8 array should never fail");
-                p_success.resolve_native(&arr, can_gc);
+            Rc::new(move |cx, bytes| {
+                rooted!(&in(cx) let mut js_object = ptr::null_mut::<JSObject>());
+                let arr = create_buffer_source::<Uint8>(
+                    cx.into(),
+                    bytes,
+                    js_object.handle_mut(),
+                    CanGc::from_cx(cx),
+                )
+                .expect("Converting input to uint8 array should never fail");
+                p_success.resolve_native(&arr, CanGc::from_cx(cx));
             }),
             Rc::new(move |cx, v| {
-                p_failure.reject(cx, v, can_gc);
+                p_failure.reject(cx.into(), v, CanGc::from_cx(cx));
             }),
-            can_gc,
         );
         p
     }

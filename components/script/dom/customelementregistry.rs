@@ -13,7 +13,9 @@ use html5ever::{LocalName, Namespace, Prefix, ns};
 use js::glue::UnwrapObjectStatic;
 use js::jsapi::{HandleValueArray, Heap, IsCallable, IsConstructor, JSAutoRealm, JSObject};
 use js::jsval::{BooleanValue, JSVal, NullValue, ObjectValue, UndefinedValue};
-use js::rust::wrappers::{Construct1, JS_GetProperty, SameValue};
+use js::realm::AutoRealm;
+use js::rust::wrappers::{Construct1, JS_GetProperty};
+use js::rust::wrappers2::SameValue;
 use js::rust::{HandleObject, MutableHandleValue};
 use rustc_hash::FxBuildHasher;
 use script_bindings::conversions::{SafeFromJSValConvertible, SafeToJSValConvertible};
@@ -47,7 +49,7 @@ use crate::dom::node::{Node, NodeTraits, ShadowIncluding};
 use crate::dom::promise::Promise;
 use crate::dom::window::Window;
 use crate::microtask::Microtask;
-use crate::realms::{InRealm, enter_realm};
+use crate::realms::{InRealm, enter_auto_realm};
 use crate::script_runtime::{CanGc, JSContext};
 use crate::script_thread::ScriptThread;
 
@@ -416,13 +418,19 @@ impl CustomElementRegistryMethods<crate::DomTypeHolder> for CustomElementRegistr
 
         // Step 2. If name is not a valid custom element name, then throw a "SyntaxError" DOMException.
         if !is_valid_custom_element_name(&name) {
-            return Err(Error::Syntax(None));
+            return Err(Error::Syntax(Some(format!(
+                "{} name is not a valid custom element name",
+                name
+            ))));
         }
 
         // Step 3. If this's custom element definition set contains an item with name name,
         // then throw a "NotSupportedError" DOMException.
         if self.definitions.borrow().contains_key(&name) {
-            return Err(Error::NotSupported(None));
+            return Err(Error::NotSupported(Some(format!(
+                "{} has already been defined as a custom element",
+                name
+            ))));
         }
 
         // Step 4. If this's custom element definition set contains an
@@ -609,9 +617,11 @@ impl CustomElementRegistryMethods<crate::DomTypeHolder> for CustomElementRegistr
     /// <https://html.spec.whatwg.org/multipage/#dom-customelementregistry-get>
     fn Get(&self, cx: JSContext, name: DOMString, mut retval: MutableHandleValue) {
         match self.definitions.borrow().get(&LocalName::from(name)) {
-            Some(definition) => definition
-                .constructor
-                .safe_to_jsval(cx, retval, CanGc::note()),
+            Some(definition) => {
+                definition
+                    .constructor
+                    .safe_to_jsval(cx, retval, CanGc::deprecated_note())
+            },
             None => retval.set(UndefinedValue()),
         }
     }
@@ -860,9 +870,9 @@ impl CustomElementDefinition {
 
 /// <https://html.spec.whatwg.org/multipage/#concept-upgrade-an-element>
 pub(crate) fn upgrade_element(
+    cx: &mut js::context::JSContext,
     definition: Rc<CustomElementDefinition>,
     element: &Element,
-    can_gc: CanGc,
 ) {
     // Step 1. If element's custom element state is not "undefined" or "uncustomized", then return.
     let state = element.get_custom_element_state();
@@ -908,7 +918,7 @@ pub(crate) fn upgrade_element(
         .push(ConstructionStackEntry::Element(DomRoot::from_ref(element)));
 
     // Steps 7-8, successful case
-    let result = run_upgrade_constructor(&definition, element, can_gc);
+    let result = run_upgrade_constructor(cx, &definition, element);
 
     // "regardless of whether the above steps threw an exception" step
     definition.construction_stack.borrow_mut().pop();
@@ -923,10 +933,15 @@ pub(crate) fn upgrade_element(
 
         // Step 8.exception.3
         let global = GlobalScope::current().expect("No current global");
-        let cx = GlobalScope::get_cx();
-        let ar = enter_realm(&*global);
-        throw_dom_exception(cx, &global, error, can_gc);
-        report_pending_exception(cx, InRealm::Entered(&ar), can_gc);
+
+        let mut realm = enter_auto_realm(cx, &*global);
+        let cx = &mut realm.current_realm();
+
+        let in_realm_proof = cx.into();
+        let in_realm = InRealm::Already(&in_realm_proof);
+
+        throw_dom_exception(cx.into(), &global, error, CanGc::from_cx(cx));
+        report_pending_exception(cx.into(), in_realm, CanGc::from_cx(cx));
 
         return;
     }
@@ -937,7 +952,7 @@ pub(crate) fn upgrade_element(
             // We know this element is is form-associated, so we can use the implementation of
             // `FormControl` for HTMLElement, which makes that assumption.
             // Step 9.1: Reset the form owner of element
-            html_element.reset_form_owner(can_gc);
+            html_element.reset_form_owner(CanGc::from_cx(cx));
             if let Some(form) = html_element.form_owner() {
                 // Even though the tree hasn't structurally mutated,
                 // HTMLCollections need to be invalidated.
@@ -963,7 +978,7 @@ pub(crate) fn upgrade_element(
                 ScriptThread::enqueue_callback_reaction(
                     element,
                     CallbackReaction::FormDisabled(true),
-                    Some(definition.clone()),
+                    Some(definition),
                 )
             }
         }
@@ -977,18 +992,16 @@ pub(crate) fn upgrade_element(
 /// Steps 9.1-9.4
 #[expect(unsafe_code)]
 fn run_upgrade_constructor(
+    cx: &mut js::context::JSContext,
     definition: &CustomElementDefinition,
     element: &Element,
-    // This function can cause GC through AutoEntryScript::Drop, but we can't pass a CanGc there
-    can_gc: CanGc,
 ) -> ErrorResult {
     let constructor = &definition.constructor;
     let window = element.owner_window();
-    let cx = GlobalScope::get_cx();
-    rooted!(in(*cx) let constructor_val = ObjectValue(constructor.callback()));
-    rooted!(in(*cx) let mut element_val = UndefinedValue());
-    element.safe_to_jsval(cx, element_val.handle_mut(), can_gc);
-    rooted!(in(*cx) let mut construct_result = ptr::null_mut::<JSObject>());
+    rooted!(&in(cx) let constructor_val = ObjectValue(constructor.callback()));
+    rooted!(&in(cx) let mut element_val = UndefinedValue());
+    element.safe_to_jsval(cx.into(), element_val.handle_mut(), CanGc::from_cx(cx));
+    rooted!(&in(cx) let mut construct_result = ptr::null_mut::<JSObject>());
     {
         // Step 9.1. If definition's disable shadow is true and element's shadow root is non-null,
         // then throw a "NotSupportedError" DOMException.
@@ -997,7 +1010,9 @@ fn run_upgrade_constructor(
         }
 
         // Go into the constructor's realm
-        let _ac = JSAutoRealm::new(*cx, constructor.callback());
+        let mut realm = AutoRealm::new(cx, std::ptr::NonNull::new(constructor.callback()).unwrap());
+        let cx = &mut *realm;
+
         let args = HandleValueArray::empty();
         // Step 8.2. Set element's custom element state to "precustomized".
         element.set_custom_element_state(CustomElementState::Precustomized);
@@ -1008,7 +1023,7 @@ fn run_upgrade_constructor(
             run_a_callback::<DomTypeHolder, _>(window.upcast(), || {
                 if unsafe {
                     !Construct1(
-                        *cx,
+                        cx.raw_cx(),
                         constructor_val.handle(),
                         &args,
                         construct_result.handle_mut(),
@@ -1022,12 +1037,12 @@ fn run_upgrade_constructor(
         })?;
 
         let mut same = false;
-        rooted!(in(*cx) let construct_result_val = ObjectValue(construct_result.get()));
+        rooted!(&in(cx) let construct_result_val = ObjectValue(construct_result.get()));
 
         // Step 9.4. If SameValue(constructResult, element) is false, then throw a TypeError.
         if unsafe {
             !SameValue(
-                *cx,
+                cx,
                 construct_result_val.handle(),
                 element_val.handle(),
                 &mut same,
@@ -1073,22 +1088,22 @@ pub(crate) enum CustomElementReaction {
 
 impl CustomElementReaction {
     /// <https://html.spec.whatwg.org/multipage/#invoke-custom-element-reactions>
-    pub(crate) fn invoke(&self, element: &Element, can_gc: CanGc) {
+    pub(crate) fn invoke(&self, cx: &mut js::context::JSContext, element: &Element) {
         // Step 2.1
         match *self {
             CustomElementReaction::Upgrade(ref definition) => {
-                upgrade_element(definition.clone(), element, can_gc)
+                upgrade_element(cx, definition.clone(), element)
             },
             CustomElementReaction::Callback(ref callback, ref arguments) => {
                 // We're rooted, so it's safe to hand out a handle to objects in Heap
                 let arguments = arguments.iter().map(|arg| arg.as_handle_value()).collect();
-                rooted!(in(*GlobalScope::get_cx()) let mut value: JSVal);
+                rooted!(&in(cx) let mut value: JSVal);
                 let _ = callback.Call_(
+                    cx,
                     element,
                     arguments,
                     value.handle_mut(),
                     ExceptionHandling::Report,
-                    can_gc,
                 );
             },
         }
@@ -1139,12 +1154,12 @@ impl CustomElementReactionStack {
         self.stack.borrow_mut().push(ElementQueue::new());
     }
 
-    pub(crate) fn pop_current_element_queue(&self, can_gc: CanGc) {
+    pub(crate) fn pop_current_element_queue(&self, cx: &mut js::context::JSContext) {
         rooted_vec!(let mut stack);
         mem::swap(&mut *stack, &mut *self.stack.borrow_mut());
 
         if let Some(current_queue) = stack.last() {
-            current_queue.invoke_reactions(can_gc);
+            current_queue.invoke_reactions(cx);
         }
         stack.pop();
 
@@ -1154,9 +1169,9 @@ impl CustomElementReactionStack {
 
     /// <https://html.spec.whatwg.org/multipage/#enqueue-an-element-on-the-appropriate-element-queue>
     /// Step 4
-    pub(crate) fn invoke_backup_element_queue(&self, can_gc: CanGc) {
+    pub(crate) fn invoke_backup_element_queue(&self, cx: &mut js::context::JSContext) {
         // Step 4.1
-        self.backup_queue.invoke_reactions(can_gc);
+        self.backup_queue.invoke_reactions(cx);
 
         // Step 4.2
         self.processing_backup_element_queue
@@ -1234,22 +1249,26 @@ impl CustomElementReactionStack {
 
                 let local_name = DOMString::from(&*local_name);
                 rooted!(in(*cx) let mut name_value = UndefinedValue());
-                local_name.safe_to_jsval(cx, name_value.handle_mut(), CanGc::note());
+                local_name.safe_to_jsval(cx, name_value.handle_mut(), CanGc::deprecated_note());
 
                 rooted!(in(*cx) let mut old_value = NullValue());
                 if let Some(old_val) = old_val {
-                    old_val.safe_to_jsval(cx, old_value.handle_mut(), CanGc::note());
+                    old_val.safe_to_jsval(cx, old_value.handle_mut(), CanGc::deprecated_note());
                 }
 
                 rooted!(in(*cx) let mut value = NullValue());
                 if let Some(val) = val {
-                    val.safe_to_jsval(cx, value.handle_mut(), CanGc::note());
+                    val.safe_to_jsval(cx, value.handle_mut(), CanGc::deprecated_note());
                 }
 
                 rooted!(in(*cx) let mut namespace_value = NullValue());
                 if namespace != ns!() {
                     let namespace = DOMString::from(&*namespace);
-                    namespace.safe_to_jsval(cx, namespace_value.handle_mut(), CanGc::note());
+                    namespace.safe_to_jsval(
+                        cx,
+                        namespace_value.handle_mut(),
+                        CanGc::deprecated_note(),
+                    );
                 }
 
                 let args = vec![
@@ -1369,10 +1388,10 @@ impl ElementQueue {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#invoke-custom-element-reactions>
-    fn invoke_reactions(&self, can_gc: CanGc) {
+    fn invoke_reactions(&self, cx: &mut js::context::JSContext) {
         // Steps 1-2
         while let Some(element) = self.next_element() {
-            element.invoke_reactions(can_gc)
+            element.invoke_reactions(cx)
         }
         self.queue.borrow_mut().clear();
     }

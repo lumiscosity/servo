@@ -6,7 +6,7 @@
            UpgradeCode="060cd15d-eab1-4614-b438-3988e3efdcf1"
            Language="1033"
            Codepage="1252"
-           Version="0.0.6">
+           Version="0.2.0">
     <Package Id="*"
              Keywords="Installer"
              Description="Servo Tech Demo Installer"
@@ -32,12 +32,6 @@
                     DiskId="1"
                     Source="${windowize(exe_path)}\servoshell.exe"
                     KeyPath="yes">
-                <Shortcut Id="StartMenuServoTechDemo"
-                          Directory="ProgramMenuDir"
-                          Name="Servo Tech Demo"
-                          WorkingDirectory="INSTALLDIR"
-                          Icon="servoshell.exe"
-                          Advertise="yes"/>
               </File>
 	            ${include_dependencies()}
             </Component>
@@ -56,6 +50,12 @@
                            Type="string"
                            Value=""
                            KeyPath="yes"/>
+            <Shortcut Id="StartMenuServoTechDemo"
+              Directory="ProgramMenuDir"
+              Name="Servo Tech Demo"
+              Target="[INSTALLDIR]servoshell.exe"
+              WorkingDirectory="INSTALLDIR"
+              Icon="servoshell.exe"/>
           </Component>
         </Directory>
       </Directory>

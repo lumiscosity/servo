@@ -6,8 +6,6 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::ptr::NonNull;
 
-use base::generic_channel::{GenericOneshotSender, GenericSend, GenericSender};
-use base::id::{BrowsingContextId, PipelineId};
 use cookie::Cookie;
 use embedder_traits::{
     CustomHandlersAutomationMode, JSValue, JavaScriptEvaluationError,
@@ -16,7 +14,6 @@ use embedder_traits::{
 };
 use euclid::default::{Point2D, Rect, Size2D};
 use hyper_serde::Serde;
-use ipc_channel::ipc::{self};
 use js::context::JSContext;
 use js::conversions::jsstr_to_string;
 use js::jsapi::{
@@ -28,13 +25,13 @@ use js::realm::CurrentRealm;
 use js::rust::wrappers::{JS_CallFunctionName, JS_GetProperty, JS_HasOwnProperty, JS_TypeOfValue};
 use js::rust::{Handle, HandleObject, HandleValue, IdVector, ToString};
 use net_traits::CookieSource::{HTTP, NonHTTP};
-use net_traits::CoreResourceMsg::{
-    DeleteCookie, DeleteCookies, GetCookiesDataForUrl, SetCookieForUrl,
-};
+use net_traits::CoreResourceMsg::{DeleteCookie, DeleteCookies, GetCookiesForUrl, SetCookieForUrl};
 use script_bindings::codegen::GenericBindings::ShadowRootBinding::ShadowRootMethods;
 use script_bindings::conversions::is_array_like;
 use script_bindings::num::Finite;
 use script_bindings::settings_stack::run_a_script;
+use servo_base::generic_channel::{self, GenericOneshotSender, GenericSend, GenericSender};
+use servo_base::id::{BrowsingContextId, PipelineId};
 use webdriver::error::ErrorStatus;
 
 use crate::DomTypeHolder;
@@ -80,11 +77,12 @@ use crate::dom::html::htmldatalistelement::HTMLDataListElement;
 use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::html::htmlformelement::FormControl;
 use crate::dom::html::htmliframeelement::HTMLIFrameElement;
-use crate::dom::html::htmlinputelement::{HTMLInputElement, InputType};
 use crate::dom::html::htmloptgroupelement::HTMLOptGroupElement;
 use crate::dom::html::htmloptionelement::HTMLOptionElement;
 use crate::dom::html::htmlselectelement::HTMLSelectElement;
 use crate::dom::html::htmltextareaelement::HTMLTextAreaElement;
+use crate::dom::html::input_element::HTMLInputElement;
+use crate::dom::input_element::input_type::InputType;
 use crate::dom::node::{Node, NodeTraits, ShadowIncluding};
 use crate::dom::nodelist::NodeList;
 use crate::dom::types::ShadowRoot;
@@ -334,13 +332,13 @@ fn object_has_to_json_property(
         rooted!(in(*cx) let mut value = UndefinedValue());
         let result = unsafe { JS_GetProperty(*cx, object, name.as_ptr(), value.handle_mut()) };
         if !result {
-            throw_dom_exception(cx, global_scope, Error::JSFailed, CanGc::note());
+            throw_dom_exception(cx, global_scope, Error::JSFailed, CanGc::deprecated_note());
             false
         } else {
             result && unsafe { JS_TypeOfValue(*cx, value.handle()) } == JSType::JSTYPE_FUNCTION
         }
     } else if unsafe { JS_IsExceptionPending(*cx) } {
-        throw_dom_exception(cx, global_scope, Error::JSFailed, CanGc::note());
+        throw_dom_exception(cx, global_scope, Error::JSFailed, CanGc::deprecated_note());
         false
     } else {
         false
@@ -475,7 +473,7 @@ fn jsval_to_webdriver_inner(
                     seen,
                 )?)
             } else {
-                throw_dom_exception(cx, global_scope, Error::JSFailed, CanGc::note());
+                throw_dom_exception(cx, global_scope, Error::JSFailed, CanGc::deprecated_note());
                 Err(JavaScriptEvaluationError::SerializationError(
                     JavaScriptEvaluationResultSerializationError::OtherJavaScriptError,
                 ))
@@ -526,7 +524,7 @@ fn clone_an_object(
                 },
             },
             Err(error) => {
-                throw_dom_exception(cx, global_scope, error, CanGc::note());
+                throw_dom_exception(cx, global_scope, error, CanGc::deprecated_note());
                 return Err(JavaScriptEvaluationError::SerializationError(
                     JavaScriptEvaluationResultSerializationError::OtherJavaScriptError,
                 ));
@@ -548,7 +546,7 @@ fn clone_an_object(
                     }
                 },
                 Err(error) => {
-                    throw_dom_exception(cx, global_scope, error, CanGc::note());
+                    throw_dom_exception(cx, global_scope, error, CanGc::deprecated_note());
                     return Err(JavaScriptEvaluationError::SerializationError(
                         JavaScriptEvaluationResultSerializationError::OtherJavaScriptError,
                     ));
@@ -725,11 +723,11 @@ pub(crate) fn handle_get_browsing_context_id(
 }
 
 /// <https://w3c.github.io/webdriver/#dfn-center-point>
-fn get_element_in_view_center_point(element: &Element, can_gc: CanGc) -> Option<Point2D<i64>> {
+fn get_element_in_view_center_point(cx: &mut JSContext, element: &Element) -> Option<Point2D<i64>> {
     let doc = element.owner_document();
     // Step 1: Let rectangle be the first element of the DOMRect sequence
     // returned by calling getClientRects() on element.
-    element.GetClientRects(can_gc).first().map(|rectangle| {
+    element.GetClientRects(cx).first().map(|rectangle| {
         let x = rectangle.X();
         let y = rectangle.Y();
         let width = rectangle.Width();
@@ -766,16 +764,16 @@ fn get_element_in_view_center_point(element: &Element, can_gc: CanGc) -> Option<
 }
 
 pub(crate) fn handle_get_element_in_view_center_point(
+    cx: &mut JSContext,
     documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
     reply: GenericOneshotSender<Result<Option<(i64, i64)>, ErrorStatus>>,
-    can_gc: CanGc,
 ) {
     reply
         .send(
             get_known_element(documents, pipeline, element_id).map(|element| {
-                get_element_in_view_center_point(&element, can_gc).map(|point| (point.x, point.y))
+                get_element_in_view_center_point(cx, &element).map(|point| (point.x, point.y))
             }),
         )
         .unwrap();
@@ -835,7 +833,7 @@ pub(crate) fn handle_find_elements_link_text(
         Ok(document) => reply
             .send(all_matching_links(
                 document.upcast::<Node>(),
-                selector.clone(),
+                selector,
                 partial,
             ))
             .unwrap(),
@@ -844,16 +842,16 @@ pub(crate) fn handle_find_elements_link_text(
 }
 
 pub(crate) fn handle_find_elements_tag_name(
+    cx: &mut JSContext,
     documents: &DocumentCollection,
     pipeline: PipelineId,
     selector: String,
     reply: GenericSender<Result<Vec<String>, ErrorStatus>>,
-    can_gc: CanGc,
 ) {
     match retrieve_document_and_check_root_existence(documents, pipeline) {
         Ok(document) => reply
             .send(Ok(document
-                .GetElementsByTagName(DOMString::from(selector), can_gc)
+                .GetElementsByTagName(cx, DOMString::from(selector))
                 .elements_iter()
                 .map(|x| x.upcast::<Node>().unique_id(pipeline))
                 .collect::<Vec<String>>()))
@@ -864,11 +862,11 @@ pub(crate) fn handle_find_elements_tag_name(
 
 /// <https://w3c.github.io/webdriver/#xpath>
 fn find_elements_xpath_strategy(
+    cx: &mut JSContext,
     document: &Document,
     start_node: &Node,
     selector: String,
     pipeline: PipelineId,
-    can_gc: CanGc,
 ) -> Result<Vec<String>, ErrorStatus> {
     // Step 1. Let evaluateResult be the result of calling evaluate,
     // with arguments selector, start node, null, ORDERED_NODE_SNAPSHOT_TYPE, and null.
@@ -880,7 +878,7 @@ fn find_elements_xpath_strategy(
         None,
         XPathResultConstants::ORDERED_NODE_SNAPSHOT_TYPE,
         None,
-        can_gc,
+        CanGc::from_cx(cx),
     ) {
         Ok(res) => res,
         Err(_) => return Err(ErrorStatus::InvalidSelector),
@@ -923,20 +921,20 @@ fn find_elements_xpath_strategy(
 }
 
 pub(crate) fn handle_find_elements_xpath_selector(
+    cx: &mut JSContext,
     documents: &DocumentCollection,
     pipeline: PipelineId,
     selector: String,
     reply: GenericSender<Result<Vec<String>, ErrorStatus>>,
-    can_gc: CanGc,
 ) {
     match retrieve_document_and_check_root_existence(documents, pipeline) {
         Ok(document) => reply
             .send(find_elements_xpath_strategy(
+                cx,
                 &document,
                 document.upcast::<Node>(),
                 selector,
                 pipeline,
-                can_gc,
             ))
             .unwrap(),
         Err(error) => reply.send(Err(error)).unwrap(),
@@ -986,18 +984,18 @@ pub(crate) fn handle_find_element_elements_link_text(
 }
 
 pub(crate) fn handle_find_element_elements_tag_name(
+    cx: &mut JSContext,
     documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
     selector: String,
     reply: GenericSender<Result<Vec<String>, ErrorStatus>>,
-    can_gc: CanGc,
 ) {
     reply
         .send(
             get_known_element(documents, pipeline, element_id).map(|element| {
                 element
-                    .GetElementsByTagName(DOMString::from(selector), can_gc)
+                    .GetElementsByTagName(cx, DOMString::from(selector))
                     .elements_iter()
                     .map(|x| x.upcast::<Node>().unique_id(pipeline))
                     .collect::<Vec<String>>()
@@ -1007,24 +1005,24 @@ pub(crate) fn handle_find_element_elements_tag_name(
 }
 
 pub(crate) fn handle_find_element_elements_xpath_selector(
+    cx: &mut JSContext,
     documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
     selector: String,
     reply: GenericSender<Result<Vec<String>, ErrorStatus>>,
-    can_gc: CanGc,
 ) {
     reply
         .send(
             get_known_element(documents, pipeline, element_id).and_then(|element| {
                 find_elements_xpath_strategy(
+                    cx,
                     &documents
                         .find_document(pipeline)
                         .expect("Document existence guaranteed by `get_known_element`"),
                     element.upcast::<Node>(),
                     selector,
                     pipeline,
-                    can_gc,
                 )
             }),
         )
@@ -1105,24 +1103,24 @@ pub(crate) fn handle_find_shadow_elements_tag_name(
 }
 
 pub(crate) fn handle_find_shadow_elements_xpath_selector(
+    cx: &mut JSContext,
     documents: &DocumentCollection,
     pipeline: PipelineId,
     shadow_root_id: String,
     selector: String,
     reply: GenericSender<Result<Vec<String>, ErrorStatus>>,
-    can_gc: CanGc,
 ) {
     reply
         .send(
             get_known_shadow_root(documents, pipeline, shadow_root_id).and_then(|shadow_root| {
                 find_elements_xpath_strategy(
+                    cx,
                     &documents
                         .find_document(pipeline)
                         .expect("Document existence guaranteed by `get_known_shadow_root`"),
                     shadow_root.upcast::<Node>(),
                     selector,
                     pipeline,
-                    can_gc,
                 )
             }),
         )
@@ -1201,9 +1199,9 @@ fn handle_send_keys_file(
 
 /// We have verify previously that input element is not textual.
 fn handle_send_keys_non_typeable(
+    cx: &mut JSContext,
     input_element: &HTMLInputElement,
     text: &str,
-    can_gc: CanGc,
 ) -> Result<bool, ErrorStatus> {
     // Step 1. If element does not have an own property named value,
     // Return ErrorStatus::ElementNotInteractable.
@@ -1216,7 +1214,7 @@ fn handle_send_keys_non_typeable(
     }
 
     // Step 3. Set a property value to text on element.
-    if let Err(error) = input_element.SetValue(text.into(), can_gc) {
+    if let Err(error) = input_element.SetValue(cx, text.into()) {
         error!(
             "Failed to set value on non-typeable input element: {:?}",
             error
@@ -1226,7 +1224,7 @@ fn handle_send_keys_non_typeable(
 
     // Step 4. If element is suffering from bad input, return ErrorStatus::InvalidArgument.
     if input_element
-        .Validity(can_gc)
+        .Validity(cx)
         .invalid_flags()
         .contains(ValidationFlags::BAD_INPUT)
     {
@@ -1244,13 +1242,13 @@ fn handle_send_keys_non_typeable(
 /// indicating whether the dispatching of the key and
 /// composition event is still needed or not.
 pub(crate) fn handle_will_send_keys(
+    cx: &mut JSContext,
     documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
     text: String,
     strict_file_interactability: bool,
     reply: GenericSender<Result<bool, ErrorStatus>>,
-    can_gc: CanGc,
 ) {
     // Set 5. Let element be the result of trying to get a known element.
     let element = match get_known_element(documents, pipeline, element_id) {
@@ -1266,12 +1264,13 @@ pub(crate) fn handle_will_send_keys(
 
     // Step 6: Let file be true if element is input element
     // in the file upload state, or false otherwise
-    let is_file_input = input_element.is_some_and(|e| e.input_type() == InputType::File);
+    let is_file_input =
+        input_element.is_some_and(|e| matches!(*e.input_type(), InputType::File(_)));
 
     // Step 7. If file is false or the session's strict file interactability
     if !is_file_input || strict_file_interactability {
         // Step 7.1. Scroll into view the element
-        scroll_into_view(&element, documents, &pipeline, can_gc);
+        scroll_into_view(cx, &element, documents, &pipeline);
 
         // TODO: Step 7.2 - 7.5
         // Wait until element become keyboard-interactable
@@ -1292,10 +1291,10 @@ pub(crate) fn handle_will_send_keys(
 
         if !element.is_active_element() {
             html_element.Focus(
+                cx,
                 &FocusOptions {
                     preventScroll: true,
                 },
-                can_gc,
             );
         } else {
             element_has_focus = element.focus_state();
@@ -1311,7 +1310,7 @@ pub(crate) fn handle_will_send_keys(
 
         // Step 8 (Handle non-typeable form control)
         if input_element.is_nontypeable() {
-            let _ = reply.send(handle_send_keys_non_typeable(input_element, &text, can_gc));
+            let _ = reply.send(handle_send_keys_non_typeable(cx, input_element, &text));
             return;
         }
     }
@@ -1360,16 +1359,19 @@ pub(crate) fn handle_get_computed_role(
     reply
         .send(
             get_known_element(documents, pipeline, node_id)
+                // FIXME: Actually compute the role instead of using WAI-ARIA role.
+                // <https://github.com/servo/servo/issues/43734>
+                // The logic can then be shared with devtools accessibility inspector.
                 .map(|element| element.GetRole().map(String::from)),
         )
         .unwrap();
 }
 
 pub(crate) fn handle_get_page_source(
+    cx: &mut JSContext,
     documents: &DocumentCollection,
     pipeline: PipelineId,
     reply: GenericSender<Result<String, ErrorStatus>>,
-    can_gc: CanGc,
 ) {
     reply
         .send(
@@ -1377,10 +1379,10 @@ pub(crate) fn handle_get_page_source(
                 .find_document(pipeline)
                 .ok_or(ErrorStatus::UnknownError)
                 .and_then(|document| match document.GetDocumentElement() {
-                    Some(element) => match element.outer_html(can_gc) {
+                    Some(element) => match element.outer_html(cx) {
                         Ok(source) => Ok(source.to_string()),
                         Err(_) => {
-                            match XMLSerializer::new(document.window(), None, can_gc)
+                            match XMLSerializer::new(document.window(), None, CanGc::from_cx(cx))
                                 .SerializeToString(element.upcast::<Node>())
                             {
                                 Ok(source) => Ok(source.to_string()),
@@ -1405,12 +1407,12 @@ pub(crate) fn handle_get_cookies(
             match documents.find_document(pipeline) {
                 Some(document) => {
                     let url = document.url();
-                    let (sender, receiver) = ipc::channel().unwrap();
+                    let (sender, receiver) = generic_channel::channel().unwrap();
                     let _ = document
                         .window()
                         .as_global_scope()
                         .resource_threads()
-                        .send(GetCookiesDataForUrl(url, sender, NonHTTP));
+                        .send(GetCookiesForUrl(url, sender, NonHTTP));
                     Ok(receiver.recv().unwrap())
                 },
                 None => Ok(Vec::new()),
@@ -1432,12 +1434,12 @@ pub(crate) fn handle_get_cookie(
             match documents.find_document(pipeline) {
                 Some(document) => {
                     let url = document.url();
-                    let (sender, receiver) = ipc::channel().unwrap();
+                    let (sender, receiver) = generic_channel::channel().unwrap();
                     let _ = document
                         .window()
                         .as_global_scope()
                         .resource_threads()
-                        .send(GetCookiesDataForUrl(url, sender, NonHTTP));
+                        .send(GetCookiesForUrl(url, sender, NonHTTP));
                     let cookies = receiver.recv().unwrap();
                     Ok(cookies
                         .into_iter()
@@ -1461,7 +1463,7 @@ pub(crate) fn handle_add_cookie(
     let document = match documents.find_document(pipeline) {
         Some(document) => document,
         None => {
-            return reply.send(Err(ErrorStatus::UnableToSetCookie)).unwrap();
+            return reply.send(Err(ErrorStatus::NoSuchWindow)).unwrap();
         },
     };
     let url = document.url();
@@ -1472,26 +1474,31 @@ pub(crate) fn handle_add_cookie(
     };
 
     let domain = cookie.domain().map(ToOwned::to_owned);
+    // Step 6.
     reply
         .send(match (document.is_cookie_averse(), domain) {
+            // If session's current browsing context's document element is a
+            // cookie-averse Document object, return error with error code invalid cookie domain.
             (true, _) => Err(ErrorStatus::InvalidCookieDomain),
             (false, Some(ref domain)) if url.host_str().is_some_and(|host| host == domain) => {
                 let _ = document
                     .window()
                     .as_global_scope()
                     .resource_threads()
-                    .send(SetCookieForUrl(url, Serde(cookie), method));
+                    .send(SetCookieForUrl(url, Serde(cookie), method, None));
                 Ok(())
             },
+            // If cookie domain is not equal to session's current browsing context's
+            // active document's domain, return error with error code invalid cookie domain.
+            (false, Some(_)) => Err(ErrorStatus::InvalidCookieDomain),
             (false, None) => {
                 let _ = document
                     .window()
                     .as_global_scope()
                     .resource_threads()
-                    .send(SetCookieForUrl(url, Serde(cookie), method));
+                    .send(SetCookieForUrl(url, Serde(cookie), method, None));
                 Ok(())
             },
-            (_, _) => Err(ErrorStatus::UnableToSetCookie),
         })
         .unwrap();
 }
@@ -1585,11 +1592,11 @@ fn calculate_absolute_position(
 
 /// <https://w3c.github.io/webdriver/#get-element-rect>
 pub(crate) fn handle_get_rect(
+    cx: &mut JSContext,
     documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
     reply: GenericSender<Result<Rect<f64>, ErrorStatus>>,
-    can_gc: CanGc,
 ) {
     reply
         .send(
@@ -1597,7 +1604,7 @@ pub(crate) fn handle_get_rect(
                 // Step 4-5
                 // We pass the rect instead of element so we don't have to
                 // call `GetBoundingClientRect` twice.
-                let rect = element.GetBoundingClientRect(can_gc);
+                let rect = element.GetBoundingClientRect(cx);
                 let (x, y) = calculate_absolute_position(documents, &pipeline, &rect)?;
 
                 // Step 6-7
@@ -1611,18 +1618,18 @@ pub(crate) fn handle_get_rect(
 }
 
 pub(crate) fn handle_scroll_and_get_bounding_client_rect(
+    cx: &mut JSContext,
     documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
     reply: GenericSender<Result<Rect<f32>, ErrorStatus>>,
-    can_gc: CanGc,
 ) {
     reply
         .send(
             get_known_element(documents, pipeline, element_id).map(|element| {
-                scroll_into_view(&element, documents, &pipeline, can_gc);
+                scroll_into_view(cx, &element, documents, &pipeline);
 
-                let rect = element.GetBoundingClientRect(can_gc);
+                let rect = element.GetBoundingClientRect(cx);
                 Rect::new(
                     Point2D::new(rect.X() as f32, rect.Y() as f32),
                     Size2D::new(rect.Width() as f32, rect.Height() as f32),
@@ -1767,7 +1774,6 @@ pub(crate) fn handle_get_url(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     reply: GenericSender<String>,
-    _can_gc: CanGc,
 ) {
     reply
         .send(
@@ -1785,22 +1791,22 @@ fn element_is_mutable_form_control(element: &Element) -> bool {
     if let Some(input_element) = element.downcast::<HTMLInputElement>() {
         input_element.is_mutable() &&
             matches!(
-                input_element.input_type(),
-                InputType::Text |
-                    InputType::Search |
-                    InputType::Url |
-                    InputType::Tel |
-                    InputType::Email |
-                    InputType::Password |
-                    InputType::Date |
-                    InputType::Month |
-                    InputType::Week |
-                    InputType::Time |
-                    InputType::DatetimeLocal |
-                    InputType::Number |
-                    InputType::Range |
-                    InputType::Color |
-                    InputType::File
+                *input_element.input_type(),
+                InputType::Text(_) |
+                    InputType::Search(_) |
+                    InputType::Url(_) |
+                    InputType::Tel(_) |
+                    InputType::Email(_) |
+                    InputType::Password(_) |
+                    InputType::Date(_) |
+                    InputType::Month(_) |
+                    InputType::Week(_) |
+                    InputType::Time(_) |
+                    InputType::DatetimeLocal(_) |
+                    InputType::Number(_) |
+                    InputType::Range(_) |
+                    InputType::Color(_) |
+                    InputType::File(_)
             )
     } else if let Some(textarea_element) = element.downcast::<HTMLTextAreaElement>() {
         textarea_element.is_mutable()
@@ -1810,7 +1816,7 @@ fn element_is_mutable_form_control(element: &Element) -> bool {
 }
 
 /// <https://w3c.github.io/webdriver/#dfn-clear-a-resettable-element>
-fn clear_a_resettable_element(element: &Element, can_gc: CanGc) -> Result<(), ErrorStatus> {
+fn clear_a_resettable_element(cx: &mut JSContext, element: &Element) -> Result<(), ErrorStatus> {
     let html_element = element
         .downcast::<HTMLElement>()
         .ok_or(ErrorStatus::UnknownError)?;
@@ -1831,15 +1837,15 @@ fn clear_a_resettable_element(element: &Element, can_gc: CanGc) -> Result<(), Er
 
     // Step 3. Invoke the focusing steps for the element.
     html_element.Focus(
+        cx,
         &FocusOptions {
             preventScroll: true,
         },
-        can_gc,
     );
 
     // Step 4. Run clear algorithm for element.
     if let Some(input_element) = element.downcast::<HTMLInputElement>() {
-        input_element.clear(can_gc);
+        input_element.clear(cx);
     } else if let Some(textarea_element) = element.downcast::<HTMLTextAreaElement>() {
         textarea_element.clear();
     } else {
@@ -1847,22 +1853,22 @@ fn clear_a_resettable_element(element: &Element, can_gc: CanGc) -> Result<(), Er
     }
 
     let event_target = element.upcast::<EventTarget>();
-    event_target.fire_bubbling_event(atom!("input"), can_gc);
-    event_target.fire_bubbling_event(atom!("change"), can_gc);
+    event_target.fire_bubbling_event(cx, atom!("input"));
+    event_target.fire_bubbling_event(cx, atom!("change"));
 
     // Step 5. Run the unfocusing steps for the element.
-    html_element.Blur(can_gc);
+    html_element.Blur(cx);
 
     Ok(())
 }
 
 /// <https://w3c.github.io/webdriver/#element-clear>
 pub(crate) fn handle_element_clear(
+    cx: &mut JSContext,
     documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
     reply: GenericSender<Result<(), ErrorStatus>>,
-    can_gc: CanGc,
 ) {
     reply
         .send(
@@ -1875,7 +1881,7 @@ pub(crate) fn handle_element_clear(
                 }
 
                 // Step 5. Scroll Into View
-                scroll_into_view(&element, documents, &pipeline, can_gc);
+                scroll_into_view(cx, &element, documents, &pipeline);
 
                 // TODO: Step 6 - 9: Implicit wait. In another PR.
                 // Wait until element become interactable and check.
@@ -1887,11 +1893,11 @@ pub(crate) fn handle_element_clear(
                 }
 
                 let paint_tree = get_element_pointer_interactable_paint_tree(
+                    cx,
                     &element,
                     &documents
                         .find_document(pipeline)
                         .expect("Document existence guaranteed by `get_known_element`"),
-                    can_gc,
                 );
                 if !is_element_in_view(&element, &paint_tree) {
                     return Err(ErrorStatus::ElementNotInteractable);
@@ -1899,7 +1905,7 @@ pub(crate) fn handle_element_clear(
 
                 // Step 11
                 // TODO: Clear content editable elements
-                clear_a_resettable_element(&element, can_gc)
+                clear_a_resettable_element(cx, &element)
             }),
         )
         .unwrap();
@@ -1940,11 +1946,11 @@ fn get_container(element: &Element) -> Option<DomRoot<Element>> {
 
 // https://w3c.github.io/webdriver/#element-click
 pub(crate) fn handle_element_click(
+    cx: &mut JSContext,
     documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
     reply: GenericSender<Result<Option<String>, ErrorStatus>>,
-    can_gc: CanGc,
 ) {
     reply
         .send(
@@ -1953,7 +1959,7 @@ pub(crate) fn handle_element_click(
                 // Step 4. If the element is an input element in the file upload state
                 // return error with error code invalid argument.
                 if let Some(input_element) = element.downcast::<HTMLInputElement>() {
-                    if input_element.input_type() == InputType::File {
+                    if matches!(*input_element.input_type(), InputType::File(_)) {
                         return Err(ErrorStatus::InvalidArgument);
                     }
                 }
@@ -1963,16 +1969,16 @@ pub(crate) fn handle_element_click(
                 };
 
                 // Step 5. Scroll into view the element's container.
-                scroll_into_view(&container, documents, &pipeline, can_gc);
+                scroll_into_view(cx, &container, documents, &pipeline);
 
                 // Step 6. If element's container is still not in view
                 // return error with error code element not interactable.
                 let paint_tree = get_element_pointer_interactable_paint_tree(
+                    cx,
                     &container,
                     &documents
                         .find_document(pipeline)
                         .expect("Document existence guaranteed by `get_known_element`"),
-                    can_gc,
                 );
 
                 if !is_element_in_view(&container, &paint_tree) {
@@ -1997,18 +2003,18 @@ pub(crate) fn handle_element_click(
                     Some(option_element) => {
                         // Steps 8.2 - 8.4
                         let event_target = container.upcast::<EventTarget>();
-                        event_target.fire_event(atom!("mouseover"), can_gc);
-                        event_target.fire_event(atom!("mousemove"), can_gc);
-                        event_target.fire_event(atom!("mousedown"), can_gc);
+                        event_target.fire_event(cx, atom!("mouseover"));
+                        event_target.fire_event(cx, atom!("mousemove"));
+                        event_target.fire_event(cx, atom!("mousedown"));
 
                         // Step 8.5
                         match container.downcast::<HTMLElement>() {
                             Some(html_element) => {
                                 html_element.Focus(
+                                    cx,
                                     &FocusOptions {
                                         preventScroll: true,
                                     },
-                                    can_gc,
                                 );
                             },
                             None => return Err(ErrorStatus::UnknownError),
@@ -2017,7 +2023,7 @@ pub(crate) fn handle_element_click(
                         // Step 8.6
                         if !is_disabled(&element) {
                             // Step 8.6.1
-                            event_target.fire_event(atom!("input"), can_gc);
+                            event_target.fire_event(cx, atom!("input"));
 
                             // Steps 8.6.2
                             let previous_selectedness = option_element.Selected();
@@ -2026,22 +2032,21 @@ pub(crate) fn handle_element_click(
                             match container.downcast::<HTMLSelectElement>() {
                                 Some(select_element) => {
                                     if select_element.Multiple() {
-                                        option_element
-                                            .SetSelected(!option_element.Selected(), can_gc);
+                                        option_element.SetSelected(cx, !option_element.Selected());
                                     }
                                 },
-                                None => option_element.SetSelected(true, can_gc),
+                                None => option_element.SetSelected(cx, true),
                             }
 
                             // Step 8.6.4
                             if !previous_selectedness {
-                                event_target.fire_event(atom!("change"), can_gc);
+                                event_target.fire_event(cx, atom!("change"));
                             }
                         }
 
                         // Steps 8.7 - 8.8
-                        event_target.fire_event(atom!("mouseup"), can_gc);
-                        event_target.fire_event(atom!("click"), can_gc);
+                        event_target.fire_event(cx, atom!("mouseup"));
+                        event_target.fire_event(cx, atom!("click"));
 
                         Ok(None)
                     },
@@ -2070,9 +2075,9 @@ fn is_element_in_view(element: &Element, paint_tree: &[DomRoot<Element>]) -> boo
 
 /// <https://w3c.github.io/webdriver/#dfn-pointer-interactable-paint-tree>
 fn get_element_pointer_interactable_paint_tree(
+    cx: &mut JSContext,
     element: &Element,
     document: &Document,
-    can_gc: CanGc,
 ) -> Vec<DomRoot<Element>> {
     // Step 1. If element is not in the same tree as session's
     // current browsing context's active document, return an empty sequence.
@@ -2085,7 +2090,7 @@ fn get_element_pointer_interactable_paint_tree(
     // The original step 4 "compute in-view center point" takes an element as argument
     // which internally computes first DOMRect of getClientRects
 
-    get_element_in_view_center_point(element, can_gc).map_or(Vec::new(), |center_point| {
+    get_element_in_view_center_point(cx, element).map_or(Vec::new(), |center_point| {
         document.ElementsFromPoint(
             Finite::wrap(center_point.x as f64),
             Finite::wrap(center_point.y as f64),
@@ -2168,18 +2173,18 @@ pub(crate) fn handle_remove_load_status_sender(
 
 /// <https://w3c.github.io/webdriver/#dfn-scrolls-into-view>
 fn scroll_into_view(
+    cx: &mut JSContext,
     element: &Element,
     documents: &DocumentCollection,
     pipeline: &PipelineId,
-    can_gc: CanGc,
 ) {
     // Check if element is already in view
     let paint_tree = get_element_pointer_interactable_paint_tree(
+        cx,
         element,
         &documents
             .find_document(*pipeline)
             .expect("Document existence guaranteed by `get_known_element`"),
-        can_gc,
     );
     if is_element_in_view(element, &paint_tree) {
         return;

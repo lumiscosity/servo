@@ -3,16 +3,18 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use atomic_refcell::AtomicRefCell;
-use devtools_traits::{EnvironmentInfo, FrameInfo};
+use devtools_traits::{DevtoolScriptControlMsg, FrameInfo};
 use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{Map, Value};
+use servo_base::generic_channel::channel;
 
 use crate::StreamId;
 use crate::actor::{Actor, ActorEncode, ActorError, ActorRegistry};
 use crate::actors::environment::{EnvironmentActor, EnvironmentActorMsg};
 use crate::actors::object::{ObjectActor, ObjectActorMsg};
-use crate::protocol::ClientRequest;
+use crate::actors::source::SourceActor;
+use crate::protocol::{ClientRequest, JsonPacketStream};
 
 #[derive(Serialize)]
 struct FrameEnvironmentReply {
@@ -58,7 +60,7 @@ pub(crate) struct FrameActorMsg {
 pub(crate) struct FrameActor {
     name: String,
     object_actor: String,
-    source_actor: String,
+    source_name: String,
     frame_result: FrameInfo,
     current_offset: AtomicRefCell<(u32, u32)>,
 }
@@ -71,7 +73,7 @@ impl Actor for FrameActor {
     // https://searchfox.org/firefox-main/source/devtools/shared/specs/frame.js
     fn handle_message(
         &self,
-        request: ClientRequest,
+        mut request: ClientRequest,
         registry: &ActorRegistry,
         msg_type: &str,
         _msg: &Map<String, Value>,
@@ -79,23 +81,24 @@ impl Actor for FrameActor {
     ) -> Result<(), ActorError> {
         match msg_type {
             "getEnvironment" => {
-                // TODO: Register from debugger.js instead
-                let environment = EnvironmentActor::register(
-                    registry,
-                    EnvironmentInfo {
-                        type_: Some("function".into()),
-                        scope_kind: Some("function".into()),
-                        ..Default::default()
-                    },
-                    None,
-                );
+                let Some((tx, rx)) = channel() else {
+                    return Err(ActorError::Internal);
+                };
+                let source_actor = registry.find::<SourceActor>(&self.source_name);
+                source_actor
+                    .script_sender
+                    .send(DevtoolScriptControlMsg::GetEnvironment(self.name(), tx))
+                    .map_err(|_| ActorError::Internal)?;
+                let environment_name = rx.recv().map_err(|_| ActorError::Internal)?;
+
                 let msg = FrameEnvironmentReply {
                     from: self.name(),
-                    environment: registry.encode::<EnvironmentActor, _>(&environment),
+                    environment: registry.encode::<EnvironmentActor, _>(&environment_name),
                 };
                 // This reply has a `type` field but it doesn't need a followup,
                 // unlike most messages. We need to skip the validity check.
-                request.reply_unchecked(&msg)?;
+                request.write_json_packet(&msg)?;
+                request.mark_handled();
             },
             _ => return Err(ActorError::UnrecognizedPacketType),
         };
@@ -106,16 +109,16 @@ impl Actor for FrameActor {
 impl FrameActor {
     pub fn register(
         registry: &ActorRegistry,
-        source_actor: String,
+        source_name: String,
         frame_result: FrameInfo,
     ) -> String {
-        let object_actor = ObjectActor::register(registry, None, "Object".to_owned());
+        let object_name = ObjectActor::register(registry, None, "Object".to_owned(), None);
 
         let name = registry.new_name::<Self>();
         let actor = Self {
             name: name.clone(),
-            object_actor,
-            source_actor,
+            object_actor: object_name,
+            source_name,
             frame_result,
             current_offset: Default::default(),
         };
@@ -150,7 +153,7 @@ impl ActorEncode<FrameActorMsg> for FrameActor {
             oldest: self.frame_result.oldest,
             state,
             where_: FrameWhere {
-                actor: self.source_actor.clone(),
+                actor: self.source_name.clone(),
                 line,
                 column,
             },

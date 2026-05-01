@@ -6,8 +6,6 @@ use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use base::generic_channel;
-use base::id::BrowsingContextId;
 use embedder_traits::{
     InputEvent, KeyboardEvent, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, TouchEvent,
     TouchEventType, TouchId, WebDriverCommandMsg, WebDriverScriptCommand, WebViewPoint, WheelDelta,
@@ -17,6 +15,8 @@ use euclid::Point2D;
 use keyboard_types::webdriver::KeyInputState;
 use log::info;
 use rustc_hash::FxHashSet;
+use servo_base::generic_channel;
+use servo_base::id::BrowsingContextId;
 use webdriver::actions::{
     ActionSequence, ActionsType, GeneralAction, KeyAction, KeyActionItem, KeyDownAction,
     KeyUpAction, NullActionItem, PointerAction, PointerActionItem, PointerDownAction,
@@ -25,7 +25,10 @@ use webdriver::actions::{
 };
 use webdriver::error::{ErrorStatus, WebDriverError};
 
-use crate::{Handler, VerifyBrowsingContextIsOpen, WebElement, wait_for_oneshot_response};
+use crate::{
+    Handler, MAXIMUM_SAFE_INTEGER, VerifyBrowsingContextIsOpen, WebElement,
+    wait_for_oneshot_response,
+};
 
 /// Interval between wheelScroll and pointerMove increments in ms, based on common vsync
 static MOVESCROLL_INTERVAL: u64 = 16;
@@ -33,10 +36,6 @@ static MOVESCROLL_INTERVAL: u64 = 16;
 /// <https://w3c.github.io/webdriver/#dfn-element-click>
 /// This is hard-coded as 0 in spec.
 pub(crate) static ELEMENT_CLICK_BUTTON: u64 = 0;
-
-/// <https://262.ecma-international.org/6.0/#sec-number.max_safe_integer>
-/// 2^53 - 1
-static MAXIMUM_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 // A single action, corresponding to an `action object` in the spec.
 // In the spec, `action item` refers to a plain JSON object.
@@ -660,8 +659,7 @@ impl Handler {
         } = self.get_pointer_input_state(input_id);
 
         // Step 7. If x != current x or y != current y, run the following steps:
-        // FIXME: Actually "last" should not be checked here based on spec.
-        if x != *current_x || y != *current_y || last {
+        if x != *current_x || y != *current_y {
             // Step 7.1. Let buttons be equal to input state's pressed property.
             // Step 7.2. Perform implementation-specific action dispatch steps
             let point = WebViewPoint::Page(Point2D::new(x as f32, y as f32));
@@ -671,11 +669,7 @@ impl Handler {
             match subtype {
                 PointerType::Mouse => {
                     let input_event = InputEvent::MouseMove(MouseMoveEvent::new(point));
-                    if last {
-                        self.send_blocking_input_event_to_embedder(input_event);
-                    } else {
-                        self.send_input_event_to_embedder(input_event);
-                    }
+                    self.send_blocking_input_event_to_embedder(input_event);
                 },
                 // In the case where the pointerType is "pen" or "touch", and buttons is empty,
                 // this may be a no-op.
@@ -686,8 +680,8 @@ impl Handler {
                             TouchId(*pointer_id as i32),
                             point,
                         ));
-                        // We should NOT block here. TouchMove is special, and may never
-                        // be forwarded to constellation and handled.
+                        // FIXME: Should replace with `send_blocking_input_event_to_embedder`
+                        // after we revamp the touch chain.
                         self.send_input_event_to_embedder(input_event);
                     }
                 },
@@ -862,9 +856,7 @@ impl Handler {
         };
 
         // Step 5. If delta x != 0 or delta y != 0, run the following steps:
-        // Actually "last" should not be checked here based on spec.
-        // However, we need to send the webdriver id at the final perform.
-        if delta_x != 0.0 || delta_y != 0.0 || last {
+        if delta_x != 0.0 || delta_y != 0.0 {
             // Step 5.1. Perform implementation-specific action dispatch steps
             let delta = WheelDelta {
                 x: -delta_x,
@@ -874,11 +866,8 @@ impl Handler {
             };
             let point = WebViewPoint::Page(Point2D::new(x as f32, y as f32));
             let input_event = InputEvent::Wheel(WheelEvent::new(delta, point));
-            if last {
-                self.send_blocking_input_event_to_embedder(input_event);
-            } else {
-                self.send_input_event_to_embedder(input_event);
-            }
+
+            self.send_blocking_input_event_to_embedder(input_event);
 
             // Step 5.2. Let current delta x property equal delta x + current delta x
             // and current delta y property equal delta y + current delta y.

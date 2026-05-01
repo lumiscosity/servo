@@ -6,6 +6,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use js::jsapi::Heap;
 use js::jsval::{JSVal, UndefinedValue};
 use js::realm::AutoRealm;
@@ -21,7 +22,7 @@ use crate::dom::stream::defaultteeunderlyingsource::DefaultTeeUnderlyingSource;
 use crate::dom::stream::readablestream::ReadableStream;
 use crate::microtask::{Microtask, MicrotaskRunnable};
 use crate::realms::enter_auto_realm;
-use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
+use crate::script_runtime::CanGc;
 
 #[derive(JSTraceable, MallocSizeOf)]
 #[cfg_attr(crown, expect(crown::unrooted_must_root))]
@@ -32,7 +33,7 @@ pub(crate) struct DefaultTeeReadRequestMicrotask {
 }
 
 impl MicrotaskRunnable for DefaultTeeReadRequestMicrotask {
-    fn handler(&self, cx: &mut js::context::JSContext) {
+    fn handler(&self, cx: &mut JSContext) {
         self.tee_read_request.chunk_steps(cx, &self.chunk);
     }
 
@@ -99,12 +100,11 @@ impl DefaultTeeReadRequest {
     /// <https://streams.spec.whatwg.org/#readable-stream-cancel>
     pub(crate) fn stream_cancel(
         &self,
-        cx: SafeJSContext,
+        cx: &mut JSContext,
         global: &GlobalScope,
         reason: SafeHandleValue,
-        can_gc: CanGc,
     ) {
-        self.stream.cancel(cx, global, reason, can_gc);
+        self.stream.cancel(cx, global, reason);
     }
     /// Enqueue a microtask to perform the chunk steps
     /// <https://streams.spec.whatwg.org/#ref-for-read-request-chunk-steps%E2%91%A2>
@@ -122,7 +122,7 @@ impl DefaultTeeReadRequest {
     }
     /// <https://streams.spec.whatwg.org/#ref-for-read-request-chunk-steps%E2%91%A2>
     #[expect(clippy::borrowed_box)]
-    pub(crate) fn chunk_steps(&self, cx: &mut js::context::JSContext, chunk: &Box<Heap<JSVal>>) {
+    pub(crate) fn chunk_steps(&self, cx: &mut JSContext, chunk: &Box<Heap<JSVal>>) {
         let global = &self.stream.global();
         // Set readAgain to false.
         self.read_again.set(false);
@@ -143,19 +143,19 @@ impl DefaultTeeReadRequest {
             {
                 // Perform ! ReadableStreamDefaultControllerError(branch_1.[[controller]], cloneResult.[[Value]]).
                 self.readable_stream_default_controller_error(
+                    cx,
                     &self.branch_1,
                     clone_result.handle(),
-                    CanGc::from_cx(cx),
                 );
 
                 // Perform ! ReadableStreamDefaultControllerError(branch_2.[[controller]], cloneResult.[[Value]]).
                 self.readable_stream_default_controller_error(
+                    cx,
                     &self.branch_2,
                     clone_result.handle(),
-                    CanGc::from_cx(cx),
                 );
                 // Resolve cancelPromise with ! ReadableStreamCancel(stream, cloneResult.[[Value]]).
-                self.stream_cancel(cx.into(), global, clone_result.handle(), CanGc::from_cx(cx));
+                self.stream_cancel(cx, global, clone_result.handle());
                 // Return.
                 return;
             } else {
@@ -166,41 +166,41 @@ impl DefaultTeeReadRequest {
         // If canceled_1 is false, perform ! ReadableStreamDefaultControllerEnqueue(branch_1.[[controller]], chunk1).
         if !self.canceled_1.get() {
             self.readable_stream_default_controller_enqueue(
+                cx,
                 &self.branch_1,
                 chunk1_value.handle(),
-                CanGc::from_cx(cx),
             );
         }
         // If canceled_2 is false, perform ! ReadableStreamDefaultControllerEnqueue(branch_2.[[controller]], chunk2).
         if !self.canceled_2.get() {
             self.readable_stream_default_controller_enqueue(
+                cx,
                 &self.branch_2,
                 chunk2_value.handle(),
-                CanGc::from_cx(cx),
             );
         }
         // Set reading to false.
         self.reading.set(false);
         // If readAgain is true, perform pullAlgorithm.
         if self.read_again.get() {
-            self.pull_algorithm(CanGc::from_cx(cx));
+            self.pull_algorithm(cx);
         }
     }
     /// <https://streams.spec.whatwg.org/#read-request-close-steps>
-    pub(crate) fn close_steps(&self, can_gc: CanGc) {
+    pub(crate) fn close_steps(&self, cx: &mut JSContext) {
         // Set reading to false.
         self.reading.set(false);
         // If canceled_1 is false, perform ! ReadableStreamDefaultControllerClose(branch_1.[[controller]]).
         if !self.canceled_1.get() {
-            self.readable_stream_default_controller_close(&self.branch_1, can_gc);
+            self.readable_stream_default_controller_close(cx, &self.branch_1);
         }
         // If canceled_2 is false, perform ! ReadableStreamDefaultControllerClose(branch_2.[[controller]]).
         if !self.canceled_2.get() {
-            self.readable_stream_default_controller_close(&self.branch_2, can_gc);
+            self.readable_stream_default_controller_close(cx, &self.branch_2);
         }
         // If canceled_1 is false or canceled_2 is false, resolve cancelPromise with undefined.
         if !self.canceled_1.get() || !self.canceled_2.get() {
-            self.cancel_promise.resolve_native(&(), can_gc);
+            self.cancel_promise.resolve_native(&(), CanGc::from_cx(cx));
         }
     }
     /// <https://streams.spec.whatwg.org/#read-request-error-steps>
@@ -212,34 +212,38 @@ impl DefaultTeeReadRequest {
     /// <https://streams.spec.whatwg.org/#readable-stream-default-controller-enqueue>
     fn readable_stream_default_controller_enqueue(
         &self,
+        cx: &mut JSContext,
         stream: &ReadableStream,
         chunk: SafeHandleValue,
-        can_gc: CanGc,
     ) {
         stream
             .get_default_controller()
-            .enqueue(GlobalScope::get_cx(), chunk, can_gc)
+            .enqueue(cx, chunk)
             .expect("enqueue failed for stream controller in DefaultTeeReadRequest");
     }
 
     /// Call into close of the default controller of a stream,
     /// <https://streams.spec.whatwg.org/#readable-stream-default-controller-close>
-    fn readable_stream_default_controller_close(&self, stream: &ReadableStream, can_gc: CanGc) {
-        stream.get_default_controller().close(can_gc);
+    fn readable_stream_default_controller_close(
+        &self,
+        cx: &mut JSContext,
+        stream: &ReadableStream,
+    ) {
+        stream.get_default_controller().close(cx);
     }
 
     /// Call into error of the default controller of stream,
     /// <https://streams.spec.whatwg.org/#readable-stream-default-controller-error>
     fn readable_stream_default_controller_error(
         &self,
+        cx: &mut JSContext,
         stream: &ReadableStream,
         error: SafeHandleValue,
-        can_gc: CanGc,
     ) {
-        stream.get_default_controller().error(error, can_gc);
+        stream.get_default_controller().error(cx, error);
     }
 
-    pub(crate) fn pull_algorithm(&self, can_gc: CanGc) {
-        self.tee_underlying_source.pull_algorithm(can_gc);
+    pub(crate) fn pull_algorithm(&self, cx: &mut JSContext) {
+        self.tee_underlying_source.pull_algorithm(cx);
     }
 }

@@ -6,19 +6,18 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
-use base::generic_channel::{GenericSend, GenericSender};
-use base::id::CookieStoreId;
 use cookie::{Cookie, SameSite};
 use dom_struct::dom_struct;
 use hyper_serde::Serde;
-use ipc_channel::ipc;
-use ipc_channel::router::ROUTER;
 use itertools::Itertools;
+use js::context::JSContext;
 use js::jsval::NullValue;
 use net_traits::CookieSource::NonHTTP;
 use net_traits::{CookieAsyncResponse, CookieData, CoreResourceMsg};
 use script_bindings::codegen::GenericBindings::CookieStoreBinding::CookieSameSite;
 use script_bindings::script_runtime::CanGc;
+use servo_base::generic_channel::{GenericCallback, GenericSend, GenericSender};
+use servo_base::id::CookieStoreId;
 use servo_url::ServoUrl;
 use time::OffsetDateTime;
 
@@ -90,10 +89,10 @@ impl CookieListener {
                     // (There is currently no way for list to result in failure)
                     if let Some(cookie) = cookie {
                         // Otherwise, resolve p with the first item of list.
-                        promise.resolve_native(&cookie_to_list_item(cookie.into_inner()), CanGc::note());
+                        promise.resolve_native(&cookie_to_list_item(cookie.into_inner()), CanGc::deprecated_note());
                     } else {
                         // If list is empty, then resolve p with null.
-                        promise.resolve_native(&NullValue(), CanGc::note());
+                        promise.resolve_native(&NullValue(), CanGc::deprecated_note());
                     }
                 },
                 CookieData::GetAll(cookies) => {
@@ -103,10 +102,10 @@ impl CookieListener {
                         .into_iter()
                         .map(|cookie| cookie_to_list_item(cookie.0))
                         .collect_vec(),
-                    CanGc::note());
+                    CanGc::deprecated_note());
                 },
                 CookieData::Delete(_) | CookieData::Change(_) | CookieData::Set(_) => {
-                    promise.resolve_native(&(), CanGc::note());
+                    promise.resolve_native(&(), CanGc::deprecated_note());
                 }
             }
         }));
@@ -138,8 +137,6 @@ impl CookieStore {
     }
 
     fn setup_route(&self) {
-        let (cookie_sender, cookie_receiver) = ipc::channel().expect("ipc channel failure");
-
         let context = Trusted::new(self);
         let cs_listener = CookieListener {
             task_source: self
@@ -150,21 +147,19 @@ impl CookieStore {
             context,
         };
 
-        ROUTER.add_typed_route(
-            cookie_receiver,
-            Box::new(move |message| match message {
-                Ok(msg) => cs_listener.handle(msg),
-                Err(err) => warn!("Error receiving a CookieStore message: {:?}", err),
-            }),
-        );
+        let callback = GenericCallback::new(move |message| match message {
+            Ok(msg) => cs_listener.handle(msg),
+            Err(err) => warn!("Error receiving a CookieStore message: {:?}", err),
+        })
+        .expect("Could not create cookie store callback");
 
         let res = self
             .global()
             .resource_threads()
             .send(CoreResourceMsg::NewCookieListener(
                 self.droppable.store_id,
-                cookie_sender,
-                self.global().creation_url().clone(),
+                callback,
+                self.global().creation_url(),
             ));
         if res.is_err() {
             error!("Failed to send cookiestore message to resource threads");
@@ -187,7 +182,7 @@ fn cookie_to_list_item(cookie: Cookie) -> CookieListItem {
 
 impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
     /// <https://cookiestore.spec.whatwg.org/#dom-cookiestore-get>
-    fn Get(&self, name: USVString, can_gc: CanGc) -> Rc<Promise> {
+    fn Get(&self, cx: &mut JSContext, name: USVString) -> Rc<Promise> {
         // 1. Let settings be this’s relevant settings object.
         let global = self.global();
 
@@ -195,11 +190,11 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
         let origin = global.origin();
 
         // 5. Let p be a new promise.
-        let p = Promise::new(&global, can_gc);
+        let p = Promise::new(&global, CanGc::from_cx(cx));
 
         // 3. If origin is an opaque origin, then return a promise rejected with a "SecurityError" DOMException.
         if !origin.is_tuple() {
-            p.reject_error(Error::Security(None), can_gc);
+            p.reject_error(Error::Security(None), CanGc::from_cx(cx));
             return p;
         }
 
@@ -214,7 +209,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
             .resource_threads()
             .send(CoreResourceMsg::GetCookieDataForUrlAsync(
                 self.droppable.store_id,
-                creation_url.clone(),
+                creation_url,
                 Some(name),
             ));
         if res.is_err() {
@@ -228,7 +223,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
     }
 
     /// <https://cookiestore.spec.whatwg.org/#dom-cookiestore-get-options>
-    fn Get_(&self, options: &CookieStoreGetOptions, can_gc: CanGc) -> Rc<Promise> {
+    fn Get_(&self, cx: &mut JSContext, options: &CookieStoreGetOptions) -> Rc<Promise> {
         // 1. Let settings be this’s relevant settings object.
         let global = self.global();
 
@@ -236,11 +231,11 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
         let origin = global.origin();
 
         // 7. Let p be a new promise.
-        let p = Promise::new(&global, can_gc);
+        let p = Promise::new(&global, CanGc::from_cx(cx));
 
         // 3. If origin is an opaque origin, then return a promise rejected with a "SecurityError" DOMException.
         if !origin.is_tuple() {
-            p.reject_error(Error::Security(None), can_gc);
+            p.reject_error(Error::Security(None), CanGc::from_cx(cx));
             return p;
         }
 
@@ -250,7 +245,10 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
         // 5. If options is empty, then return a promise rejected with a TypeError.
         // "is empty" is not strictly defined anywhere in the spec but the only value we require here is "url"
         if options.url.is_none() && options.name.is_none() {
-            p.reject_error(Error::Type(c"Options cannot be empty".to_owned()), can_gc);
+            p.reject_error(
+                Error::Type(c"Options cannot be empty".to_owned()),
+                CanGc::from_cx(cx),
+            );
             return p;
         }
 
@@ -270,7 +268,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
                 {
                     p.reject_error(
                         Error::Type(c"URL does not match context".to_owned()),
-                        can_gc,
+                        CanGc::from_cx(cx),
                     );
                     return p;
                 }
@@ -282,7 +280,10 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
                 .as_ref()
                 .is_ok_and(|parsed| creation_url.origin() != parsed.origin())
             {
-                p.reject_error(Error::Type(c"Not same origin".to_owned()), can_gc);
+                p.reject_error(
+                    Error::Type(c"Not same origin".to_owned()),
+                    CanGc::from_cx(cx),
+                );
                 return p;
             }
 
@@ -298,7 +299,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
             .resource_threads()
             .send(CoreResourceMsg::GetCookieDataForUrlAsync(
                 self.droppable.store_id,
-                final_url.clone(),
+                final_url,
                 options.name.clone().map(|val| CookieStore::normalize(&val)),
             ));
         if res.is_err() {
@@ -311,7 +312,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
     }
 
     /// <https://cookiestore.spec.whatwg.org/#dom-cookiestore-getall>
-    fn GetAll(&self, name: USVString, can_gc: CanGc) -> Rc<Promise> {
+    fn GetAll(&self, cx: &mut JSContext, name: USVString) -> Rc<Promise> {
         // 1. Let settings be this’s relevant settings object.
         let global = self.global();
 
@@ -319,11 +320,11 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
         let origin = global.origin();
 
         // 5. Let p be a new promise.
-        let p = Promise::new(&global, can_gc);
+        let p = Promise::new(&global, CanGc::from_cx(cx));
 
         // 3. If origin is an opaque origin, then return a promise rejected with a "SecurityError" DOMException.
         if !origin.is_tuple() {
-            p.reject_error(Error::Security(None), can_gc);
+            p.reject_error(Error::Security(None), CanGc::from_cx(cx));
             return p;
         }
         // 4. Let url be settings’s creation URL.
@@ -338,7 +339,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
                 .resource_threads()
                 .send(CoreResourceMsg::GetAllCookieDataForUrlAsync(
                     self.droppable.store_id,
-                    creation_url.clone(),
+                    creation_url,
                     Some(name),
                 ));
         if res.is_err() {
@@ -352,7 +353,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
     }
 
     /// <https://cookiestore.spec.whatwg.org/#dom-cookiestore-getall-options>
-    fn GetAll_(&self, options: &CookieStoreGetOptions, can_gc: CanGc) -> Rc<Promise> {
+    fn GetAll_(&self, cx: &mut JSContext, options: &CookieStoreGetOptions) -> Rc<Promise> {
         // 1. Let settings be this’s relevant settings object.
         let global = self.global();
 
@@ -360,11 +361,11 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
         let origin = global.origin();
 
         // 6. Let p be a new promise.
-        let p = Promise::new(&global, can_gc);
+        let p = Promise::new(&global, CanGc::from_cx(cx));
 
         // 3. If origin is an opaque origin, then return a promise rejected with a "SecurityError" DOMException.
         if !origin.is_tuple() {
-            p.reject_error(Error::Security(None), can_gc);
+            p.reject_error(Error::Security(None), CanGc::from_cx(cx));
             return p;
         }
 
@@ -387,7 +388,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
                 {
                     p.reject_error(
                         Error::Type(c"URL does not match context".to_owned()),
-                        can_gc,
+                        CanGc::from_cx(cx),
                     );
                     return p;
                 }
@@ -399,7 +400,10 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
                 .as_ref()
                 .is_ok_and(|parsed| creation_url.origin() != parsed.origin())
             {
-                p.reject_error(Error::Type(c"Not same origin".to_owned()), can_gc);
+                p.reject_error(
+                    Error::Type(c"Not same origin".to_owned()),
+                    CanGc::from_cx(cx),
+                );
                 return p;
             }
 
@@ -415,7 +419,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
                 .resource_threads()
                 .send(CoreResourceMsg::GetAllCookieDataForUrlAsync(
                     self.droppable.store_id,
-                    final_url.clone(),
+                    final_url,
                     options.name.clone().map(|val| CookieStore::normalize(&val)),
                 ));
         if res.is_err() {
@@ -429,7 +433,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
     }
 
     /// <https://cookiestore.spec.whatwg.org/#dom-cookiestore-set>
-    fn Set(&self, name: USVString, value: USVString, can_gc: CanGc) -> Rc<Promise> {
+    fn Set(&self, cx: &mut JSContext, name: USVString, value: USVString) -> Rc<Promise> {
         // 1. Let settings be this’s relevant settings object.
         let global = self.global();
 
@@ -437,11 +441,11 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
         let origin = global.origin();
 
         // 9. Let p be a new promise.
-        let p = Promise::new(&global, can_gc);
+        let p = Promise::new(&global, CanGc::from_cx(cx));
 
         // 3. If origin is an opaque origin, then return a promise rejected with a "SecurityError" DOMException.
         if !origin.is_tuple() {
-            p.reject_error(Error::Security(None), can_gc);
+            p.reject_error(Error::Security(None), CanGc::from_cx(cx));
             return p;
         }
 
@@ -458,7 +462,10 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
         let creation_url = global.creation_url();
         let Some(cookie) = CookieStore::set_a_cookie(&creation_url, &properties) else {
             // If r is failure, then reject p with a TypeError and abort these steps.
-            p.reject_error(Error::Type(c"Invalid cookie".to_owned()), can_gc);
+            p.reject_error(
+                Error::Type(c"Invalid cookie".to_owned()),
+                CanGc::from_cx(cx),
+            );
             return p;
         };
 
@@ -483,7 +490,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
     }
 
     /// <https://cookiestore.spec.whatwg.org/#dom-cookiestore-set-options>
-    fn Set_(&self, options: &CookieInit, can_gc: CanGc) -> Rc<Promise> {
+    fn Set_(&self, cx: &mut JSContext, options: &CookieInit) -> Rc<Promise> {
         // 1. Let settings be this’s relevant settings object.
         let global = self.global();
 
@@ -491,11 +498,11 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
         let origin = global.origin();
 
         // 5. Let p be a new promise.
-        let p = Promise::new(&global, can_gc);
+        let p = Promise::new(&global, CanGc::from_cx(cx));
 
         // 3. If origin is an opaque origin, then return a promise rejected with a "SecurityError" DOMException.
         if !origin.is_tuple() {
-            p.reject_error(Error::Security(None), can_gc);
+            p.reject_error(Error::Security(None), CanGc::from_cx(cx));
             return p;
         }
 
@@ -505,7 +512,10 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
         // 6.1. Let r be the result of running set a cookie with url, options["name"], options["value"],
         // options["expires"], options["domain"], options["path"], options["sameSite"], and options["partitioned"].
         let Some(cookie) = CookieStore::set_a_cookie(&creation_url, options) else {
-            p.reject_error(Error::Type(c"Invalid cookie".to_owned()), can_gc);
+            p.reject_error(
+                Error::Type(c"Invalid cookie".to_owned()),
+                CanGc::from_cx(cx),
+            );
             return p;
         };
 
@@ -530,7 +540,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
     }
 
     /// <https://cookiestore.spec.whatwg.org/#dom-cookiestore-delete>
-    fn Delete(&self, name: USVString, can_gc: CanGc) -> Rc<Promise> {
+    fn Delete(&self, cx: &mut JSContext, name: USVString) -> Rc<Promise> {
         // 1. Let settings be this’s relevant settings object.
         let global = self.global();
 
@@ -538,11 +548,11 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
         let origin = global.origin();
 
         // 5. Let p be a new promise.
-        let p = Promise::new(&global, can_gc);
+        let p = Promise::new(&global, CanGc::from_cx(cx));
 
         // 3. If origin is an opaque origin, then return a promise rejected with a "SecurityError" DOMException.
         if !origin.is_tuple() {
-            p.reject_error(Error::Security(None), can_gc);
+            p.reject_error(Error::Security(None), CanGc::from_cx(cx));
             return p;
         }
 
@@ -552,7 +562,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
             .resource_threads()
             .send(CoreResourceMsg::DeleteCookieAsync(
                 self.droppable.store_id,
-                global.creation_url().clone(),
+                global.creation_url(),
                 name.0,
             ));
         if res.is_err() {
@@ -566,7 +576,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
     }
 
     /// <https://cookiestore.spec.whatwg.org/#dom-cookiestore-delete-options>
-    fn Delete_(&self, options: &CookieStoreDeleteOptions, can_gc: CanGc) -> Rc<Promise> {
+    fn Delete_(&self, cx: &mut JSContext, options: &CookieStoreDeleteOptions) -> Rc<Promise> {
         // 1. Let settings be this’s relevant settings object.
         let global = self.global();
 
@@ -574,11 +584,11 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
         let origin = global.origin();
 
         // 5. Let p be a new promise.
-        let p = Promise::new(&global, can_gc);
+        let p = Promise::new(&global, CanGc::from_cx(cx));
 
         // 3. If origin is an opaque origin, then return a promise rejected with a "SecurityError" DOMException.
         if !origin.is_tuple() {
-            p.reject_error(Error::Security(None), can_gc);
+            p.reject_error(Error::Security(None), CanGc::from_cx(cx));
             return p;
         }
 
@@ -588,7 +598,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
             .resource_threads()
             .send(CoreResourceMsg::DeleteCookieAsync(
                 self.droppable.store_id,
-                global.creation_url().clone(),
+                global.creation_url(),
                 options.name.to_string(),
             ));
         if res.is_err() {

@@ -13,7 +13,7 @@ use servo_url::ServoUrl;
 use style::attr::AttrValue;
 use style::parser::ParserContext;
 use style::stylesheets::Origin;
-use style::values::specified::Length;
+use style::values::specified::LengthPercentage;
 use style_traits::ParsingMode;
 use uuid::Uuid;
 use xml5ever::serialize::TraversalScope;
@@ -26,14 +26,13 @@ use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::{DomRoot, LayoutDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
-use crate::dom::element::{AttributeMutation, Element, LayoutElementHelpers};
+use crate::dom::element::{AttributeMutation, Element};
 use crate::dom::node::{
     ChildrenMutation, CloneChildrenFlag, Node, NodeDamage, NodeTraits, ShadowIncluding,
     UnbindContext,
 };
 use crate::dom::svg::svggraphicselement::SVGGraphicsElement;
 use crate::dom::virtualmethods::VirtualMethods;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct SVGSVGElement {
@@ -61,17 +60,17 @@ impl SVGSVGElement {
 
     #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn new(
+        cx: &mut js::context::JSContext,
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
     ) -> DomRoot<SVGSVGElement> {
         Node::reflect_node_with_proto(
+            cx,
             Box::new(SVGSVGElement::new_inherited(local_name, prefix, document)),
             document,
             proto,
-            can_gc,
         )
     }
 
@@ -86,7 +85,7 @@ impl SVGSVGElement {
             .upcast::<Node>()
             .xml_serialize(TraversalScope::IncludeNode);
 
-        self.cleanup_cloned_nodes(&cloned_nodes, CanGc::from_cx(cx));
+        self.cleanup_cloned_nodes(cx, &cloned_nodes);
 
         let Ok(xml_source) = serialize_result else {
             *self.cached_serialized_data_url.borrow_mut() = Some(Err(()));
@@ -145,19 +144,19 @@ impl SVGSVGElement {
             None,
         );
         let root_node = self.upcast::<Node>();
-        let _ = root_node.AppendChild(&cloned_node, CanGc::from_cx(cx));
+        let _ = root_node.AppendChild(cx, &cloned_node);
 
         Some(cloned_node)
     }
 
-    fn cleanup_cloned_nodes(&self, cloned_nodes: &[DomRoot<Node>], can_gc: CanGc) {
+    fn cleanup_cloned_nodes(&self, cx: &mut JSContext, cloned_nodes: &[DomRoot<Node>]) {
         if cloned_nodes.is_empty() {
             return;
         }
         let root_node = self.upcast::<Node>();
 
         for cloned_node in cloned_nodes {
-            let _ = root_node.RemoveChild(cloned_node, can_gc);
+            let _ = root_node.RemoveChild(cx, cloned_node);
         }
     }
 
@@ -167,13 +166,9 @@ impl SVGSVGElement {
     }
 }
 
-pub(crate) trait LayoutSVGSVGElementHelpers<'dom> {
-    fn data(self) -> SVGElementData<'dom>;
-}
-
-impl<'dom> LayoutSVGSVGElementHelpers<'dom> for LayoutDom<'dom, SVGSVGElement> {
+impl<'dom> LayoutDom<'dom, SVGSVGElement> {
     #[expect(unsafe_code)]
-    fn data(self) -> SVGElementData<'dom> {
+    pub(crate) fn data(self) -> SVGElementData<'dom> {
         let svg_id = self.unsafe_get().uuid.clone();
         let element = self.upcast::<Element>();
         let width = element.get_attr_for_layout(&ns!(), &local_name!("width"));
@@ -199,10 +194,15 @@ impl VirtualMethods for SVGSVGElement {
         Some(self.upcast::<SVGGraphicsElement>() as &dyn VirtualMethods)
     }
 
-    fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation, can_gc: CanGc) {
+    fn attribute_mutated(
+        &self,
+        cx: &mut js::context::JSContext,
+        attr: &Attr,
+        mutation: AttributeMutation,
+    ) {
         self.super_type()
             .unwrap()
-            .attribute_mutated(attr, mutation, can_gc);
+            .attribute_mutated(cx, attr, mutation);
 
         self.invalidate_cached_serialized_subtree();
     }
@@ -235,12 +235,12 @@ impl VirtualMethods for SVGSVGElement {
                     None,
                     None,
                 );
-                let val = Length::parse_quirky(
+                let val = LengthPercentage::parse_quirky(
                     &context,
                     parser,
                     style::values::specified::AllowQuirks::Always,
                 );
-                AttrValue::Length(value.to_string(), val.ok())
+                AttrValue::LengthPercentage(value.to_string(), val.ok())
             },
             _ => self
                 .super_type()
@@ -249,17 +249,17 @@ impl VirtualMethods for SVGSVGElement {
         }
     }
 
-    fn children_changed(&self, mutation: &ChildrenMutation, can_gc: CanGc) {
+    fn children_changed(&self, cx: &mut JSContext, mutation: &ChildrenMutation) {
         if let Some(super_type) = self.super_type() {
-            super_type.children_changed(mutation, can_gc);
+            super_type.children_changed(cx, mutation);
         }
 
         self.invalidate_cached_serialized_subtree();
     }
 
-    fn unbind_from_tree(&self, context: &UnbindContext<'_>, can_gc: CanGc) {
+    fn unbind_from_tree(&self, cx: &mut js::context::JSContext, context: &UnbindContext<'_>) {
         if let Some(s) = self.super_type() {
-            s.unbind_from_tree(context, can_gc);
+            s.unbind_from_tree(cx, context);
         }
         let owner_window = self.owner_window();
         self.owner_window()

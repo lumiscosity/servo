@@ -7,6 +7,7 @@ use std::mem;
 
 use cssparser::{Parser as CssParser, ParserInput as CssParserInput, ToCss};
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use selectors::parser::{ParseRelative, SelectorList};
 use servo_arc::Arc;
 use style::selector_parser::SelectorParser;
@@ -19,7 +20,7 @@ use super::cssstyledeclaration::{CSSModificationAccess, CSSStyleDeclaration, CSS
 use super::cssstylesheet::CSSStyleSheet;
 use crate::dom::bindings::codegen::Bindings::CSSStyleRuleBinding::CSSStyleRuleMethods;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object};
+use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object_with_cx};
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::window::Window;
@@ -47,15 +48,15 @@ impl CSSStyleRule {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         window: &Window,
         parent_stylesheet: &CSSStyleSheet,
         stylerule: Arc<Locked<StyleRule>>,
-        can_gc: CanGc,
     ) -> DomRoot<CSSStyleRule> {
-        reflect_dom_object(
+        reflect_dom_object_with_cx(
             Box::new(CSSStyleRule::new_inherited(parent_stylesheet, stylerule)),
             window,
-            can_gc,
+            cx,
         )
     }
 
@@ -85,6 +86,16 @@ impl CSSStyleRule {
 
         *self.style_rule.borrow_mut() = stylerule;
     }
+
+    pub(crate) fn block_id(&self) -> usize {
+        let guard = self.css_grouping_rule.shared_lock().read();
+        self.style_rule
+            .borrow()
+            .read_with(&guard)
+            .block
+            .raw_ptr()
+            .as_ptr() as usize
+    }
 }
 
 impl SpecificCSSRule for CSSStyleRule {
@@ -104,7 +115,7 @@ impl SpecificCSSRule for CSSStyleRule {
 
 impl CSSStyleRuleMethods<crate::DomTypeHolder> for CSSStyleRule {
     /// <https://drafts.csswg.org/cssom/#dom-cssstylerule-style>
-    fn Style(&self, can_gc: CanGc) -> DomRoot<CSSStyleDeclaration> {
+    fn Style(&self, cx: &mut JSContext) -> DomRoot<CSSStyleDeclaration> {
         self.style_declaration.or_init(|| {
             let guard = self.css_grouping_rule.shared_lock().read();
             CSSStyleDeclaration::new(
@@ -115,7 +126,7 @@ impl CSSStyleRuleMethods<crate::DomTypeHolder> for CSSStyleRule {
                 ),
                 None,
                 CSSModificationAccess::ReadWrite,
-                can_gc,
+                CanGc::from_cx(cx),
             )
         })
     }

@@ -2,10 +2,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use constellation_traits::BlobImpl;
 use dom_struct::dom_struct;
 use html5ever::LocalName;
 use js::rust::HandleObject;
+use servo_constellation_traits::BlobImpl;
 
 use super::bindings::trace::NoTrace;
 use crate::dom::bindings::cell::DomRefCell;
@@ -25,7 +25,7 @@ use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::html::htmlformelement::{
     FormDatum, FormDatumValue, FormSubmitterElement, HTMLFormElement,
 };
-use crate::dom::html::htmlinputelement::HTMLInputElement;
+use crate::dom::html::input_element::HTMLInputElement;
 use crate::script_runtime::CanGc;
 
 #[dom_struct]
@@ -157,7 +157,7 @@ impl FormDataMethods<crate::DomTypeHolder> for FormData {
             value: FormDatumValue::File(DomRoot::from_ref(&*self.create_an_entry(
                 blob,
                 filename,
-                CanGc::note(),
+                CanGc::deprecated_note(),
             ))),
         };
 
@@ -232,7 +232,7 @@ impl FormDataMethods<crate::DomTypeHolder> for FormData {
 
     /// <https://xhr.spec.whatwg.org/#dom-formdata-set>
     fn Set_(&self, name: USVString, blob: &Blob, filename: Option<USVString>) {
-        let file = self.create_an_entry(blob, filename, CanGc::note());
+        let file = self.create_an_entry(blob, filename, CanGc::deprecated_note());
 
         let mut data = self.data.borrow_mut();
         let local_name = LocalName::from(name.0.clone());

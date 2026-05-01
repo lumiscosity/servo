@@ -5,7 +5,6 @@
 use html5ever::LocalName;
 use js::context::JSContext;
 use script_bindings::root::DomRoot;
-use script_bindings::script_runtime::CanGc;
 use style::attr::AttrValue;
 
 use crate::dom::attr::Attr;
@@ -33,7 +32,6 @@ use crate::dom::html::htmlheadelement::HTMLHeadElement;
 use crate::dom::html::htmlhrelement::HTMLHRElement;
 use crate::dom::html::htmliframeelement::HTMLIFrameElement;
 use crate::dom::html::htmlimageelement::HTMLImageElement;
-use crate::dom::html::htmlinputelement::HTMLInputElement;
 use crate::dom::html::htmllabelelement::HTMLLabelElement;
 use crate::dom::html::htmllielement::HTMLLIElement;
 use crate::dom::html::htmllinkelement::HTMLLinkElement;
@@ -60,6 +58,7 @@ use crate::dom::html::htmltemplateelement::HTMLTemplateElement;
 use crate::dom::html::htmltextareaelement::HTMLTextAreaElement;
 use crate::dom::html::htmltitleelement::HTMLTitleElement;
 use crate::dom::html::htmlvideoelement::HTMLVideoElement;
+use crate::dom::html::input_element::HTMLInputElement;
 use crate::dom::htmlbuttonelement::CommandState;
 use crate::dom::htmldialogelement::HTMLDialogElement;
 use crate::dom::node::{
@@ -80,9 +79,14 @@ pub(crate) trait VirtualMethods {
     /// Called when attributes of a node are mutated.
     /// <https://dom.spec.whatwg.org/#attribute-is-set>
     /// <https://dom.spec.whatwg.org/#attribute-is-removed>
-    fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation, can_gc: CanGc) {
+    fn attribute_mutated(
+        &self,
+        cx: &mut js::context::JSContext,
+        attr: &Attr,
+        mutation: AttributeMutation,
+    ) {
         if let Some(s) = self.super_type() {
-            s.attribute_mutated(attr, mutation, can_gc);
+            s.attribute_mutated(cx, attr, mutation);
         }
     }
 
@@ -114,39 +118,39 @@ pub(crate) trait VirtualMethods {
     }
 
     /// <https://dom.spec.whatwg.org/#concept-node-move-ext>
-    fn moving_steps(&self, context: &MoveContext, can_gc: CanGc) {
+    fn moving_steps(&self, cx: &mut JSContext, context: &MoveContext) {
         if let Some(s) = self.super_type() {
-            s.moving_steps(context, can_gc);
+            s.moving_steps(cx, context);
         }
     }
 
     /// Called when a Node is appended to a tree.
-    fn bind_to_tree(&self, context: &BindContext, can_gc: CanGc) {
+    fn bind_to_tree(&self, cx: &mut JSContext, context: &BindContext) {
         if let Some(s) = self.super_type() {
-            s.bind_to_tree(context, can_gc);
+            s.bind_to_tree(cx, context);
         }
     }
 
     /// Called when a Node is removed from a tree.
     /// Implements removing steps:
     /// <https://dom.spec.whatwg.org/#concept-node-remove-ext>
-    fn unbind_from_tree(&self, context: &UnbindContext, can_gc: CanGc) {
+    fn unbind_from_tree(&self, cx: &mut js::context::JSContext, context: &UnbindContext) {
         if let Some(s) = self.super_type() {
-            s.unbind_from_tree(context, can_gc);
+            s.unbind_from_tree(cx, context);
         }
     }
 
     /// Called on the parent when its children are changed.
-    fn children_changed(&self, mutation: &ChildrenMutation, can_gc: CanGc) {
+    fn children_changed(&self, cx: &mut JSContext, mutation: &ChildrenMutation) {
         if let Some(s) = self.super_type() {
-            s.children_changed(mutation, can_gc);
+            s.children_changed(cx, mutation);
         }
     }
 
     /// Called during event dispatch after the bubbling phase completes.
-    fn handle_event(&self, event: &Event, can_gc: CanGc) {
+    fn handle_event(&self, cx: &mut js::context::JSContext, event: &Event) {
         if let Some(s) = self.super_type() {
-            s.handle_event(event, can_gc);
+            s.handle_event(cx, event);
         }
     }
 
@@ -159,18 +163,18 @@ pub(crate) trait VirtualMethods {
     /// <https://html.spec.whatwg.org/multipage/#command-steps>
     fn command_steps(
         &self,
+        cx: &mut js::context::JSContext,
         button: DomRoot<HTMLButtonElement>,
         command: CommandState,
-        can_gc: CanGc,
     ) -> bool {
         self.super_type()
-            .is_some_and(|super_type| super_type.command_steps(button, command, can_gc))
+            .is_some_and(|super_type| super_type.command_steps(cx, button, command))
     }
 
     /// <https://dom.spec.whatwg.org/#concept-node-adopt-ext>
-    fn adopting_steps(&self, old_doc: &Document, can_gc: CanGc) {
+    fn adopting_steps(&self, cx: &mut JSContext, old_doc: &Document) {
         if let Some(s) = self.super_type() {
-            s.adopting_steps(old_doc, can_gc);
+            s.adopting_steps(cx, old_doc);
         }
     }
 

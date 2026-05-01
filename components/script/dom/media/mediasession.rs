@@ -4,13 +4,13 @@
 
 use std::rc::Rc;
 
-use constellation_traits::ScriptToConstellationMessage;
 use dom_struct::dom_struct;
 use embedder_traits::{
     MediaMetadata as EmbedderMediaMetadata, MediaPositionState as EmbedderMediaPositionState,
     MediaSessionActionType, MediaSessionEvent,
 };
 use rustc_hash::FxBuildHasher;
+use servo_constellation_traits::ScriptToConstellationMessage;
 
 use crate::conversions::Convert;
 use crate::dom::bindings::callback::ExceptionHandling;
@@ -80,10 +80,7 @@ impl MediaSession {
         debug!("Handle media session action {:?}", action);
 
         if let Some(handler) = self.action_handlers.borrow().get(&action) {
-            if handler
-                .Call__(ExceptionHandling::Report, CanGc::from_cx(cx))
-                .is_err()
-            {
+            if handler.Call__(cx, ExceptionHandling::Report).is_err() {
                 warn!("Error calling MediaSessionActionHandler callback");
             }
             return;
@@ -203,7 +200,7 @@ impl MediaSessionMethods<crate::DomTypeHolder> for MediaSession {
             Some(handler) => self
                 .action_handlers
                 .borrow_mut()
-                .insert(action.convert(), handler.clone()),
+                .insert(action.convert(), handler),
             None => self.action_handlers.borrow_mut().remove(&action.convert()),
         };
     }

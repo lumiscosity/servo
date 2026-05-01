@@ -8,14 +8,15 @@
 use std::collections::HashMap;
 
 use atomic_refcell::AtomicRefCell;
-use base::generic_channel::{self, GenericSender};
-use base::id::PipelineId;
 use devtools_traits::{
-    AttrModification, DevtoolScriptControlMsg, EventListenerInfo, NodeInfo, ShadowRootMode,
+    AttrModification, DevtoolScriptControlMsg, EventListenerInfo, MatchedRule, NodeInfo,
+    ShadowRootMode,
 };
 use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{self, Map, Value};
+use servo_base::generic_channel::{self, GenericSender};
+use servo_base::id::PipelineId;
 
 use crate::actor::{Actor, ActorError, ActorRegistry};
 use crate::protocol::ClientRequest;
@@ -130,7 +131,7 @@ pub(crate) struct NodeActor {
     pub script_chan: GenericSender<DevtoolScriptControlMsg>,
     pub pipeline: PipelineId,
     pub walker: String,
-    pub style_rules: AtomicRefCell<HashMap<(String, usize), String>>,
+    pub style_rules: AtomicRefCell<HashMap<MatchedRule, String>>,
 }
 
 impl Actor for NodeActor {
@@ -255,10 +256,34 @@ impl Actor for NodeActor {
     }
 }
 
+impl NodeActor {
+    pub fn register(
+        registry: &ActorRegistry,
+        script_id: String,
+        script_chan: GenericSender<DevtoolScriptControlMsg>,
+        pipeline: PipelineId,
+        walker: String,
+    ) -> String {
+        let name = registry.new_name::<Self>();
+
+        registry.register_script_actor(script_id, name.clone());
+
+        let actor = Self {
+            name: name.clone(),
+            script_chan,
+            pipeline,
+            walker,
+            style_rules: AtomicRefCell::new(HashMap::new()),
+        };
+
+        registry.register(actor);
+        name
+    }
+}
 pub trait NodeInfoToProtocol {
     fn encode(
         self,
-        actors: &ActorRegistry,
+        registry: &ActorRegistry,
         script_chan: GenericSender<DevtoolScriptControlMsg>,
         pipeline: PipelineId,
         walker: String,
@@ -268,27 +293,22 @@ pub trait NodeInfoToProtocol {
 impl NodeInfoToProtocol for NodeInfo {
     fn encode(
         self,
-        actors: &ActorRegistry,
+        registry: &ActorRegistry,
         script_chan: GenericSender<DevtoolScriptControlMsg>,
         pipeline: PipelineId,
         walker: String,
     ) -> NodeActorMsg {
         let get_or_register_node_actor = |id: &str| {
-            if !actors.script_actor_registered(id.to_string()) {
-                let name = actors.new_name::<NodeActor>();
-                actors.register_script_actor(id.to_string(), name.clone());
-
-                let node_actor = NodeActor {
-                    name: name.clone(),
-                    script_chan: script_chan.clone(),
+            if !registry.script_actor_registered(id.to_string()) {
+                NodeActor::register(
+                    registry,
+                    id.to_string(),
+                    script_chan.clone(),
                     pipeline,
-                    walker: walker.clone(),
-                    style_rules: AtomicRefCell::new(HashMap::new()),
-                };
-                actors.register(node_actor);
-                name
+                    walker.clone(),
+                )
             } else {
-                actors.script_to_actor(id.to_string())
+                registry.script_to_actor(id.to_string())
             }
         };
 
@@ -298,7 +318,7 @@ impl NodeInfoToProtocol for NodeInfo {
             .as_ref()
             .map(|host_id| get_or_register_node_actor(host_id));
 
-        let name = actors.actor_to_script(actor.clone());
+        let name = registry.actor_to_script(actor.clone());
 
         // If a node only has a single text node as a child whith a small enough text,
         // return it with this node as an `inlineTextChild`.
@@ -319,7 +339,7 @@ impl NodeInfoToProtocol for NodeInfo {
             let mut children = rx.recv().ok()??;
 
             let child = children.pop()?;
-            let msg = child.encode(actors, script_chan.clone(), pipeline, walker);
+            let msg = child.encode(registry, script_chan.clone(), pipeline, walker);
 
             // If the node child is not a text node, do not represent it inline.
             if msg.node_type != TEXT_NODE {
@@ -357,7 +377,7 @@ impl NodeInfoToProtocol for NodeInfo {
             node_type: self.node_type,
             node_value: self.node_value,
             num_children: self.num_children,
-            parent: actors.script_to_actor(self.parent.clone()),
+            parent: registry.script_to_actor(self.parent.clone()),
             shadow_root_mode: self
                 .shadow_root_mode
                 .as_ref()

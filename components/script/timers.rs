@@ -9,13 +9,14 @@ use std::default::Default;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use base::id::PipelineId;
 use deny_public_fields::DenyPublicFields;
+use js::context::JSContext;
 use js::jsapi::Heap;
 use js::jsval::JSVal;
 use js::rust::HandleValue;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use servo_base::id::PipelineId;
 use servo_config::pref;
 use timers::{BoxedTimerCallback, TimerEventRequest};
 
@@ -40,13 +41,13 @@ use crate::dom::trustedtypes::trustedscript::TrustedScript;
 use crate::dom::types::{Window, WorkerGlobalScope};
 use crate::dom::xmlhttprequest::XHRTimeoutCallback;
 use crate::script_module::ScriptFetchOptions;
-use crate::script_runtime::{CanGc, IntroductionType};
+use crate::script_runtime::IntroductionType;
 use crate::script_thread::ScriptThread;
 use crate::task_source::SendableTaskSource;
 
 type TimerKey = i32;
 type RunStepsDeadline = Instant;
-type CompletionStep = Box<dyn FnOnce(&mut js::context::JSContext, &GlobalScope) + 'static>;
+type CompletionStep = Box<dyn FnOnce(&mut JSContext, &GlobalScope) + 'static>;
 
 /// <https://html.spec.whatwg.org/multipage/#run-steps-after-a-timeout>
 /// OrderingIdentifier per spec ("orderingIdentifier")
@@ -143,16 +144,14 @@ pub(crate) enum OneshotTimerCallback {
 }
 
 impl OneshotTimerCallback {
-    fn invoke<T: DomObject>(self, this: &T, js_timers: &JsTimers, cx: &mut js::context::JSContext) {
+    fn invoke<T: DomObject>(self, this: &T, js_timers: &JsTimers, cx: &mut JSContext) {
         match self {
-            OneshotTimerCallback::XhrTimeout(callback) => callback.invoke(CanGc::from_cx(cx)),
+            OneshotTimerCallback::XhrTimeout(callback) => callback.invoke(cx),
             OneshotTimerCallback::EventSourceTimeout(callback) => callback.invoke(),
             OneshotTimerCallback::JsTimer(task) => task.invoke(this, js_timers, cx),
             #[cfg(feature = "testbinding")]
             OneshotTimerCallback::TestBindingCallback(callback) => callback.invoke(),
-            OneshotTimerCallback::RefreshRedirectDue(callback) => {
-                callback.invoke(CanGc::from_cx(cx))
-            },
+            OneshotTimerCallback::RefreshRedirectDue(callback) => callback.invoke(cx),
             OneshotTimerCallback::RunStepsAfterTimeout { completion, .. } => {
                 // <https://html.spec.whatwg.org/multipage/#run-steps-after-a-timeout>
                 // Step 4.4 Perform completionSteps.
@@ -320,12 +319,7 @@ impl OneshotTimers {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#timer-initialisation-steps>
-    pub(crate) fn fire_timer(
-        &self,
-        id: TimerEventId,
-        global: &GlobalScope,
-        cx: &mut js::context::JSContext,
-    ) {
+    pub(crate) fn fire_timer(&self, id: TimerEventId, global: &GlobalScope, cx: &mut JSContext) {
         // Step 9.2. If id does not exist in global's map of setTimeout and setInterval IDs, then abort these steps.
         let expected_id = self.expected_event_id.get();
         if expected_id != id {
@@ -529,22 +523,22 @@ impl OneshotTimers {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn set_timeout_or_interval(
         &self,
+        cx: &mut JSContext,
         global: &GlobalScope,
         callback: TimerCallback,
         arguments: Vec<HandleValue>,
         timeout: Duration,
         is_interval: IsInterval,
         source: TimerSource,
-        can_gc: CanGc,
     ) -> Fallible<i32> {
         self.js_timers.set_timeout_or_interval(
+            cx,
             global,
             callback,
             arguments,
             timeout,
             is_interval,
             source,
-            can_gc,
         )
     }
 
@@ -627,13 +621,13 @@ impl JsTimers {
     #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     pub(crate) fn set_timeout_or_interval(
         &self,
+        cx: &mut JSContext,
         global: &GlobalScope,
         callback: TimerCallback,
         arguments: Vec<HandleValue>,
         timeout: Duration,
         is_interval: IsInterval,
         source: TimerSource,
-        can_gc: CanGc,
     ) -> Fallible<i32> {
         let callback = match callback {
             TimerCallback::StringTimerCallback(trusted_script_or_string) => {
@@ -653,11 +647,11 @@ impl JsTimers {
                 let sink = format!("{} {}", global_name, method_name);
                 // Step 9.6.1.4. Set handler to the result of invoking the
                 // Get Trusted Type compliant string algorithm with TrustedScript, global, handler, sink, and "script".
-                let code_str = TrustedScript::get_trusted_script_compliant_string(
+                let code_str = TrustedScript::get_trusted_type_compliant_string(
+                    cx,
                     global,
                     trusted_script_or_string,
                     &sink,
-                    can_gc,
                 )?;
                 // Step 9.6.3. Perform EnsureCSPDoesNotBlockStringCompilation(realm, « », handler, handler, timer, « », handler).
                 // If this throws an exception, catch it, report it for global, and abort these steps.
@@ -780,12 +774,7 @@ fn clamp_duration(nesting_level: u32, unclamped: Duration) -> Duration {
 
 impl JsTimerTask {
     // see https://html.spec.whatwg.org/multipage/#timer-initialisation-steps
-    pub(crate) fn invoke<T: DomObject>(
-        self,
-        this: &T,
-        timers: &JsTimers,
-        cx: &mut js::context::JSContext,
-    ) {
+    pub(crate) fn invoke<T: DomObject>(self, this: &T, timers: &JsTimers, cx: &mut JSContext) {
         // step 9.2 can be ignored, because we proactively prevent execution
         // of this task when its scheduled execution is canceled.
 
@@ -801,7 +790,7 @@ impl JsTimerTask {
                 // TODO Step 7. Let initiating script be the active script.
 
                 // Step 9.6.5. Let fetch options be the default script fetch options.
-                let fetch_options = ScriptFetchOptions::default_classic_script(&global);
+                let fetch_options = ScriptFetchOptions::default_classic_script();
 
                 // Step 9.6.6. Let base URL be settings object's API base URL.
                 let base_url = global.api_base_url();
@@ -818,6 +807,7 @@ impl JsTimerTask {
                 // Step 9.6.8. Let script be the result of creating a classic script given handler,
                 // settings object, base URL, and fetch options.
                 let script = global.create_a_classic_script(
+                    cx,
                     (*code_str.str()).into(),
                     base_url,
                     fetch_options,
@@ -828,20 +818,14 @@ impl JsTimerTask {
                 );
 
                 // Step 9.6.9. Run the classic script script.
-                _ = global.run_a_classic_script(script, RethrowErrors::No, CanGc::from_cx(cx));
+                _ = global.run_a_classic_script(cx, script, RethrowErrors::No);
             },
             // Step 9.5. If handler is a Function, then invoke handler given arguments and
             // "report", and with callback this value set to thisArg.
             InternalTimerCallback::FunctionTimerCallback(ref function, ref arguments) => {
                 let arguments = self.collect_heap_args(arguments);
                 rooted!(&in(cx) let mut value: JSVal);
-                let _ = function.Call_(
-                    this,
-                    arguments,
-                    value.handle_mut(),
-                    Report,
-                    CanGc::from_cx(cx),
-                );
+                let _ = function.Call_(cx, this, arguments, value.handle_mut(), Report);
             },
         };
 

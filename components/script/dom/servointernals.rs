@@ -4,7 +4,6 @@
 
 use std::rc::Rc;
 
-use constellation_traits::ScriptToConstellationMessage;
 use dom_struct::dom_struct;
 use js::gc::MutableHandleValue;
 use js::jsapi::Heap;
@@ -17,6 +16,7 @@ use script_bindings::interfaces::ServoInternalsHelpers;
 use script_bindings::script_runtime::JSContext;
 use script_bindings::str::USVString;
 use servo_config::prefs::{self, PrefValue, Preferences};
+use servo_constellation_traits::ScriptToConstellationMessage;
 
 use crate::dom::bindings::codegen::Bindings::ServoInternalsBinding::ServoInternalsMethods;
 use crate::dom::bindings::import::base::SafeJSContext;
@@ -120,7 +120,7 @@ impl ServoInternalsMethods<crate::DomTypeHolder> for ServoInternals {
             return Err(Error::NotFound(None));
         }
         let pref = Preferences::default().get_value(&name);
-        pref_to_jsval(&pref, cx, rval, CanGc::note());
+        pref_to_jsval(&pref, cx, rval, CanGc::deprecated_note());
         Ok(())
     }
 
@@ -135,7 +135,7 @@ impl ServoInternalsMethods<crate::DomTypeHolder> for ServoInternals {
             return Err(Error::NotFound(None));
         }
         let pref = prefs::get().get_value(&name);
-        pref_to_jsval(&pref, cx, rval, CanGc::note());
+        pref_to_jsval(&pref, cx, rval, CanGc::deprecated_note());
         Ok(())
     }
 
@@ -195,10 +195,15 @@ impl ServoInternalsMethods<crate::DomTypeHolder> for ServoInternals {
 }
 
 impl RoutedPromiseListener<MemoryReportResult> for ServoInternals {
-    fn handle_response(&self, response: MemoryReportResult, promise: &Rc<Promise>, can_gc: CanGc) {
+    fn handle_response(
+        &self,
+        cx: &mut js::context::JSContext,
+        response: MemoryReportResult,
+        promise: &Rc<Promise>,
+    ) {
         let stringified = serde_json::to_string(&response.results)
             .unwrap_or_else(|_| "{ error: \"failed to create memory report\"}".to_owned());
-        promise.resolve_native(&stringified, can_gc);
+        promise.resolve_native(&stringified, CanGc::from_cx(cx));
     }
 }
 

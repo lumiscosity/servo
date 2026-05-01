@@ -14,6 +14,9 @@ RUN apt-get update \
     &&  /tmp/linux_packages/generate_pkg_list.sh /tmp/linux_packages/apt/* | xargs apt-get install -y --no-install-recommends \
     && curl --version
 
+# Required due to https://github.com/servo/servo/issues/35029
+RUN apt purge -y fonts-droid-fallback
+
 # Please keep `RUST_VERSION` in sync with the `rust-toolchain.toml` file.
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
@@ -34,7 +37,7 @@ FROM base AS rust_builder
 
 # TODO: We would need to use `ARG` and install specific versions, to ensure
 # that the tools are updated and not always cached.
-RUN cargo install cargo-deny cargo-nextest taplo-cli cargo-about --locked
+RUN cargo install cargo-deny cargo-nextest taplo-cli --locked
 
 
 FROM base AS final
@@ -43,6 +46,5 @@ COPY --from=rust_builder \
     /usr/local/cargo/bin/cargo-deny \
     /usr/local/cargo/bin/cargo-nextest \
     /usr/local/cargo/bin/taplo \
-    /usr/local/cargo/bin/cargo-about \
     /usr/local/cargo/bin/
 COPY --from=uv /uv /uvx /bin/

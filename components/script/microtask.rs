@@ -10,9 +10,9 @@ use std::cell::Cell;
 use std::mem;
 use std::rc::Rc;
 
-use base::id::PipelineId;
 use js::jsapi::JobQueueMayNotBeEmpty;
 use js::realm::AutoRealm;
+use servo_base::id::PipelineId;
 
 use crate::dom::bindings::callback::ExceptionHandling;
 use crate::dom::bindings::cell::DomRefCell;
@@ -27,7 +27,7 @@ use crate::dom::stream::byteteereadintorequest::ByteTeeReadIntoRequestMicrotask;
 use crate::dom::stream::byteteereadrequest::ByteTeeReadRequestMicrotask;
 use crate::dom::stream::defaultteereadrequest::DefaultTeeReadRequestMicrotask;
 use crate::realms::enter_auto_realm;
-use crate::script_runtime::{CanGc, JSContext, notify_about_rejected_promises};
+use crate::script_runtime::{JSContext, notify_about_rejected_promises};
 use crate::script_thread::ScriptThread;
 
 /// A collection of microtasks in FIFO order.
@@ -124,22 +124,14 @@ impl MicrotaskQueue {
                             let _guard = ScriptThread::user_interacting_guard();
                             let mut realm = enter_auto_realm(cx, &*target);
                             let cx = &mut realm;
-                            let _ = job.callback.Call_(
-                                &*target,
-                                ExceptionHandling::Report,
-                                CanGc::from_cx(cx),
-                            );
+                            let _ = job.callback.Call_(cx, &*target, ExceptionHandling::Report);
                         }
                     },
                     Microtask::User(ref job) => {
                         if let Some(target) = target_provider(job.pipeline) {
                             let mut realm = enter_auto_realm(cx, &*target);
                             let cx = &mut realm;
-                            let _ = job.callback.Call_(
-                                &*target,
-                                ExceptionHandling::Report,
-                                CanGc::from_cx(cx),
-                            );
+                            let _ = job.callback.Call_(cx, &*target, ExceptionHandling::Report);
                         }
                     },
                     Microtask::MediaElement(ref task) => {
@@ -163,11 +155,10 @@ impl MicrotaskQueue {
                         task.handler(cx);
                     },
                     Microtask::CustomElementReaction => {
-                        ScriptThread::invoke_backup_element_queue(CanGc::from_cx(cx));
+                        ScriptThread::invoke_backup_element_queue(cx);
                     },
                     Microtask::NotifyMutationObservers => {
-                        ScriptThread::mutation_observers()
-                            .notify_mutation_observers(CanGc::from_cx(cx));
+                        ScriptThread::mutation_observers().notify_mutation_observers(cx);
                     },
                     Microtask::ReadableStreamByteTeeReadRequest(ref task) => {
                         task.microtask_chunk_steps(cx)

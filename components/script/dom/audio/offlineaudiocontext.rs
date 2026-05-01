@@ -7,9 +7,9 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::Builder;
 
-use base::id::PipelineId;
 use dom_struct::dom_struct;
 use js::rust::HandleObject;
+use servo_base::id::PipelineId;
 use servo_media::audio::context::OfflineAudioContextOptions as ServoMediaOfflineAudioContextOptions;
 
 use crate::dom::audio::audiobuffer::{AudioBuffer, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE};
@@ -179,7 +179,7 @@ impl OfflineAudioContextMethods<crate::DomTypeHolder> for OfflineAudioContext {
             .name("OfflineACResolver".to_owned())
             .spawn(move || {
                 let _ = receiver.recv();
-                task_source.queue(task!(resolve: move || {
+                task_source.queue(task!(resolve: move |cx| {
                     let this = this.root();
                     let processed_audio = processed_audio.lock().unwrap();
                     let mut processed_audio: Vec<_> = processed_audio
@@ -191,24 +191,25 @@ impl OfflineAudioContextMethods<crate::DomTypeHolder> for OfflineAudioContext {
                         processed_audio.resize(this.length as usize, Vec::new())
                     }
                     let buffer = AudioBuffer::new(
+                        cx,
                         this.global().as_window(),
                         this.channel_count,
                         this.length,
                         *this.context.SampleRate(),
                         Some(processed_audio.as_slice()),
-                        CanGc::note());
+                    );
                     (*this.pending_rendering_promise.borrow_mut())
                         .take()
                         .unwrap()
-                        .resolve_native(&buffer, CanGc::note());
+                        .resolve_native(&buffer, CanGc::from_cx(cx));
                     let global = &this.global();
                     let window = global.as_window();
                     let event = OfflineAudioCompletionEvent::new(window,
                                                                  atom!("complete"),
                                                                  EventBubbles::DoesNotBubble,
                                                                  EventCancelable::NotCancelable,
-                                                                 &buffer, CanGc::note());
-                    event.upcast::<Event>().fire(this.upcast(), CanGc::note());
+                                                                 &buffer, CanGc::from_cx(cx));
+                    event.upcast::<Event>().fire(this.upcast(), CanGc::from_cx(cx));
                 }));
             })
             .unwrap();

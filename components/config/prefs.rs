@@ -2,8 +2,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+//! Preferences are the global configuration options that can be changed at runtime.
+
 use std::env::consts::ARCH;
 use std::sync::{RwLock, RwLockReadGuard};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use servo_config_macro::ServoPreferences;
@@ -12,7 +15,12 @@ pub use crate::pref_util::PrefValue;
 
 static PREFERENCES: RwLock<Preferences> = RwLock::new(Preferences::const_default());
 
+/// A trait to be implemented by components that wish to be notified about runtime changes to the
+/// global preferences for the current process.
 pub trait PreferencesObserver: Send + Sync {
+    /// This method is called when the global preferences have been updated. The argument to the
+    /// method is an array of tuples where the first component is the name of the preference and
+    /// the second component is the new value of the preference.
     fn prefs_changed(&self, _changes: &[(&'static str, PrefValue)]) {}
 }
 
@@ -24,10 +32,13 @@ pub fn get() -> RwLockReadGuard<'static, Preferences> {
     PREFERENCES.read().unwrap()
 }
 
+/// Subscribe to notifications about changes to the global preferences for the current process.
 pub fn add_observer(observer: Box<dyn PreferencesObserver>) {
     OBSERVERS.write().unwrap().push(observer);
 }
 
+/// Update the values of the global preferences for the current process. This also notifies the
+/// observers previously added using [`add_observer`].
 pub fn set(preferences: Preferences) {
     // Map between Stylo preference names and Servo preference names as the This should be
     // kept in sync with components/script/dom/bindings/codegen/run.py which generates the
@@ -71,6 +82,16 @@ macro_rules! pref {
     };
 }
 
+/// The set of global preferences supported by Servo.
+///
+/// Each preference has a default value that determines its initial state. These defaults
+/// fall into roughly three categories:
+/// - **Stable**: enabled by default.
+/// - **Experimental**: disabled by default, but intended to be enabled for experimental use.
+/// - **Unstable**: disabled by default.
+///
+/// For a full overview of which preferences are experimental, see the
+/// [experimental features documentation](https://book.servo.org/design-documentation/experimental-features.html).
 #[derive(Clone, Deserialize, Serialize, ServoPreferences)]
 pub struct Preferences {
     pub fonts_default: String,
@@ -79,6 +100,9 @@ pub struct Preferences {
     pub fonts_monospace: String,
     pub fonts_default_size: i64,
     pub fonts_default_monospace_size: i64,
+    /// The amount of time that a half cycle of a text caret blink takes in milliseconds.
+    /// If this value is less than or equal to zero, then caret blink is disabled.
+    pub editing_caret_blink_time: i64,
     pub css_animations_testing_enabled: bool,
     /// Start the devtools server at startup
     pub devtools_server_enabled: bool,
@@ -92,6 +116,7 @@ pub struct Preferences {
     pub dom_abort_controller_enabled: bool,
     // feature: Adopted Stylesheet | #38132 | Web/API/Document/adoptedStyleSheets
     pub dom_adoptedstylesheet_enabled: bool,
+    pub dom_allow_preloading_module_descendants: bool,
     // feature: Clipboard API | #36084 | Web/API/Clipboard_API
     pub dom_async_clipboard_enabled: bool,
     pub dom_bluetooth_enabled: bool,
@@ -108,7 +133,6 @@ pub struct Preferences {
     /// - vello_cpu
     pub dom_canvas_backend: String,
     pub dom_clipboardevent_enabled: bool,
-    pub dom_command_invokers_enabled: bool,
     pub dom_composition_event_enabled: bool,
     // feature: CookieStore | #37674 | Web/API/CookieStore
     pub dom_cookiestore_enabled: bool,
@@ -127,6 +151,8 @@ pub struct Preferences {
     pub dom_gamepad_enabled: bool,
     // feature: Geolocation API | #38903 | Web/API/Geolocation_API
     pub dom_geolocation_enabled: bool,
+    // feature: Screen Wake Lock API | #43615 | Web/API/Screen_Wake_Lock_API
+    pub dom_wakelock_enabled: bool,
     // feature: IndexedDB | #6963 | Web/API/IndexedDB_API
     pub dom_indexeddb_enabled: bool,
     // feature: IntersectionObserver | #35767 | Web/API/Intersection_Observer_API
@@ -147,10 +173,16 @@ pub struct Preferences {
     pub dom_permissions_testing_allowed_in_nonsecure_contexts: bool,
     // feature: ResizeObserver | #39790 | Web/API/ResizeObserver
     pub dom_resize_observer_enabled: bool,
+    // feature: Sanitizer API | #43948 | Web/API/HTML_Sanitizer_API
+    pub dom_sanitizer_enabled: bool,
     pub dom_script_asynch: bool,
+    // feature: Storage API | #43976 | Web/API/Storage_API
+    pub dom_storage_manager_api_enabled: bool,
     // feature: ServiceWorker | #36538 | Web/API/Service_Worker_API
     pub dom_serviceworker_enabled: bool,
     pub dom_serviceworker_timeout_seconds: i64,
+    // feature: SharedWorker | #7458 | Web/API/SharedWorker
+    pub dom_sharedworker_enabled: bool,
     pub dom_servo_helpers_enabled: bool,
     pub dom_servoparser_async_html_tokenizer_enabled: bool,
     pub dom_testbinding_enabled: bool,
@@ -324,10 +356,12 @@ impl Preferences {
     const fn const_default() -> Self {
         Self {
             css_animations_testing_enabled: false,
+            editing_caret_blink_time: 600,
             devtools_server_enabled: false,
             devtools_server_listen_address: String::new(),
             dom_abort_controller_enabled: true,
             dom_adoptedstylesheet_enabled: false,
+            dom_allow_preloading_module_descendants: false,
             dom_allow_scripts_to_close_windows: false,
             dom_async_clipboard_enabled: false,
             dom_bluetooth_enabled: false,
@@ -336,7 +370,6 @@ impl Preferences {
             dom_canvas_text_enabled: true,
             dom_canvas_backend: String::new(),
             dom_clipboardevent_enabled: true,
-            dom_command_invokers_enabled: false,
             dom_composition_event_enabled: false,
             dom_cookiestore_enabled: false,
             dom_credential_management_enabled: false,
@@ -348,6 +381,7 @@ impl Preferences {
             dom_fullscreen_test: false,
             dom_gamepad_enabled: true,
             dom_geolocation_enabled: false,
+            dom_wakelock_enabled: false,
             dom_indexeddb_enabled: false,
             dom_intersection_observer_enabled: false,
             dom_microdata_testing_enabled: false,
@@ -360,9 +394,12 @@ impl Preferences {
             dom_permissions_enabled: false,
             dom_permissions_testing_allowed_in_nonsecure_contexts: false,
             dom_resize_observer_enabled: true,
+            dom_sanitizer_enabled: false,
             dom_script_asynch: true,
+            dom_storage_manager_api_enabled: false,
             dom_serviceworker_enabled: false,
             dom_serviceworker_timeout_seconds: 60,
+            dom_sharedworker_enabled: false,
             dom_servo_helpers_enabled: false,
             dom_servoparser_async_html_tokenizer_enabled: false,
             dom_testbinding_enabled: false,
@@ -481,6 +518,16 @@ impl Preferences {
             user_agent: String::new(),
             viewport_meta_enabled: false,
             log_filter: String::new(),
+        }
+    }
+
+    /// The amount of time that a half cycle of a text caret blink takes. If blinking is disabled
+    /// this returns `None`.
+    pub fn editing_caret_blink_time(&self) -> Option<Duration> {
+        if self.editing_caret_blink_time > 0 {
+            Some(Duration::from_millis(self.editing_caret_blink_time as u64))
+        } else {
+            None
         }
     }
 }

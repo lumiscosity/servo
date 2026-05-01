@@ -6,8 +6,6 @@ use std::cell::Cell;
 use std::collections::hash_map::Entry;
 use std::rc::Rc;
 
-use base::id::{PipelineId, WebViewId};
-use constellation_traits::{EmbedderToConstellationMessage, ScrollStateUpdate, WindowSizeType};
 use crossbeam_channel::Sender;
 use embedder_traits::{
     AnimationState, InputEvent, InputEventAndId, InputEventId, InputEventResult, MouseButton,
@@ -23,6 +21,10 @@ use paint_api::viewport_description::{
 };
 use paint_api::{PipelineExitSource, SendableFrameTree, WebViewTrait};
 use rustc_hash::FxHashMap;
+use servo_base::id::{PipelineId, WebViewId};
+use servo_constellation_traits::{
+    EmbedderToConstellationMessage, ScrollStateUpdate, WindowSizeType,
+};
 use servo_geometry::DeviceIndependentPixel;
 use style_traits::CSSPixel;
 use webrender::RenderApi;
@@ -44,8 +46,6 @@ pub(crate) struct ScrollEvent {
     pub scroll: Scroll,
     /// Scroll the scroll node that is found at this point.
     pub point: DevicePoint,
-    /// The number of OS events that have been coalesced together into this one event.
-    pub event_count: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -114,7 +114,7 @@ pub(crate) struct WebViewRenderer {
     animating: bool,
     /// A [`ViewportDescription`] for this [`WebViewRenderer`], which contains the limitations
     /// and initial values for zoom derived from the `viewport` meta tag in web content.
-    viewport_description: Option<ViewportDescription>,
+    viewport_description: ViewportDescription,
 
     //
     // Data that is shared with the parent renderer.
@@ -153,7 +153,7 @@ impl WebViewRenderer {
             hidpi_scale_factor: Scale::new(hidpi_scale_factor.0),
             hidden: false,
             animating: false,
-            viewport_description: None,
+            viewport_description: Default::default(),
             embedder_to_constellation_sender,
             refresh_driver,
             webrender_document,
@@ -270,6 +270,11 @@ impl WebViewRenderer {
         let pipeline_details = self.ensure_pipeline_details(pipeline_id);
         pipeline_details.pipeline = Some(frame_tree.pipeline.clone());
         pipeline_details.parent_pipeline_id = parent_pipeline_id;
+        pipeline_details.children = frame_tree
+            .children
+            .iter()
+            .map(|frame_tree| frame_tree.pipeline.id)
+            .collect();
 
         for kid in &frame_tree.children {
             self.set_frame_tree_on_pipeline_details(kid, Some(pipeline_id));
@@ -333,6 +338,26 @@ impl WebViewRenderer {
         self.webview.set_animating(self.animating());
     }
 
+    pub(crate) fn for_each_connected_pipeline(&self, callback: &mut impl FnMut(&PipelineDetails)) {
+        if let Some(root_pipeline_id) = self.root_pipeline_id {
+            self.for_each_connected_pipeline_internal(root_pipeline_id, callback);
+        }
+    }
+
+    fn for_each_connected_pipeline_internal(
+        &self,
+        pipeline_id: PipelineId,
+        callback: &mut impl FnMut(&PipelineDetails),
+    ) {
+        let Some(pipeline) = self.pipelines.get(&pipeline_id) else {
+            return;
+        };
+        callback(pipeline);
+        for child_pipeline_id in &pipeline.children {
+            self.for_each_connected_pipeline_internal(*child_pipeline_id, callback);
+        }
+    }
+
     /// Update touch-based animations (currently just fling) during a `RefreshDriver`-based
     /// frame tick. Returns `true` if we should continue observing frames (the fling is ongoing)
     /// or `false` if we should stop observing frames (the fling has finished).
@@ -388,10 +413,9 @@ impl WebViewRenderer {
         render_api: &RenderApi,
         repaint_reason: &Cell<RepaintReason>,
         event_and_id: InputEventAndId,
-    ) {
+    ) -> bool {
         if let InputEvent::Touch(touch_event) = event_and_id.event {
-            self.on_touch_event(render_api, repaint_reason, touch_event, event_and_id.id);
-            return;
+            return self.on_touch_event(render_api, repaint_reason, touch_event, event_and_id.id);
         }
 
         if let InputEvent::Wheel(wheel_event) = event_and_id.event {
@@ -399,7 +423,7 @@ impl WebViewRenderer {
                 .insert(event_and_id.id, wheel_event);
         }
 
-        self.dispatch_input_event_with_hit_testing(render_api, event_and_id);
+        self.dispatch_input_event_with_hit_testing(render_api, event_and_id)
     }
 
     fn send_touch_event(
@@ -435,30 +459,41 @@ impl WebViewRenderer {
         repaint_reason: &Cell<RepaintReason>,
         event: TouchEvent,
         id: InputEventId,
-    ) {
-        match event.event_type {
+    ) -> bool {
+        let result = match event.event_type {
             TouchEventType::Down => self.on_touch_down(render_api, event, id),
             TouchEventType::Move => self.on_touch_move(render_api, event, id),
             TouchEventType::Up => self.on_touch_up(render_api, event, id),
             TouchEventType::Cancel => self.on_touch_cancel(render_api, event, id),
-        }
+        };
 
         self.touch_handler
             .add_touch_move_refresh_observer_if_necessary(
                 self.refresh_driver.clone(),
                 repaint_reason,
             );
+        result
     }
 
-    fn on_touch_down(&mut self, render_api: &RenderApi, event: TouchEvent, id: InputEventId) {
+    fn on_touch_down(
+        &mut self,
+        render_api: &RenderApi,
+        event: TouchEvent,
+        id: InputEventId,
+    ) -> bool {
         let point = event
             .point
             .as_device_point(self.device_pixels_per_page_pixel());
         self.touch_handler.on_touch_down(event.touch_id, point);
-        self.send_touch_event(render_api, event, id);
+        self.send_touch_event(render_api, event, id)
     }
 
-    fn on_touch_move(&mut self, render_api: &RenderApi, mut event: TouchEvent, id: InputEventId) {
+    fn on_touch_move(
+        &mut self,
+        render_api: &RenderApi,
+        mut event: TouchEvent,
+        id: InputEventId,
+    ) -> bool {
         let point = event
             .point
             .as_device_point(self.device_pixels_per_page_pixel());
@@ -480,37 +515,45 @@ impl WebViewRenderer {
                 self.pending_scroll_zoom_events.push(action);
             }
         }
+        let mut reached_constellation = false;
         // When the event is touchmove, if the script thread is processing the touch
         // move event, we skip sending the event to the script thread.
         // This prevents the script thread from stacking up for a large amount of time.
         if !self.touch_handler.is_handling_touch_move_for_touch_id(
             self.touch_handler.current_sequence_id,
             event.touch_id,
-        ) && self.send_touch_event(render_api, event, id) &&
-            event.is_cancelable()
-        {
-            self.touch_handler.set_handling_touch_move_for_touch_id(
-                self.touch_handler.current_sequence_id,
-                event.touch_id,
-                TouchIdMoveTracking::Track,
-            );
+        ) {
+            reached_constellation = self.send_touch_event(render_api, event, id);
+            if reached_constellation && event.is_cancelable() {
+                self.touch_handler.set_handling_touch_move_for_touch_id(
+                    self.touch_handler.current_sequence_id,
+                    event.touch_id,
+                    TouchIdMoveTracking::Track,
+                );
+            }
         }
+        reached_constellation
     }
 
-    fn on_touch_up(&mut self, render_api: &RenderApi, event: TouchEvent, id: InputEventId) {
+    fn on_touch_up(&mut self, render_api: &RenderApi, event: TouchEvent, id: InputEventId) -> bool {
         let point = event
             .point
             .as_device_point(self.device_pixels_per_page_pixel());
         self.touch_handler.on_touch_up(event.touch_id, point);
-        self.send_touch_event(render_api, event, id);
+        self.send_touch_event(render_api, event, id)
     }
 
-    fn on_touch_cancel(&mut self, render_api: &RenderApi, event: TouchEvent, id: InputEventId) {
+    fn on_touch_cancel(
+        &mut self,
+        render_api: &RenderApi,
+        event: TouchEvent,
+        id: InputEventId,
+    ) -> bool {
         let point = event
             .point
             .as_device_point(self.device_pixels_per_page_pixel());
         self.touch_handler.on_touch_cancel(event.touch_id, point);
-        self.send_touch_event(render_api, event, id);
+        self.send_touch_event(render_api, event, id)
     }
 
     fn on_touch_event_processed(
@@ -704,7 +747,6 @@ impl WebViewRenderer {
             .push(ScrollZoomEvent::Scroll(ScrollEvent {
                 scroll,
                 point: cursor,
-                event_count: 1,
             }));
     }
 
@@ -730,8 +772,11 @@ impl WebViewRenderer {
 
         for scroll_event in self.pending_scroll_zoom_events.drain(..) {
             match scroll_event {
-                ScrollZoomEvent::PinchZoom(factor, center) => {
-                    new_pinch_zoom.zoom(factor, center);
+                ScrollZoomEvent::PinchZoom(magnification, center) => {
+                    let new_factor = self
+                        .viewport_description
+                        .clamp_zoom(self.pinch_zoom.zoom_factor().0 * magnification);
+                    new_pinch_zoom.set_zoom(new_factor, center);
                 },
                 ScrollZoomEvent::Scroll(scroll_event_info) => {
                     let combined_event = match combined_scroll_event.as_mut() {
@@ -744,19 +789,11 @@ impl WebViewRenderer {
 
                     match (combined_event.scroll, scroll_event_info.scroll) {
                         (Scroll::Delta(old_delta), Scroll::Delta(new_delta)) => {
-                            // Mac OS X sometimes delivers scroll events out of vsync during a
-                            // fling. This causes events to get bunched up occasionally, causing
-                            // nasty-looking "pops". To mitigate this, during a fling we average
-                            // deltas instead of summing them.
-                            let old_event_count = combined_event.event_count as f32;
-                            combined_event.event_count += 1;
-                            let new_event_count = combined_event.event_count as f32;
                             let old_delta =
                                 old_delta.as_device_vector(device_pixels_per_page_pixel);
                             let new_delta =
                                 new_delta.as_device_vector(device_pixels_per_page_pixel);
-                            let delta = (old_delta * old_event_count + new_delta) / new_event_count;
-                            combined_event.scroll = Scroll::Delta(delta.into());
+                            combined_event.scroll = Scroll::Delta((old_delta + new_delta).into());
                         },
                         (Scroll::Start, _) | (Scroll::End, _) => {
                             // Once we see Start or End, we shouldn't process any more events.
@@ -919,7 +956,7 @@ impl WebViewRenderer {
 
         self.send_scroll_positions_to_layout_for_pipeline(root_pipeline_id, external_scroll_id);
 
-        if pinch_zoom_result == PinchZoomResult::DidNotPinchZoom {
+        if pinch_zoom_result == PinchZoomResult::DidPinchZoom {
             self.send_pinch_zoom_infos_to_script();
         }
 
@@ -1049,7 +1086,7 @@ impl WebViewRenderer {
 
     pub fn set_viewport_description(&mut self, viewport_description: ViewportDescription) {
         self.set_page_zoom(viewport_description.initial_scale);
-        self.viewport_description = Some(viewport_description);
+        self.viewport_description = viewport_description;
     }
 
     pub(crate) fn scroll_trees_memory_usage(

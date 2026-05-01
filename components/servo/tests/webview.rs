@@ -8,24 +8,29 @@ mod common;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use dpi::PhysicalSize;
+use embedder_traits::UrlRequest;
 use euclid::{Point2D, Size2D};
+use http::{HeaderMap, HeaderName, HeaderValue};
 use http_body_util::combinators::BoxBody;
 use hyper::body::{Bytes, Incoming};
 use hyper::{Request as HyperRequest, Response as HyperResponse};
+use itertools::Itertools;
 use net::test_util::{make_body, make_server, replace_host_table};
 use servo::{
     ContextMenuAction, ContextMenuElementInformation, ContextMenuElementInformationFlags,
     ContextMenuItem, CreateNewWebViewRequest, Cursor, EmbedderControl, InputEvent, InputMethodType,
     JSValue, LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent,
-    MouseMoveEvent, RenderingContext, SimpleDialog, Theme, WebView, WebViewBuilder,
-    WebViewDelegate,
+    MouseMoveEvent, RenderingContext, Scroll, SimpleDialog, Theme, WebView, WebViewBuilder,
+    WebViewDelegate, WebViewPoint, WebViewVector,
 };
 use servo_config::prefs::Preferences;
 use servo_url::ServoUrl;
 use url::Url;
-use webrender_api::units::{DeviceIntSize, DevicePoint};
+use webrender_api::units::{DeviceIntSize, DevicePoint, DeviceVector2D};
 
 use crate::common::{
     ServoTest, WebViewDelegateImpl, click_at_point, evaluate_javascript,
@@ -91,7 +96,7 @@ fn test_create_webview_http() {
 
     let webview = WebViewBuilder::new(servo_test.servo(), servo_test.rendering_context.clone())
         .delegate(delegate.clone())
-        .url(url.into_url())
+        .url(url.as_url().clone())
         .build();
 
     servo_test.spin(move || !delegate.url_changed.get());
@@ -489,7 +494,7 @@ fn test_show_and_hide_ime() {
         .build();
 
     show_webview_and_wait_for_rendering_to_be_ready(&servo_test, &webview, &delegate);
-    click_at_point(&webview, Point2D::new(100., 100.));
+    click_at_point(&webview, Point2D::new(150., 150.));
 
     // The form control should be shown.
     let captured_delegate = delegate.clone();
@@ -596,9 +601,15 @@ fn test_simple_context_menu() {
     show_webview_and_wait_for_rendering_to_be_ready(&servo_test, &webview, &delegate);
     open_context_menu_at_point(&webview, DevicePoint::new(50.0, 50.0));
 
-    // The form control should be shown.
+    // Wait for a context menu to appear.
     let captured_delegate = delegate.clone();
-    servo_test.spin(move || captured_delegate.number_of_controls_shown.get() == 0);
+    servo_test.spin(move || {
+        let controls = captured_delegate.controls_shown.borrow();
+        !controls
+            .iter()
+            .any(|control| matches!(control, EmbedderControl::ContextMenu(_)))
+    });
+    assert!(delegate.number_of_controls_shown.get() > 0);
 
     let context_menu = {
         let mut controls = delegate.controls_shown.borrow_mut();
@@ -658,8 +669,15 @@ fn test_open_context_menu_closes_existing() {
     show_webview_and_wait_for_rendering_to_be_ready(&servo_test, &webview, &delegate);
     open_context_menu_at_point(&webview, DevicePoint::new(50.0, 50.0));
 
+    // Wait for a context menu to appear.
     let captured_delegate = delegate.clone();
-    servo_test.spin(move || captured_delegate.number_of_controls_shown.get() == 0);
+    servo_test.spin(move || {
+        let controls = captured_delegate.controls_shown.borrow();
+        !controls
+            .iter()
+            .any(|control| matches!(control, EmbedderControl::ContextMenu(_)))
+    });
+    assert!(delegate.number_of_controls_shown.get() > 0);
 
     assert_eq!(delegate.number_of_controls_hidden.get(), 0);
 
@@ -699,9 +717,15 @@ fn test_contextual_context_menu_items() {
          expected_info: ContextMenuElementInformation| {
             assert!(delegate.controls_shown.borrow().is_empty());
 
-            // The form control should be shown.
+            // Wait for a context menu to appear.
             let captured_delegate = delegate.clone();
-            servo_test.spin(move || captured_delegate.number_of_controls_shown.get() == 0);
+            servo_test.spin(move || {
+                let controls = captured_delegate.controls_shown.borrow();
+                !controls
+                    .iter()
+                    .any(|control| matches!(control, EmbedderControl::ContextMenu(_)))
+            });
+            assert!(delegate.number_of_controls_shown.get() > 0);
 
             {
                 let mut controls = delegate.controls_shown.borrow_mut();
@@ -846,28 +870,151 @@ fn test_pinch_zoom_update_dom_visual_viewport() {
         .build();
 
     show_webview_and_wait_for_rendering_to_be_ready(&servo_test, &webview, &delegate);
-    let eval_visual_viewport = |attr: &str| {
-        evaluate_javascript(
-            &servo_test,
-            webview.clone(),
-            format!("window.visualViewport.{}", attr),
-        )
+    let eval_visual_viewport = |attribute: &str| match evaluate_javascript(
+        &servo_test,
+        webview.clone(),
+        format!("window.visualViewport.{}", attribute),
+    ) {
+        Ok(JSValue::Number(number)) => Some(number),
+        _ => None,
     };
 
     // Default value of the DOM visual viewport is initialized correctly.
-    assert_eq!(eval_visual_viewport("scale"), Ok(JSValue::Number(1.)));
-    assert_eq!(eval_visual_viewport("width"), Ok(JSValue::Number(500.)));
-    assert_eq!(eval_visual_viewport("height"), Ok(JSValue::Number(500.)));
-    assert_eq!(eval_visual_viewport("offsetLeft"), Ok(JSValue::Number(0.)));
-    assert_eq!(eval_visual_viewport("offsetTop"), Ok(JSValue::Number(0.)));
+    assert_eq!(eval_visual_viewport("scale"), Some(1.));
+    assert_eq!(eval_visual_viewport("width"), Some(500.));
+    assert_eq!(eval_visual_viewport("height"), Some(500.));
+    assert_eq!(eval_visual_viewport("offsetLeft"), Some(0.));
+    assert_eq!(eval_visual_viewport("offsetTop"), Some(0.));
 
-    webview.pinch_zoom(5., DevicePoint::new(100., 100.));
+    webview.adjust_pinch_zoom(5., DevicePoint::new(100., 100.));
     wait_for_webview_scene_to_be_up_to_date(&servo_test, &webview);
 
-    // The visual viewport dimension is correct after a pinch zoom.
-    assert_eq!(eval_visual_viewport("scale"), Ok(JSValue::Number(5.)));
-    assert_eq!(eval_visual_viewport("width"), Ok(JSValue::Number(100.)));
-    assert_eq!(eval_visual_viewport("height"), Ok(JSValue::Number(100.)));
-    assert_eq!(eval_visual_viewport("offsetLeft"), Ok(JSValue::Number(80.)));
-    assert_eq!(eval_visual_viewport("offsetTop"), Ok(JSValue::Number(80.)));
+    // The visual viewport size and offset is correct after a pinch zoom.
+    assert_eq!(eval_visual_viewport("scale"), Some(5.));
+    assert_eq!(eval_visual_viewport("width"), Some(100.));
+    assert_eq!(eval_visual_viewport("height"), Some(100.));
+    assert_eq!(eval_visual_viewport("offsetLeft"), Some(80.));
+    assert_eq!(eval_visual_viewport("offsetTop"), Some(80.));
+
+    // Note that the scroll vector will be affected by the pinch zoom scale.
+    webview.notify_scroll_event(
+        Scroll::Delta(WebViewVector::Device(DeviceVector2D::new(100., 100.))),
+        WebViewPoint::Device(DevicePoint::zero()),
+    );
+    wait_for_webview_scene_to_be_up_to_date(&servo_test, &webview);
+
+    // The visual viewport size and offset is correct after the scroll event.
+    assert_eq!(eval_visual_viewport("scale"), Some(5.));
+    assert_eq!(eval_visual_viewport("width"), Some(100.));
+    assert_eq!(eval_visual_viewport("height"), Some(100.));
+    assert_eq!(eval_visual_viewport("offsetLeft"), Some(100.));
+    assert_eq!(eval_visual_viewport("offsetTop"), Some(100.));
+}
+
+#[test]
+fn test_webview_load_with_headers() {
+    let servo_test = ServoTest::new();
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_clone = request_count.clone();
+
+    let mut headers = HeaderMap::new();
+    headers.append(HeaderName::from_static("world"), "hello".parse().unwrap());
+    headers.append(HeaderName::from_static("second"), "header".parse().unwrap());
+    headers.append(
+        HeaderName::from_static("accept-encoding"),
+        "customzip".parse().unwrap(),
+    );
+    static MESSAGE: &'static [u8] = b"<!DOCTYPE html>\nHello";
+    let handler =
+        move |req: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            if request_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 2 {
+                let headers = req.headers();
+                assert_eq!(
+                    headers.get("world"),
+                    Some(&HeaderValue::from_static("hello"))
+                );
+                assert_eq!(
+                    headers.get("second"),
+                    Some(&HeaderValue::from_static("header"))
+                );
+
+                // headers should be added if they already exist.
+                assert!(
+                    headers
+                        .get_all("accept-encoding")
+                        .iter()
+                        .contains(&HeaderValue::from_static("customzip"))
+                );
+                assert!(headers.get_all("accept-encoding").iter().count() > 1);
+            } else {
+                *response.body_mut() = make_body(MESSAGE.to_vec());
+            }
+        };
+    let (server, url) = make_server(handler);
+
+    let delegate = Rc::new(WebViewDelegateImpl::default());
+
+    let webview = WebViewBuilder::new(servo_test.servo(), servo_test.rendering_context.clone())
+        .delegate(delegate.clone())
+        .url(url.url().into_url())
+        .build();
+
+    {
+        let delegate = delegate.clone();
+        servo_test.spin(move || !delegate.url_changed.get());
+    }
+
+    let urlrequest = UrlRequest::new(url.url().into_url()).headers(headers);
+    webview.load_request(urlrequest);
+    {
+        let request_count = request_count.clone();
+        servo_test.spin(move || request_count.load(std::sync::atomic::Ordering::SeqCst) < 2);
+    }
+    assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    server.close();
+}
+
+#[test]
+fn test_console_log_and_error_ordering() {
+    let servo_test = ServoTest::new();
+    let delegate = Rc::new(WebViewDelegateImpl::default());
+
+    let _webview = WebViewBuilder::new(servo_test.servo(), servo_test.rendering_context.clone())
+        .delegate(delegate.clone())
+        .url(
+            Url::parse(
+                "data:text/html,<!doctype html><script>\
+                    console.log('Hello');\
+                    DocumentFragment.prototype.querySelector.call(document, 'body');\
+                </script>",
+            )
+            .unwrap(),
+        )
+        .build();
+
+    // Wait until both messages have arrived through the embedder channel.
+    let captured = delegate.clone();
+    servo_test.spin(move || captured.console_messages.borrow().len() < 2);
+
+    let messages = delegate.console_messages.borrow();
+    assert_eq!(
+        messages.len(),
+        2,
+        "Expected exactly 2 console messages, got: {messages:?}"
+    );
+
+    // The console.log("Hello") must arrive first.
+    assert!(
+        messages[0].1.contains("Hello"),
+        "Expected first message to contain 'Hello', got: {:?}",
+        messages[0].1
+    );
+
+    // The uncaught TypeError must arrive second.
+    assert!(
+        messages[1].1.contains("DocumentFragment") || messages[1].1.contains("querySelector"),
+        "Expected second message to contain error info, got: {:?}",
+        messages[1].1
+    );
 }

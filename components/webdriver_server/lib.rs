@@ -9,6 +9,7 @@
 mod actions;
 mod capabilities;
 mod script_argument_extraction;
+mod server;
 mod session;
 mod timeout;
 mod user_prompt;
@@ -22,8 +23,6 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 use std::{env, fmt, process, thread};
 
-use base::generic_channel::{self, GenericReceiver, GenericSender, RoutedReceiver};
-use base::id::{BrowsingContextId, WebViewId};
 use base64::Engine;
 use capabilities::ServoCapabilities;
 use cookie::{CookieBuilder, Expiration, SameSite};
@@ -44,6 +43,9 @@ use serde::de::{Deserializer, MapAccess, Visitor};
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use server::{Session, SessionTeardownKind, WebDriverHandler};
+use servo_base::generic_channel::{self, GenericReceiver, GenericSender, RoutedReceiver};
+use servo_base::id::{BrowsingContextId, WebViewId};
 use servo_config::prefs::{self, PrefValue, Preferences};
 use servo_geometry::DeviceIndependentIntRect;
 use servo_url::ServoUrl;
@@ -71,11 +73,14 @@ use webdriver::response::{
     CloseWindowResponse, CookieResponse, CookiesResponse, ElementRectResponse, NewSessionResponse,
     NewWindowResponse, TimeoutsResponse, ValueResponse, WebDriverResponse, WindowRectResponse,
 };
-use webdriver::server::{self, Session, SessionTeardownKind, WebDriverHandler};
 
 use crate::actions::{ELEMENT_CLICK_BUTTON, InputSourceState, PendingActions, PointerInputState};
 use crate::session::{PageLoadStrategy, WebDriverSession};
 use crate::timeout::{DEFAULT_IMPLICIT_WAIT, DEFAULT_PAGE_LOAD_TIMEOUT, SCREENSHOT_TIMEOUT};
+
+/// <https://262.ecma-international.org/6.0/#sec-number.max_safe_integer>
+/// 2^53 - 1
+pub(crate) static MAXIMUM_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 fn extension_routes() -> Vec<(Method, &'static str, ServoExtensionRoute)> {
     vec![
@@ -485,6 +490,7 @@ impl Handler {
             .ok_or_else(|| WebDriverError::new(ErrorStatus::UnknownError, "No webview available"))
     }
 
+    // FIXME: This should be completely removed after we revamp the touch chain.
     fn send_input_event_to_embedder(&self, input_event: InputEvent) {
         let _ = self.send_message_to_embedder(WebDriverCommandMsg::InputEvent(
             self.verified_webview_id(),
@@ -1858,6 +1864,18 @@ impl Handler {
         self.handle_any_user_prompts(self.webview_id()?)?;
         let (sender, receiver) = generic_channel::channel().unwrap();
 
+        // Step 6. cookie expiry time is not an integer type,
+        // or it less than 0 or greater than the maximum safe integer,
+        // return error with error code invalid argument.
+        if let Some(ref expiry) = params.expiry {
+            if expiry.0 > MAXIMUM_SAFE_INTEGER {
+                return Err(WebDriverError::new(
+                    ErrorStatus::InvalidArgument,
+                    "expiry time greater than maximum safe integer",
+                ));
+            }
+        }
+
         let mut cookie_builder =
             CookieBuilder::new(params.name.to_owned(), params.value.to_owned())
                 .secure(params.secure)
@@ -1869,9 +1887,10 @@ impl Handler {
             cookie_builder = cookie_builder.path(path.clone());
         }
         if let Some(ref expiry) = params.expiry {
-            if let Ok(datetime) = OffsetDateTime::from_unix_timestamp(expiry.0 as i64) {
-                cookie_builder = cookie_builder.expires(datetime);
-            }
+            let datetime = OffsetDateTime::from_unix_timestamp(expiry.0 as i64).map_err(|_| {
+                WebDriverError::new(ErrorStatus::InvalidArgument, "invalid expiry time")
+            })?;
+            cookie_builder = cookie_builder.expires(datetime);
         }
         if let Some(ref same_site) = params.sameSite {
             cookie_builder = match same_site.as_str() {
@@ -2239,9 +2258,9 @@ impl Handler {
                     }
                 },
                 DispatchStringEvent::Composition(event) => {
-                    self.send_input_event_to_embedder(InputEvent::Ime(ImeEvent::Composition(
-                        event,
-                    )));
+                    self.send_blocking_input_event_to_embedder(InputEvent::Ime(
+                        ImeEvent::Composition(event),
+                    ));
                 },
             }
         }
@@ -2475,7 +2494,6 @@ impl Handler {
 
         let rect = wait_for_ipc_response_flatten(receiver)?;
 
-        // TODO: Consider writing mode. Convert `rect` before requesting screenshot.
         // Step 5
         let encoded = self.take_screenshot(Some(Rect::from_untyped(&rect)))?;
 

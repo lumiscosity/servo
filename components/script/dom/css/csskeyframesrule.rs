@@ -6,6 +6,7 @@ use std::cell::RefCell;
 
 use cssparser::{Parser, ParserInput};
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use servo_arc::Arc;
 use style::shared_lock::{Locked, SharedRwLockReadGuard, ToCssWithGuard};
 use style::stylesheets::keyframes_rule::{Keyframe, KeyframeSelector, KeyframesRule};
@@ -19,11 +20,10 @@ use super::cssstylesheet::CSSStyleSheet;
 use crate::dom::bindings::codegen::Bindings::CSSKeyframesRuleBinding::CSSKeyframesRuleMethods;
 use crate::dom::bindings::error::ErrorResult;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object};
+use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object_with_cx};
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct CSSKeyframesRule {
@@ -47,29 +47,29 @@ impl CSSKeyframesRule {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         window: &Window,
         parent_stylesheet: &CSSStyleSheet,
         keyframesrule: Arc<Locked<KeyframesRule>>,
-        can_gc: CanGc,
     ) -> DomRoot<CSSKeyframesRule> {
-        reflect_dom_object(
+        reflect_dom_object_with_cx(
             Box::new(CSSKeyframesRule::new_inherited(
                 parent_stylesheet,
                 keyframesrule,
             )),
             window,
-            can_gc,
+            cx,
         )
     }
 
-    fn rulelist(&self, can_gc: CanGc) -> DomRoot<CSSRuleList> {
+    fn rulelist(&self, cx: &mut JSContext) -> DomRoot<CSSRuleList> {
         self.rule_list.or_init(|| {
             let parent_stylesheet = &self.upcast::<CSSRule>().parent_stylesheet();
             CSSRuleList::new(
+                cx,
                 self.global().as_window(),
                 parent_stylesheet,
                 RulesSource::Keyframes(self.keyframes_rule.borrow().clone()),
-                can_gc,
             )
         })
     }
@@ -109,12 +109,12 @@ impl CSSKeyframesRule {
 
 impl CSSKeyframesRuleMethods<crate::DomTypeHolder> for CSSKeyframesRule {
     /// <https://drafts.csswg.org/css-animations/#dom-csskeyframesrule-cssrules>
-    fn CssRules(&self, can_gc: CanGc) -> DomRoot<CSSRuleList> {
-        self.rulelist(can_gc)
+    fn CssRules(&self, cx: &mut JSContext) -> DomRoot<CSSRuleList> {
+        self.rulelist(cx)
     }
 
     /// <https://drafts.csswg.org/css-animations/#dom-csskeyframesrule-appendrule>
-    fn AppendRule(&self, rule: DOMString, can_gc: CanGc) {
+    fn AppendRule(&self, cx: &mut JSContext, rule: DOMString) {
         let style_stylesheet = self.css_rule.parent_stylesheet().style_stylesheet();
         let rule = rule.str();
         let rule = {
@@ -134,22 +134,26 @@ impl CSSKeyframesRuleMethods<crate::DomTypeHolder> for CSSKeyframesRule {
                 .write_with(&mut guard)
                 .keyframes
                 .push(rule);
-            self.rulelist(can_gc).append_lazy_dom_rule();
+            self.rulelist(cx).append_lazy_dom_rule();
             self.css_rule.parent_stylesheet().notify_invalidations();
         }
     }
 
     /// <https://drafts.csswg.org/css-animations/#dom-csskeyframesrule-deleterule>
-    fn DeleteRule(&self, selector: DOMString, can_gc: CanGc) {
+    fn DeleteRule(&self, cx: &mut JSContext, selector: DOMString) {
         if let Some(idx) = self.find_rule(&selector) {
-            let _ = self.rulelist(can_gc).remove_rule(idx as u32);
+            let _ = self.rulelist(cx).remove_rule(idx as u32);
         }
     }
 
     /// <https://drafts.csswg.org/css-animations/#dom-csskeyframesrule-findrule>
-    fn FindRule(&self, selector: DOMString, can_gc: CanGc) -> Option<DomRoot<CSSKeyframeRule>> {
+    fn FindRule(
+        &self,
+        cx: &mut JSContext,
+        selector: DOMString,
+    ) -> Option<DomRoot<CSSKeyframeRule>> {
         self.find_rule(&selector)
-            .and_then(|idx| self.rulelist(can_gc).item(idx as u32, can_gc))
+            .and_then(|idx| self.rulelist(cx).item(cx, idx as u32))
             .and_then(DomRoot::downcast)
     }
 

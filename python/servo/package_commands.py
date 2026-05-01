@@ -69,8 +69,73 @@ def check_call_with_randomized_backoff(args: list[str], retries: int) -> int:
         return check_call_with_randomized_backoff(args, retries - 1)
 
 
+def copy_packaged_resources(top_dir: str, destination: str) -> None:
+    os.makedirs(destination, exist_ok=True)
+    shutil.copytree(path.join(top_dir, "resources"), destination, dirs_exist_ok=True)
+    shutil.copytree(
+        path.join(top_dir, "components", "default-resources", "resources"),
+        path.join(destination, "named_resources"),
+        dirs_exist_ok=True,
+    )
+
+
 @CommandProvider
 class PackageCommands(CommandBase):
+    @staticmethod
+    def _replace_workspace_version(content: str, new_version: str) -> str:
+        """
+        Given the `content` of servo's workspace Cargo.toml, update the workspace version to
+        `new_version` and return the modified Cargo.toml content.
+        """
+        lines = content.splitlines()
+        section_header = "[workspace.package]"
+        in_section = False
+
+        for index, line in enumerate(lines):
+            stripped_line = line.strip()
+            if stripped_line == section_header:
+                in_section = True
+                continue
+
+            if in_section and stripped_line.startswith("[") and stripped_line.endswith("]"):
+                break
+
+            if in_section and stripped_line.startswith("version"):
+                lines[index] = f'version = "{new_version}"'
+                return "\n".join(lines)
+
+        raise ValueError("Failed to update workspace package version.")
+
+    @staticmethod
+    def _replace_path_versions(content: str, new_version: str) -> str:
+        """
+        Given content of the workspace Cargo.toml file, update the version requirements of `path`
+        dependencies that are versioned with the workspace version.
+        We mark the relevant section in our Cargo.toml so we can easily find the dependencies
+        we need to update the version of.
+        """
+        begin_marker = "# Begin workspace-version dependencies - Don't change this comment, we grep for it in scripts!"
+        end_marker = "# End workspace-version dependencies - Don't change this comment, we grep for it in scripts!"
+        block_start = content.find(begin_marker)
+        if block_start == -1:
+            raise ValueError(f"Could not find begin marker: {begin_marker}")
+
+        block_start += len(begin_marker)
+        block_end = content.find(end_marker, block_start)
+        if block_end == -1:
+            raise ValueError(f"Could not find end marker: {end_marker}")
+
+        block = content[block_start:block_end]
+        updated_block, count = re.subn(r'version\s*=\s*"[^"]*"', f'version = "{new_version}"', block)
+        if count == 0:
+            raise ValueError("No workspace-version dependency references found in Cargo.toml.")
+        elif count == 1:
+            raise RuntimeError(
+                "Our regex only updated one version, but we expect to have many. Please check the regex."
+            )
+
+        return f"{content[:block_start]}{updated_block}{content[block_end:]}"
+
     @Command("package", description="Package Servo", category="package")
     @CommandArgument("--android", default=None, action="store_true", help="Package Android")
     @CommandArgument("--ohos", default=None, action="store_true", help="Package OpenHarmony")
@@ -104,7 +169,7 @@ class PackageCommands(CommandBase):
 
             if build_type.is_dev():
                 build_type_string = "Debug"
-            elif build_type.is_release() or build_type.is_prod():
+            elif build_type.is_release() or build_type.is_prod() or build_type.profile == "checked-release":
                 build_type_string = "Release"
             else:
                 print(f"Servo was built with custom cargo profile `{build_type.profile}`.")
@@ -121,7 +186,7 @@ class PackageCommands(CommandBase):
             if path.exists(dir_to_resources):
                 delete(dir_to_resources)
 
-            shutil.copytree(path.join(dir_to_root, "resources"), dir_to_resources)
+            copy_packaged_resources(dir_to_root, dir_to_resources)
 
             variant = ":assemble" + flavor_name + arch_string + build_type_string
             apk_task_name = ":servoapp" + variant
@@ -143,10 +208,8 @@ class PackageCommands(CommandBase):
                 print("Cleaning up from previous packaging")
                 delete(ohos_target_dir)
             shutil.copytree(ohos_app_dir, ohos_target_dir)
-            resources_src_dir = path.join(self.get_top_dir(), "resources")
             resources_app_dir = path.join(ohos_target_dir, "AppScope", "resources", "resfile", "servo")
-            os.makedirs(resources_app_dir, exist_ok=True)
-            shutil.copytree(resources_src_dir, resources_app_dir, dirs_exist_ok=True)
+            copy_packaged_resources(self.get_top_dir(), str(resources_app_dir))
 
             # Map non-debug profiles to 'release' buildMode HAP.
             if build_type.is_custom():
@@ -218,7 +281,7 @@ class PackageCommands(CommandBase):
                 delete(dir_to_dmg)
 
             print("Copying files")
-            shutil.copytree(path.join(dir_to_root, "resources"), dir_to_resources)
+            copy_packaged_resources(dir_to_root, dir_to_resources)
             shutil.copy2(
                 path.join(dir_to_root, "ports/servoshell/platform/macos/Info.plist"),
                 path.join(dir_to_app, "Contents", "Info.plist"),
@@ -294,7 +357,7 @@ class PackageCommands(CommandBase):
             print("Copying files")
             dir_to_temp = path.join(dir_to_msi, "temp")
             dir_to_resources = path.join(dir_to_temp, "resources")
-            shutil.copytree(path.join(dir_to_root, "resources"), dir_to_resources)
+            copy_packaged_resources(dir_to_root, dir_to_resources)
             shutil.copy(binary_path, dir_to_temp)
             copy_windows_dependencies(target_dir, dir_to_temp)
 
@@ -362,7 +425,7 @@ class PackageCommands(CommandBase):
 
             print("Copying files")
             dir_to_resources = path.join(dir_to_temp, "resources")
-            shutil.copytree(path.join(dir_to_root, "resources"), dir_to_resources)
+            copy_packaged_resources(dir_to_root, dir_to_resources)
             shutil.copy(binary_path, dir_to_temp)
 
             print("Creating tarball")
@@ -422,6 +485,9 @@ class PackageCommands(CommandBase):
         elif is_windows():
             pkg_path = path.join(path.dirname(binary_path), "msi", "Servo.msi")
             exec_command = ["msiexec", "/i", pkg_path]
+        else:
+            print("install command not supported for the current target")
+            return 1
 
         if not path.exists(pkg_path):
             print("Servo package not found. Packaging servo...")
@@ -448,7 +514,7 @@ class PackageCommands(CommandBase):
         return 1
 
     @Command(
-        "release", description="Perform necessary updates before release a new servoshell version", category="package"
+        "release", description="Perform necessary updates before releasing a new servo version", category="package"
     )
     @CommandArgument("target", type=str, help="Target version to bump to")
     @CommandArgument("--allow-dirty", action="store_true", help="Allow working directory to be dirty")
@@ -461,8 +527,23 @@ class PackageCommands(CommandBase):
                 print("To bypass this check, use --allow-dirty.")
                 return 1
         print("\r ➤  Bumping version number...")
+        workspace_toml_path = path.join(self.get_top_dir(), "Cargo.toml")
+        with open(workspace_toml_path, "r") as file:
+            workspace_toml_content = file.read()
+
+        try:
+            workspace_toml_content = self._replace_workspace_version(workspace_toml_content, target)
+            workspace_toml_content = self._replace_path_versions(workspace_toml_content, target)
+        except (ValueError, RuntimeError) as error:
+            print(f"Failed to update workspace version: `{error}`", file=sys.stderr)
+            return 1
+
+        with open(workspace_toml_path, "w") as file:
+            file.write(workspace_toml_content)
+
+        print("Updated occurrences in workspace Cargo.toml.")
+
         replacements = {
-            "ports/servoshell/Cargo.toml": r'^version ?= ?"(?P<version>.*?)"',
             "ports/servoshell/platform/windows/servoshell.exe.manifest": r'assemblyIdentity[^\/>]+version="(?P<version>.*?).0\"[^\/>]*\/>',
             "support/windows/ServoShell.wxs.mako": r'<Product(.|\n)*Version="(?P<version>.*?)".*>',
             "ports/servoshell/platform/macos/Info.plist": r"<key>CFBundleShortVersionString</key>\n\s*<string>(?P<version>.*?)</string>",
@@ -500,6 +581,10 @@ class PackageCommands(CommandBase):
             print(f"Updated occurrence in {filename}.")
         print("\r ➤  Updating license.html...")
         # cargo about generate etc/about.hbs > resources/resource_protocol/license.html
+        if shutil.which("cargo-about") is None:
+            print("Updating license.html requires cargo-about, but it is not installed.", file=sys.stderr)
+            print("Install it with: `cargo install cargo-about --locked`", file=sys.stderr)
+            return 1
         try:
             # Remove resources/resource_protocol/license.html before regenerating it
             license_html_path = path.join("resources", "resource_protocol", "license.html")

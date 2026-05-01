@@ -5,6 +5,7 @@
 use std::cell::RefCell;
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use servo_arc::Arc;
 use style::shared_lock::{Locked, SharedRwLockReadGuard, ToCssWithGuard};
 use style::stylesheets::CssRuleType;
@@ -15,7 +16,7 @@ use super::cssstyledeclaration::{CSSModificationAccess, CSSStyleDeclaration, CSS
 use super::cssstylesheet::CSSStyleSheet;
 use crate::dom::bindings::codegen::Bindings::CSSKeyframeRuleBinding::CSSKeyframeRuleMethods;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object};
+use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object_with_cx};
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::window::Window;
@@ -43,18 +44,18 @@ impl CSSKeyframeRule {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         window: &Window,
         parent_stylesheet: &CSSStyleSheet,
         keyframerule: Arc<Locked<Keyframe>>,
-        can_gc: CanGc,
     ) -> DomRoot<CSSKeyframeRule> {
-        reflect_dom_object(
+        reflect_dom_object_with_cx(
             Box::new(CSSKeyframeRule::new_inherited(
                 parent_stylesheet,
                 keyframerule,
             )),
             window,
-            can_gc,
+            cx,
         )
     }
 
@@ -72,7 +73,7 @@ impl CSSKeyframeRule {
 
 impl CSSKeyframeRuleMethods<crate::DomTypeHolder> for CSSKeyframeRule {
     /// <https://drafts.csswg.org/css-animations/#dom-csskeyframerule-style>
-    fn Style(&self, can_gc: CanGc) -> DomRoot<CSSStyleDeclaration> {
+    fn Style(&self, cx: &mut JSContext) -> DomRoot<CSSStyleDeclaration> {
         self.style_declaration.or_init(|| {
             let guard = self.css_rule.shared_lock().read();
             CSSStyleDeclaration::new(
@@ -83,7 +84,7 @@ impl CSSKeyframeRuleMethods<crate::DomTypeHolder> for CSSKeyframeRule {
                 ),
                 None,
                 CSSModificationAccess::ReadWrite,
-                can_gc,
+                CanGc::from_cx(cx),
             )
         })
     }

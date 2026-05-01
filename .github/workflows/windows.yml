@@ -5,7 +5,7 @@ on:
     inputs:
       profile:
         required: false
-        default: "release"
+        default: "checked-release"
         type: string
       build-args:
         default: ""
@@ -40,8 +40,8 @@ on:
     inputs:
       profile:
         required: false
-        default: "release"
-        options: ["release", "debug", "production"]
+        default: "checked-release"
+        options: ["checked-release", "release", "debug", "production"]
         type: choice
       unit-tests:
         required: false
@@ -83,7 +83,7 @@ jobs:
     steps:
       - name: Runner select
         id: select
-        uses: servo/ci-runners/actions/runner-select@6d88b19dda997f1ce2a11e4c1c34717c2bbcafba
+        uses: servo/ci-runners/actions/runner-select@f0b81b95522256c64ee207b4236ec71fc23b99a1
         with:
           GITHUB_TOKEN: ${{ github.token }}
           github-hosted-runner-label: windows-2022
@@ -103,7 +103,7 @@ jobs:
     outputs:
       release_artifact_ids: ${{ steps.artifact_ids.outputs.release_artifact_ids }}
     steps:
-      - uses: servo/ci-runners/actions/checkout@6d88b19dda997f1ce2a11e4c1c34717c2bbcafba
+      - uses: servo/ci-runners/actions/checkout@f0b81b95522256c64ee207b4236ec71fc23b99a1
 
       - name: ccache
         # FIXME: “Error: Restoring cache failed: Error: Unable to locate executable file: sh.”
@@ -157,13 +157,13 @@ jobs:
       - name: Smoketest
         run: .\mach smoketest --profile ${{ inputs.profile }}
       - name: Install cargo nextest
-        if: ${{ runner.environment != 'self-hosted' }}
+        if: ${{ runner.environment != 'self-hosted' && inputs.unit-tests }}
         uses: taiki-e/install-action@v2
         with:
           tool: nextest
       # On self-hosted windows runners the install-action fails
       - name: Install cargo nextest (self-hosted)
-        if: ${{ runner.environment == 'self-hosted' }}
+        if: ${{ runner.environment == 'self-hosted' && inputs.unit-tests }}
         run: cargo install cargo-nextest --locked
       - name: Unit tests
         if: ${{ inputs.unit-tests }}
