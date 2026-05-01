@@ -1812,7 +1812,7 @@ impl Node {
             node_value: self.GetNodeValue().map(|v| v.into()),
             display_name,
             num_children,
-            attrs: self.downcast().map(Element::summarize).unwrap_or(vec![]),
+            attrs,
             is_pseudo_element,
             is_shadow_host,
             shadow_root_mode,
