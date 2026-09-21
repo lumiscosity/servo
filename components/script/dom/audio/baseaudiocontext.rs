@@ -4,7 +4,7 @@
 
 use std::cell::Cell;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -91,8 +91,6 @@ struct DecodeResolver {
     pub(crate) error_callback: Option<Rc<DecodeErrorCallback>>,
 }
 
-type BoxedSliceOfPromises = Box<[TracedPromise]>;
-
 #[dom_struct]
 pub(crate) struct BaseAudioContext {
     eventtarget: EventTarget,
@@ -102,8 +100,6 @@ pub(crate) struct BaseAudioContext {
     /// <https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-destination>
     destination: MutNullableDom<AudioDestinationNode>,
     listener: MutNullableDom<AudioListener>,
-    /// Resume promises which are soon to be fulfilled by a queued task.
-    in_flight_resume_promises_queue: DomRefCell<VecDeque<(BoxedSliceOfPromises, ErrorResult)>>,
     /// <https://webaudio.github.io/web-audio-api/#pendingresumepromises>
     pending_resume_promises: DomRefCell<Vec<TracedPromise>>,
     decode_resolvers: DomRefCell<HashMap<String, DecodeResolver>>,
@@ -141,7 +137,6 @@ impl BaseAudioContext {
             audio_context_impl,
             destination: Default::default(),
             listener: Default::default(),
-            in_flight_resume_promises_queue: Default::default(),
             pending_resume_promises: Default::default(),
             decode_resolvers: Default::default(),
             sample_rate,
@@ -178,49 +173,12 @@ impl BaseAudioContext {
             .push(promise.to_traced());
     }
 
-    /// Takes the pending resume promises.
-    ///
-    /// The result with which these promises will be fulfilled is passed here
-    /// and this method returns nothing because we actually just move the
-    /// current list of pending resume promises to the
-    /// `in_flight_resume_promises_queue` field.
-    ///
-    /// Each call to this method must be followed by a call to
-    /// `fulfill_in_flight_resume_promises`, to actually fulfill the promises
-    /// which were taken and moved to the in-flight queue.
-    fn take_pending_resume_promises(&self, result: ErrorResult) {
-        self.in_flight_resume_promises_queue
-            .borrow_mut()
-            .push_back((
-                std::mem::take(&mut *self.pending_resume_promises.borrow_mut()).into(),
-                result,
-            ));
-    }
-
-    /// Fulfills the next in-flight resume promises queue after running a closure.
-    ///
-    /// See the comment on `take_pending_resume_promises` for why this method
-    /// does not take a list of promises to fulfill. Callers cannot just pop
-    /// the front list off of `in_flight_resume_promises_queue` and later fulfill
-    /// the promises because that would mean putting
-    /// `#[cfg_attr(crown, expect(crown::unrooted_must_root))]` on even more functions, potentially
-    /// hiding actual safety bugs.
-    fn fulfill_in_flight_resume_promises<F>(&self, cx: &mut JSContext, f: F)
+    fn fulfill_resume_promises<F>(&self, cx: &mut JSContext, promises: Vec<RootedPromise>, result: ErrorResult, f: F)
     where
         F: FnOnce(),
     {
-        let (promises, result) = self
-            .in_flight_resume_promises_queue
-            .borrow_mut()
-            .pop_front()
-            .map(|(promises, result)| {
-                let promises: Vec<RootedPromise> =
-                    promises.iter().map(|promise| promise.root(cx)).collect();
-                (promises, result)
-            })
-            .expect("there should be at least one list of in flight resume promises");
         f();
-        for promise in &promises {
+        for promise in promises {
             match result {
                 Ok(ref value) => promise.resolve_native(cx, value),
                 Err(ref error) => promise.reject_error(cx, error.clone()),
@@ -240,15 +198,16 @@ impl BaseAudioContext {
 
     pub(crate) fn resume(&self) {
         let this = Trusted::new(self);
+
         // Set the rendering thread state to 'running' and start
         // rendering the audio graph.
         match self.audio_context_impl.lock().unwrap().resume() {
             Some(()) => {
-                self.take_pending_resume_promises(Ok(()));
                 self.global().task_manager().dom_manipulation_task_source().queue(
                     task!(resume_success: move |cx| {
                         let this = this.root();
-                        this.fulfill_in_flight_resume_promises(cx, || {
+                        let promises = this.pending_resume_promises.borrow_mut().iter().map(|promise| promise.root(cx)).collect();
+                        this.fulfill_resume_promises(cx, promises, Ok(()), || {
                             if this.state.get() != AudioContextState::Running {
                                 this.state.set(AudioContextState::Running);
                                 this.global().task_manager().dom_manipulation_task_source().queue_simple_event(
@@ -261,14 +220,15 @@ impl BaseAudioContext {
                 );
             },
             None => {
-                self.take_pending_resume_promises(Err(Error::Type(
-                    c"Something went wrong".to_owned(),
-                )));
                 self.global()
                     .task_manager()
                     .dom_manipulation_task_source()
                     .queue(task!(resume_error: move |cx| {
-                        this.root().fulfill_in_flight_resume_promises(cx, || {})
+                        let this = this.root();
+                        let promises = this.pending_resume_promises.borrow_mut().iter().map(|promise| promise.root(cx)).collect();
+                        this.fulfill_resume_promises(cx, promises, Err(Error::Type(
+                            c"Something went wrong".to_owned(),
+                        )), || {})
                     }));
             },
         }
